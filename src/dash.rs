@@ -108,18 +108,39 @@ pub struct CollectOpts {
 
 pub const SCHEMA: &str = "wire-dash-v1";
 
+/// Cap on how much of an on-disk state file we read. Normal trust.json /
+/// relay.json / daemon.pid are well under 1 KB; this bounds the blast radius
+/// of a single corrupt/hostile file across the ~270-session fan-out.
+const MAX_STATE_FILE: u64 = 256 * 1024;
+
+/// Read at most [`MAX_STATE_FILE`] bytes of a file. `None` on any error.
+fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(MAX_STATE_FILE).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
 /// Extract the short fingerprint from a DID (`did:wire:terra-plain-e6511a52`
 /// → `e6511a52`). The nickname may contain hyphens, so take the final segment.
+/// `None` for a DID with no usable trailing segment.
 pub fn fingerprint_from_did(did: &str) -> Option<String> {
     let tail = did.rsplit(':').next()?; // "terra-plain-e6511a52"
-    tail.rsplit('-').next().map(|s| s.to_string())
+    let fp = tail.rsplit('-').next().unwrap_or("");
+    if fp.is_empty() {
+        return None;
+    }
+    Some(fp.chars().take(16).collect())
 }
 
 /// Read a session's pinned peers from `<home>/config/wire/trust.json`,
 /// excluding the session's own identity (`trust.json` lists self as an agent).
-pub fn read_peers(home: &Path, own_did: Option<&str>) -> Vec<PeerRow> {
+/// Self is matched on DID **or** handle: a corrupt self-entry missing its `did`
+/// must still not surface the session as its own peer.
+pub fn read_peers(home: &Path, own_did: Option<&str>, own_handle: Option<&str>) -> Vec<PeerRow> {
     let path = home.join("config").join("wire").join("trust.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Some(bytes) = read_capped(&path) else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -132,9 +153,9 @@ pub fn read_peers(home: &Path, own_did: Option<&str>) -> Vec<PeerRow> {
     for (handle, rec) in agents {
         let did = rec.get("did").and_then(|d| d.as_str()).unwrap_or("");
         // Skip the self entry — trust.json always lists the owning identity.
-        if let Some(own) = own_did
-            && did == own
-        {
+        // Match on either DID or handle so a `did`-less self entry is still
+        // excluded (else the session lists itself as a peer).
+        if own_did == Some(did) || own_handle == Some(handle.as_str()) {
             continue;
         }
         out.push(PeerRow {
@@ -154,7 +175,7 @@ pub fn read_peers(home: &Path, own_did: Option<&str>) -> Vec<PeerRow> {
 /// Read `<home>/config/wire/relay.json` → `(relay_url, slot_id)`.
 pub fn read_relay_binding(home: &Path) -> (Option<String>, Option<String>) {
     let path = home.join("config").join("wire").join("relay.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Some(bytes) = read_capped(&path) else {
         return (None, None);
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -182,7 +203,7 @@ pub fn last_sync_age_s(home: &Path) -> Option<u64> {
 /// Read the daemon `version` from `<home>/state/wire/daemon.pid`.
 fn read_daemon_version(home: &Path) -> Option<String> {
     let path = home.join("state").join("wire").join("daemon.pid");
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = read_capped(&path)?;
     let v = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
     v.get("version")
         .and_then(|s| s.as_str())
@@ -199,7 +220,7 @@ fn snapshot_one(si: &crate::session::SessionInfo) -> SessionSnapshot {
         (Some(pid), false) => DaemonState::StalePid { pid },
         (None, _) => DaemonState::None,
     };
-    let peers = read_peers(home, si.did.as_deref());
+    let peers = read_peers(home, si.did.as_deref(), si.handle.as_deref());
     let (relay_url, slot_id) = read_relay_binding(home);
     let (nickname, emoji, primary_hex, ansi256_primary) = match &si.character {
         Some(c) => (
@@ -233,8 +254,20 @@ fn snapshot_one(si: &crate::session::SessionInfo) -> SessionSnapshot {
 
 fn probe_relay(url: &str) -> RelayHealth {
     let base = url.trim_end_matches('/');
+    // Defensive: relay_url comes from an on-disk session file. Only probe
+    // http(s), and never follow redirects (a hostile relay could otherwise
+    // bounce the blind probe at an internal address).
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return RelayHealth {
+            url: url.to_string(),
+            ok: false,
+            status: None,
+            unprobed: false,
+        };
+    }
     let build = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
         .build();
     let Ok(client) = build else {
         return RelayHealth {
@@ -337,16 +370,104 @@ mod tests {
             },"version":1}"#,
         )
         .unwrap();
-        let peers = read_peers(dir.path(), Some("did:wire:terra-plain-e6511a52"));
+        let peers = read_peers(
+            dir.path(),
+            Some("did:wire:terra-plain-e6511a52"),
+            Some("terra-plain"),
+        );
         assert_eq!(peers.len(), 1, "self must be excluded");
         assert_eq!(peers[0].handle, "raven-kettle");
         assert_eq!(peers[0].tier, "VERIFIED");
     }
 
     #[test]
+    fn read_peers_excludes_self_by_handle_when_did_missing() {
+        // A corrupt self-entry with no `did` must still be excluded via handle.
+        let dir = tempfile::tempdir().unwrap();
+        let cw = dir.path().join("config").join("wire");
+        fs::create_dir_all(&cw).unwrap();
+        fs::write(
+            cw.join("trust.json"),
+            r#"{"agents":{
+                "terra-plain":{"tier":"ATTESTED"},
+                "raven-kettle":{"did":"did:wire:raven-kettle-11112222","tier":"VERIFIED"}
+            },"version":1}"#,
+        )
+        .unwrap();
+        let peers = read_peers(
+            dir.path(),
+            Some("did:wire:terra-plain-e6511a52"),
+            Some("terra-plain"),
+        );
+        assert_eq!(peers.len(), 1, "did-less self entry excluded by handle");
+        assert_eq!(peers[0].handle, "raven-kettle");
+    }
+
+    #[test]
     fn read_peers_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_peers(dir.path(), None).is_empty());
+        assert!(read_peers(dir.path(), None, None).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_none_for_empty_tail() {
+        assert_eq!(fingerprint_from_did("did:wire:"), None);
+        assert_eq!(fingerprint_from_did(""), None);
+    }
+
+    #[test]
+    fn dash_report_json_shape_is_stable() {
+        // Anti-drift: the wire-dash-v1 golden surface. If a field is renamed
+        // or dropped, this fails — external consumers (Mission Control adapter,
+        // any --json reader) depend on this shape.
+        let report = DashReport {
+            schema: SCHEMA,
+            sessions: vec![SessionSnapshot {
+                key: "k".into(),
+                handle: Some("h".into()),
+                did: Some("did:wire:h-deadbeef".into()),
+                fingerprint: Some("deadbeef".into()),
+                nickname: Some("h".into()),
+                emoji: Some("🦊".into()),
+                primary_hex: Some("#da60a3".into()),
+                ansi256_primary: Some(175),
+                daemon: DaemonState::StalePid { pid: 9 },
+                daemon_version: Some("0.16.0".into()),
+                relay_url: Some("https://wireup.net".into()),
+                slot_id: Some("s".into()),
+                last_sync_age_s: Some(5),
+                peers: vec![],
+                cwd: Some("/tmp/x".into()),
+                likely_idle: false,
+            }],
+            relays: vec![],
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["schema"], "wire-dash-v1");
+        let s = &v["sessions"][0];
+        for key in [
+            "key",
+            "handle",
+            "did",
+            "fingerprint",
+            "nickname",
+            "emoji",
+            "primary_hex",
+            "ansi256_primary",
+            "daemon",
+            "daemon_version",
+            "relay_url",
+            "slot_id",
+            "last_sync_age_s",
+            "peers",
+            "cwd",
+            "likely_idle",
+        ] {
+            assert!(s.get(key).is_some(), "missing golden field: {key}");
+        }
+        // StalePid must serialize as the tagged `stale_pid` a consumer keys on.
+        assert_eq!(s["daemon"]["state"], "stale_pid");
+        assert_eq!(s["daemon"]["pid"], 9);
     }
 
     #[test]

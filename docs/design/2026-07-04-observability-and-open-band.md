@@ -43,6 +43,14 @@ Scope confirmed with operator: all four layers wanted —
 
 ## P0 — shared core: `src/dash.rs`
 
+> **As-built (2026-07-04, branch `observability-open-band`):** shipped `DaemonState` is
+> `Running{pid} | StalePid{pid} | None` (not `Live/Abandoned/Dead`) plus a separate
+> `likely_idle: bool` = *running daemon ∧ no real peers*. Reason found in research: a running
+> daemon heartbeat-syncs regardless of use, so **sync-age can't detect "abandoned" — peer-count
+> is the honest signal.** Speculative `in_use`/`session_source` fields dropped; `cwd` is carried
+> and rendered (the reap-decision hint). Sort = peers-desc → running → key. The struct below is
+> the original plan; the code is the source of truth.
+
 The reusable mechanism both P1 (TUI) and P2 (MC adapter) consume. Build once.
 
 ```rust

@@ -5,35 +5,50 @@
 //! top; the idle solo-daemon throwaways collapse into a count (`--all` expands).
 //! Read-only — never spawns or kills a daemon.
 
+use crate::character::sanitize_display_text;
 use crate::dash::{self, CollectOpts, DaemonState, SessionSnapshot};
 use anyhow::Result;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
+
+/// Visible width of the name column (emoji + handle). Emoji display width is
+/// terminal-dependent (usually 2); we pad on Rust char count, so rows with an
+/// emoji may sit ~1 column wider than plain rows — acceptable for a glance tool.
+const NAME_W: usize = 24;
+/// Visible width of the daemon cell — every label (`● live` / `○ husk` /
+/// `· none`) is exactly 6 chars, matching the `DAEMON` header.
+const DAEMON_W: usize = 6;
+/// Fingerprints are 8 hex chars; give the column one space of breathing room.
+const FP_W: usize = 9;
+const CWD_MAX: usize = 30;
 
 pub fn cmd_dash(watch: bool, json: bool, all: bool, probe: bool) -> Result<()> {
     let opts = CollectOpts {
         probe_relays: probe,
     };
-    if json {
-        let report = dash::collect(&opts)?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
+    let color = std::io::stdout().is_terminal();
     if watch {
-        let color = std::io::stdout().is_terminal();
+        // Watch is the outer loop: each tick emits JSON (one compact object)
+        // or the table, so `--watch --json` streams and `--watch | pipe` keeps
+        // looping instead of silently printing once.
         loop {
             let report = dash::collect(&opts)?;
-            // Clear screen + home cursor, then repaint.
-            print!("\x1b[2J\x1b[H");
-            print!("{}", render(&report, all, color));
-            use std::io::Write;
+            print!("\x1b[2J\x1b[H"); // clear + home
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                print!("{}", render(&report, all, color));
+            }
             let _ = std::io::stdout().flush();
             std::thread::sleep(Duration::from_secs(2));
         }
     }
     let report = dash::collect(&opts)?;
-    let color = std::io::stdout().is_terminal();
-    print!("{}", render(&report, all, color));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render(&report, all, color));
+    }
     Ok(())
 }
 
@@ -47,30 +62,20 @@ fn fmt_age(s: Option<u64>) -> String {
     }
 }
 
+/// A fixed-width daemon cell: pad the *plain* label first, then wrap it in
+/// color so the visible width stays `DAEMON_W` (wrapping an already-padded
+/// ANSI string with `{:<N}` would add zero fill and misalign every color row).
 fn daemon_cell(d: &DaemonState, color: bool) -> String {
-    let (glyph, code) = match d {
+    let (label, code) = match d {
         DaemonState::Running { .. } => ("● live", "32"), // green
         DaemonState::StalePid { .. } => ("○ husk", "31"), // red
         DaemonState::None => ("· none", "2"),            // dim
     };
+    let padded = format!("{label:<DAEMON_W$}");
     if color {
-        format!("\x1b[{code}m{glyph}\x1b[0m")
+        format!("\x1b[{code}m{padded}\x1b[0m")
     } else {
-        glyph.to_string()
-    }
-}
-
-fn name_cell(s: &SessionSnapshot, color: bool) -> String {
-    let emoji = s.emoji.as_deref().unwrap_or("·");
-    let name = s
-        .handle
-        .as_deref()
-        .or(s.nickname.as_deref())
-        .unwrap_or(&s.key);
-    if color && let Some(c) = s.ansi256_primary {
-        format!("{emoji} \x1b[38;5;{c}m{name}\x1b[0m")
-    } else {
-        format!("{emoji} {name}")
+        padded
     }
 }
 
@@ -79,6 +84,25 @@ fn dim(text: &str, color: bool) -> String {
         format!("\x1b[2m{text}\x1b[0m")
     } else {
         text.to_string()
+    }
+}
+
+/// Display name for a session: sanitized `handle` (or nickname, or key).
+fn display_name(s: &SessionSnapshot) -> String {
+    let raw = s
+        .handle
+        .as_deref()
+        .or(s.nickname.as_deref())
+        .unwrap_or(&s.key);
+    sanitize_display_text(raw)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
     }
 }
 
@@ -130,11 +154,11 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
     }
     out.push('\n');
 
-    // Header row.
+    // Header row (padded to the same widths the data rows use).
     out.push_str(&dim(
         &format!(
-            "{:<26} {:<9} {:<7} {:>5} {:>6}  {}\n",
-            "IDENTITY", "DAEMON", "FP", "PEERS", "SYNC", "RELAY"
+            "{:<NAME_W$} {:<DAEMON_W$} {:<FP_W$} {:>5} {:>6}  {}\n",
+            "IDENTITY", "DAEMON", "FP", "PEERS", "SYNC", "RELAY / CWD"
         ),
         color,
     ));
@@ -146,46 +170,63 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
             hidden += 1;
             continue;
         }
-        let name = name_cell(s, color);
-        // name may carry ANSI; pad on the visible-width by padding the plain form.
-        let plain_name = format!(
-            "{} {}",
-            s.emoji.as_deref().unwrap_or("·"),
-            s.handle
-                .as_deref()
-                .or(s.nickname.as_deref())
-                .unwrap_or(&s.key)
-        );
-        let name_pad = 26usize.saturating_sub(plain_name.chars().count());
+        let name = display_name(s);
+        let emoji = s.emoji.as_deref().unwrap_or("·");
+        let plain_name = format!("{emoji} {name}");
+        let name_pad = NAME_W.saturating_sub(plain_name.chars().count());
+        // Colorize just the name; pad with plain spaces after (color must not
+        // affect the computed column width).
+        let name_col = if color && let Some(c) = s.ansi256_primary {
+            format!(
+                "{emoji} \x1b[38;5;{c}m{name}\x1b[0m{}",
+                " ".repeat(name_pad)
+            )
+        } else {
+            format!("{plain_name}{}", " ".repeat(name_pad))
+        };
         let fp = s.fingerprint.as_deref().unwrap_or("—");
         let peers = s.peers.len();
         let sync = fmt_age(s.last_sync_age_s);
         let relay = s.relay_url.as_deref().unwrap_or("—");
+        // cwd is the reap-decision signal for idle daemons — which project a
+        // stale daemon belongs to. Dim, truncated.
+        let cwd = s
+            .cwd
+            .as_deref()
+            .map(|c| format!("  {}", dim(&truncate(c, CWD_MAX), color)))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{name}{pad} {daemon:<9} {fp:<7} {peers:>5} {sync:>6}  {relay}\n",
-            pad = " ".repeat(name_pad),
+            "{name_col} {daemon} {fp:<FP_W$} {peers:>5} {sync:>6}  {relay}{cwd}\n",
             daemon = daemon_cell(&s.daemon, color),
-            fp = fp,
-            peers = peers,
-            sync = sync,
-            relay = relay,
         ));
-        // Show pinned peers under a paired session.
+        // Pinned peers under a paired session (sanitized — handle/tier are
+        // peer-published text that must not inject terminal escapes).
         if !s.peers.is_empty() {
             let list: Vec<String> = s
                 .peers
                 .iter()
-                .map(|p| format!("{} ({})", p.handle, p.tier))
+                .map(|p| {
+                    format!(
+                        "{} ({})",
+                        sanitize_display_text(&p.handle),
+                        sanitize_display_text(&p.tier)
+                    )
+                })
                 .collect();
             out.push_str(&dim(&format!("    ↳ {}\n", list.join(", ")), color));
         }
     }
     if hidden > 0 {
+        let plural = if hidden == 1 { "" } else { "s" };
         out.push_str(&dim(
-            &format!("\n… {hidden} idle solo daemons hidden (--all to show)\n"),
+            &format!("\n… {hidden} idle solo daemon{plural} hidden (--all to show)\n"),
             color,
         ));
     }
+    out.push_str(&dim(
+        "run `wire dash` on each box for a fleet view.\n",
+        color,
+    ));
     out
 }
 
@@ -240,11 +281,10 @@ mod tests {
         let collapsed = render(&report, false, false);
         assert!(collapsed.contains("paired"), "paired session always shown");
         assert!(
-            collapsed.contains("1 idle solo daemons hidden"),
-            "idle collapses by default:\n{collapsed}"
+            collapsed.contains("1 idle solo daemon hidden"),
+            "idle collapses (singular):\n{collapsed}"
         );
-        // The paired session is shown even collapsed, and shows its own peer
-        // line; only the idle session is hidden.
+        // The paired session is shown even collapsed; only the idle row hides.
         assert!(
             !collapsed.contains("🦊 idle"),
             "idle row is hidden:\n{collapsed}"
@@ -276,11 +316,50 @@ mod tests {
     }
 
     #[test]
+    fn peer_handle_terminal_escape_is_stripped() {
+        let mut s = snap("victim", true, 0);
+        s.peers = vec![PeerRow {
+            handle: "evil\x1b[2Jhandle".to_string(),
+            did: "did:wire:evil-0000".to_string(),
+            tier: "VERIFIED".to_string(),
+        }];
+        s.likely_idle = false;
+        let report = DashReport {
+            schema: dash::SCHEMA,
+            sessions: vec![s],
+            relays: vec![],
+        };
+        let out = render(&report, true, true);
+        // The live screen-clear escape (ESC[2J) must not survive into output.
+        // sanitize_display_text strips the ESC byte; the inert "[2J" text may
+        // remain, which is harmless (no ESC = no terminal action).
+        assert!(
+            !out.contains("\x1b[2J"),
+            "injected ESC[2J must not survive:\n{out:?}"
+        );
+        assert!(out.contains("evil"), "sanitized handle text still shown");
+        assert!(out.contains("handle"), "sanitized handle text still shown");
+    }
+
+    #[test]
     fn fmt_age_scales() {
         assert_eq!(fmt_age(None), "—");
         assert_eq!(fmt_age(Some(5)), "5s");
         assert_eq!(fmt_age(Some(120)), "2m");
         assert_eq!(fmt_age(Some(7200)), "2h");
         assert_eq!(fmt_age(Some(172800)), "2d");
+    }
+
+    #[test]
+    fn cwd_rendered_when_present() {
+        let mut s = snap("proj", true, 1);
+        s.cwd = Some("/Users/x/Source/wire".to_string());
+        let report = DashReport {
+            schema: dash::SCHEMA,
+            sessions: vec![s],
+            relays: vec![],
+        };
+        let out = render(&report, false, false);
+        assert!(out.contains("/Users/x/Source/wire"), "cwd shown:\n{out}");
     }
 }
