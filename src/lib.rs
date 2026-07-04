@@ -18,6 +18,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon_stream;
 pub mod daemon_supervisor;
+pub mod dash;
 pub mod diag;
 pub mod enc;
 pub mod endpoints;

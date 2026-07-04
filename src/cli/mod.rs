@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::config;
 
 mod comms;
+mod dash;
 mod demo;
 mod group;
 mod identity;
@@ -125,6 +126,23 @@ pub enum Command {
     Peers {
         #[arg(long)]
         json: bool,
+    },
+    /// One pane for every wire identity on this box — daemon liveness,
+    /// pinned peers, relay binding, and sync recency. Read-only; paired
+    /// sessions float to the top, idle solo daemons collapse into a count.
+    Dash {
+        /// Live-refresh every 2s (Ctrl-C to exit).
+        #[arg(long)]
+        watch: bool,
+        /// Emit the full snapshot as JSON (the `wire-dash-v1` surface).
+        #[arg(long)]
+        json: bool,
+        /// Show idle solo daemons too (hidden by default).
+        #[arg(long)]
+        all: bool,
+        /// Probe each distinct relay's /healthz (one GET per relay).
+        #[arg(long)]
+        probe: bool,
     },
     /// Emit a shell completion script to stdout.
     ///
@@ -1849,6 +1867,12 @@ pub fn run() -> Result<()> {
             colored,
         } => identity::cmd_whoami(json_default(json), short, colored),
         Command::Peers { json } => comms::cmd_peers(json_default(json)),
+        Command::Dash {
+            watch,
+            json,
+            all,
+            probe,
+        } => dash::cmd_dash(watch, json_default(json), all, probe),
         Command::Here { json } => comms::cmd_here(json_default(json)),
         Command::Demo { json } => demo::cmd_demo(json_default(json)),
         Command::Completions { shell } => {
