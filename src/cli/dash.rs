@@ -22,6 +22,20 @@ const DAEMON_W: usize = 6;
 const FP_W: usize = 9;
 const CWD_MAX: usize = 30;
 
+/// Write a frame to stdout, exiting cleanly on a broken pipe. `wire dash` is
+/// meant to be piped (`head`, `jq`, the Mission Control reporter, an SSH tail);
+/// the default `print!`/`println!` macros PANIC on EPIPE, so a downstream reader
+/// closing early would crash wire with a backtrace. Exit 0 instead.
+fn emit(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let r = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    if let Err(e) = r
+        && e.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(0);
+    }
+}
+
 pub fn cmd_dash(watch: bool, json: bool, all: bool, probe: bool) -> Result<()> {
     let opts = CollectOpts {
         probe_relays: probe,
@@ -33,22 +47,24 @@ pub fn cmd_dash(watch: bool, json: bool, all: bool, probe: bool) -> Result<()> {
         // looping instead of silently printing once.
         loop {
             let report = dash::collect(&opts)?;
-            print!("\x1b[2J\x1b[H"); // clear + home
+            let mut frame = String::from("\x1b[2J\x1b[H"); // clear + home
             if json {
-                println!("{}", serde_json::to_string(&report)?);
+                frame.push_str(&serde_json::to_string(&report)?);
+                frame.push('\n');
             } else {
-                print!("{}", render(&report, all, color));
+                frame.push_str(&render(&report, all, color));
             }
-            let _ = std::io::stdout().flush();
+            emit(&frame);
             std::thread::sleep(Duration::from_secs(2));
         }
     }
     let report = dash::collect(&opts)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    let frame = if json {
+        format!("{}\n", serde_json::to_string_pretty(&report)?)
     } else {
-        print!("{}", render(&report, all, color));
-    }
+        render(&report, all, color)
+    };
+    emit(&frame);
     Ok(())
 }
 
