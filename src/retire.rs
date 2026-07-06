@@ -124,6 +124,20 @@ pub fn stop_daemon_graceful_then_force(pid: u32) -> bool {
 pub fn current_home() -> Option<PathBuf> {
     let cfg = crate::config::config_dir().ok()?; // <home>/config/wire
     let home = cfg.parent()?.parent()?; // <home>
+    // Fail closed: only claim a home we can confirm is a real identity home
+    // (has `config/wire/private.key`). Under a bare terminal with no WIRE_HOME
+    // set, `config_dir()` is only one level deep (`dirs_config/wire`), so
+    // `parent().parent()` walks PAST the config root into an unrelated ancestor
+    // — the private.key check rejects that bogus path and returns None (the
+    // caller then fails closed) instead of a plausible-looking wrong home.
+    if !home
+        .join("config")
+        .join("wire")
+        .join("private.key")
+        .exists()
+    {
+        return None;
+    }
     Some(std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()))
 }
 

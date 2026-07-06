@@ -328,6 +328,7 @@ fn render(report: &dash::DashReport, all: bool, retired_only: bool, color: bool)
 /// cutoff. Dry-run unless confirmed; guards re-checked at kill time (TOCTOU).
 fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool) -> Result<()> {
     use crate::retire;
+    use std::path::PathBuf;
     // Fail closed: if we can't identify our own home, refuse — never risk
     // retiring the identity the operator is using right now.
     let current = retire::current_home().ok_or_else(|| {
@@ -336,36 +337,62 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
         )
     })?;
     let cutoff_s = older_than_days.saturating_mul(86_400);
-    let report = dash::collect(&CollectOpts::default())?;
-    // Snapshots don't carry home_dir; map key → home via list_sessions().
-    let sessions = crate::session::list_sessions()?;
-    let home_by_key: std::collections::HashMap<String, std::path::PathBuf> = sessions
-        .iter()
-        .map(|s| (s.name.clone(), s.home_dir.clone()))
-        .collect();
-
-    let is_candidate = |s: &SessionSnapshot, home: &std::path::Path| -> bool {
-        s.daemon.is_running()
-            && s.peers.is_empty()
-            && !s.retired
-            && std::fs::canonicalize(home)
-                .map(|h| h != current)
-                .unwrap_or(true)
-            && !retire::has_pending_inbound(home)
-            && retire::identity_age_s(home)
-                .map(|a| a >= cutoff_s)
-                .unwrap_or(false)
+    let is_current = |home: &std::path::Path| -> bool {
+        std::fs::canonicalize(home)
+            .map(|h| h == current)
+            .unwrap_or(false)
     };
-    let candidates: Vec<&SessionSnapshot> = report
-        .sessions
-        .iter()
-        .filter(|s| {
-            home_by_key
-                .get(&s.key)
-                .map(|h| is_candidate(s, h))
-                .unwrap_or(false)
-        })
-        .collect();
+
+    // Iterate session homes DIRECTLY — each SessionInfo carries its own
+    // home_dir. Deliberately NOT a name-keyed map: SessionInfo.name is the
+    // DID-derived handle, which can collide across ~270 identities (32-bit
+    // nickname space → birthday paradox), and a collision would collapse two
+    // homes and retire the wrong one.
+    struct Cand {
+        home: PathBuf,
+        label: String,
+        fp: String,
+        emoji: String,
+        cwd: Option<String>,
+        did: Option<String>,
+        handle: Option<String>,
+    }
+    let sessions = crate::session::list_sessions()?;
+    let mut candidates: Vec<Cand> = Vec::new();
+    for si in &sessions {
+        let home = &si.home_dir;
+        if !si.daemon_running
+            || retire::is_retired(home)
+            || is_current(home)
+            || retire::has_pending_inbound(home)
+            || retire::identity_age_s(home)
+                .map(|a| a < cutoff_s)
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        // Peer read last (a file read per session).
+        if !crate::dash::read_peers(home, si.did.as_deref(), si.handle.as_deref()).is_empty() {
+            continue;
+        }
+        candidates.push(Cand {
+            home: home.clone(),
+            label: si.handle.clone().unwrap_or_else(|| si.name.clone()),
+            fp: si
+                .did
+                .as_deref()
+                .and_then(crate::dash::fingerprint_from_did)
+                .unwrap_or_else(|| "—".into()),
+            emoji: si
+                .character
+                .as_ref()
+                .map(|c| c.emoji.clone())
+                .unwrap_or_else(|| "·".into()),
+            cwd: si.cwd.clone(),
+            did: si.did.clone(),
+            handle: si.handle.clone(),
+        });
+    }
 
     if candidates.is_empty() {
         if json {
@@ -377,7 +404,7 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
             ));
         } else {
             eprintln!(
-                "no idle solo daemons to retire (running >{older_than_days}d, 0 peers, not current/paired/pending)."
+                "no idle solo daemons to retire (identity older than {older_than_days}d, 0 peers, not current/paired/pending)."
             );
         }
         return Ok(());
@@ -387,9 +414,7 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
     if json && dry_run {
         let list: Vec<_> = candidates
             .iter()
-            .map(|s| {
-                serde_json::json!({"handle": s.handle, "key": s.key, "fp": s.fingerprint, "cwd": s.cwd})
-            })
+            .map(|c| serde_json::json!({"handle": c.handle, "fp": c.fp, "cwd": c.cwd}))
             .collect();
         emit(&format!(
             "{}\n",
@@ -400,20 +425,19 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
         return Ok(());
     }
 
-    // Always name the victims before the confirm gate (like `wire nuke`).
+    // Name the victims before the confirm gate (like `wire nuke`).
     eprintln!(
         "wire dash --retire-idle would retire {} idle identit{}:",
         candidates.len(),
         if candidates.len() == 1 { "y" } else { "ies" }
     );
-    for s in &candidates {
-        let h = s.handle.as_deref().unwrap_or(&s.key);
+    for c in &candidates {
         eprintln!(
             "  {} {}  {}  {}",
-            s.emoji.as_deref().unwrap_or("·"),
-            h,
-            s.fingerprint.as_deref().unwrap_or("—"),
-            s.cwd.as_deref().unwrap_or("")
+            c.emoji,
+            c.label,
+            c.fp,
+            c.cwd.as_deref().unwrap_or("")
         );
     }
     if dry_run {
@@ -454,29 +478,29 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut retired: Vec<String> = Vec::new();
-    let mut dropped: Vec<String> = Vec::new();
-    for s in &candidates {
-        let Some(home) = home_by_key.get(&s.key).cloned() else {
-            continue;
-        };
-        let label = s.handle.clone().unwrap_or_else(|| s.key.clone());
-        let peers = dash::read_peers(&home, s.did.as_deref(), s.handle.as_deref());
-        let ok = peers.is_empty()
-            && !retire::is_current(&home)
-            && !retire::has_pending_inbound(&home)
-            && !retire::is_retired(&home);
-        if !ok {
-            dropped.push(label);
+    let mut skipped: Vec<String> = Vec::new(); // a guard changed during confirm
+    let mut errored: Vec<String> = Vec::new();
+    let total = candidates.len();
+    for (i, c) in candidates.iter().enumerate() {
+        let still_ok = !is_current(&c.home)
+            && !retire::has_pending_inbound(&c.home)
+            && !retire::is_retired(&c.home)
+            && crate::dash::read_peers(&c.home, c.did.as_deref(), c.handle.as_deref()).is_empty();
+        if !still_ok {
+            skipped.push(c.label.clone());
             continue;
         }
+        if !json {
+            eprintln!("  [{}/{total}] retiring {}…", i + 1, c.label);
+        }
         match retire::retire_session(
-            &home,
+            &c.home,
             "idle-sweep",
             now_unix,
             retire::stop_daemon_graceful_then_force,
         ) {
-            Ok(_) => retired.push(label),
-            Err(e) => dropped.push(format!("{label} (error: {e})")),
+            Ok(_) => retired.push(c.label.clone()),
+            Err(e) => errored.push(format!("{}: {e}", c.label)),
         }
     }
 
@@ -484,17 +508,22 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
         emit(&format!(
             "{}\n",
             serde_json::to_string_pretty(
-                &serde_json::json!({"retired": retired, "dropped": dropped})
+                &serde_json::json!({"retired": retired, "skipped": skipped, "errored": errored})
             )?
         ));
     } else {
-        let drop_note = if dropped.is_empty() {
-            String::new()
-        } else {
-            format!("dropped {} (changed during confirm). ", dropped.len())
-        };
+        let mut note = String::new();
+        if !skipped.is_empty() {
+            note.push_str(&format!(
+                "skipped {} (changed during confirm). ",
+                skipped.len()
+            ));
+        }
+        if !errored.is_empty() {
+            note.push_str(&format!("{} errored. ", errored.len()));
+        }
         eprintln!(
-            "\nretired {} idle identit{}. {drop_note}`wire dash --retired` lists them; `wire revive <handle>` restores one.",
+            "\nretired {} idle identit{}. {note}`wire dash --retired` lists them; `wire revive <handle>` restores one.",
             retired.len(),
             if retired.len() == 1 { "y" } else { "ies" }
         );
@@ -571,6 +600,43 @@ mod tests {
         assert!(
             expanded.contains("↳ peer0 (VERIFIED)"),
             "peer line under paired"
+        );
+    }
+
+    #[test]
+    fn retired_collapses_by_default_and_lists_with_retired_flag() {
+        let mut r = snap("gone", false, 0); // daemon stopped
+        r.retired = true;
+        r.likely_idle = false;
+        let report = DashReport {
+            schema: dash::SCHEMA,
+            sessions: vec![snap("live", true, 1), r],
+            relays: vec![],
+        };
+        // Default view: retired row hidden (NOT via likely_idle, which is false
+        // once the daemon dies), counted in the summary + hidden note.
+        let def = render(&report, false, false, false);
+        assert!(
+            !def.contains("🦊 gone"),
+            "retired hidden by default:\n{def}"
+        );
+        assert!(
+            def.contains("1 retired ·"),
+            "retired counted in summary:\n{def}"
+        );
+        assert!(
+            def.contains("retired identity hidden"),
+            "retired hidden note:\n{def}"
+        );
+        // --retired: only retired rows.
+        let only = render(&report, false, true, false);
+        assert!(
+            only.contains("🦊 gone"),
+            "retired shown under --retired:\n{only}"
+        );
+        assert!(
+            !only.contains("🦊 live"),
+            "non-retired hidden under --retired:\n{only}"
         );
     }
 
