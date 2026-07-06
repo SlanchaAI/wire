@@ -49,6 +49,32 @@ pub struct DashArgs {
     pub force: bool,
 }
 
+/// A warning banner when this shell's wire identity is split — the env resolves
+/// a different identity than Claude Code's live session (a stale wire process,
+/// usually an MCP server, answering as the wrong identity). Empty when healthy.
+fn split_banner(color: bool) -> String {
+    let Some(s) = crate::session::detect_identity_split() else {
+        return String::new();
+    };
+    let headline = match (s.env_handle.as_deref(), s.live_handle.as_deref()) {
+        (Some(env), Some(live)) => {
+            format!("this shell operates as {env} but your live Claude session is {live}")
+        }
+        _ => format!(
+            "the wire identity this shell resolves (via {}) doesn't match your live Claude session",
+            s.env_source
+        ),
+    };
+    let body = format!(
+        "⚠ identity split — {headline}.\n  A stale wire process (usually an MCP server) is bound to the wrong identity. Fix: reconnect it (/mcp) or restart this session.\n\n"
+    );
+    if color {
+        format!("\x1b[33m{body}\x1b[0m")
+    } else {
+        body
+    }
+}
+
 pub fn cmd_dash(args: DashArgs) -> Result<()> {
     if args.retire_idle {
         return cmd_retire_idle(
@@ -73,6 +99,7 @@ pub fn cmd_dash(args: DashArgs) -> Result<()> {
                 frame.push_str(&serde_json::to_string(&report)?);
                 frame.push('\n');
             } else {
+                frame.push_str(&split_banner(color));
                 frame.push_str(&render(&report, args.all, args.retired, color));
             }
             emit(&frame);
@@ -83,7 +110,11 @@ pub fn cmd_dash(args: DashArgs) -> Result<()> {
     let frame = if args.json {
         format!("{}\n", serde_json::to_string_pretty(&report)?)
     } else {
-        render(&report, args.all, args.retired, color)
+        format!(
+            "{}{}",
+            split_banner(color),
+            render(&report, args.all, args.retired, color)
+        )
     };
     emit(&frame);
     Ok(())
