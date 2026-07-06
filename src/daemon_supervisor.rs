@@ -157,22 +157,41 @@ fn fs_has_identity(home: &Path) -> bool {
         .exists()
 }
 
+/// True iff the session home has been retired (`state/wire/retired.json`).
+/// A retired home is ineligible for a daemon regardless of cwd/identity/idle —
+/// the supervisor kills any running child and never respawns. Pure existence
+/// check (see [`crate::retire::is_retired`]).
+fn fs_is_retired(home: &Path) -> bool {
+    crate::retire::is_retired(home)
+}
+
 /// Filter `list_sessions()` down to the sessions the supervisor should
 /// own a daemon for. A session is eligible iff it has a registry cwd
 /// binding OR it was active within `max_idle`. `max_idle == None`
 /// disables the filter (every session eligible). Pure: the activity
 /// probe is injected so this is unit-testable without touching disk.
-fn supervisor_eligible<F, G>(
+fn supervisor_eligible<F, G, H>(
     sessions: Vec<crate::session::SessionInfo>,
     max_idle: Option<Duration>,
     now: SystemTime,
     last_active: F,
     has_identity: G,
+    is_retired: H,
 ) -> Vec<crate::session::SessionInfo>
 where
     F: Fn(&Path) -> Option<SystemTime>,
     G: Fn(&Path) -> bool,
+    H: Fn(&Path) -> bool,
 {
+    // Retired homes are ineligible in EVERY configuration — filtered FIRST,
+    // ahead of the `max_idle == None` early-return and the cwd/identity keeps
+    // below. A retired identity's daemon must stop and never respawn; an
+    // `is_retired` check placed after either branch would let a cwd-bound or
+    // identity-ful retired home stay eligible and get respawned.
+    let sessions: Vec<crate::session::SessionInfo> = sessions
+        .into_iter()
+        .filter(|s| !is_retired(&s.home_dir))
+        .collect();
     let Some(max_idle) = max_idle else {
         return sessions;
     };
@@ -440,6 +459,7 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
             SystemTime::now(),
             fs_last_active,
             fs_has_identity,
+            fs_is_retired,
         );
         if wanted.len() != total_sessions {
             eprintln!(
@@ -738,6 +758,7 @@ pub fn read_supervisor_state() -> Result<SupervisorState> {
         SystemTime::now(),
         fs_last_active,
         fs_has_identity,
+        fs_is_retired,
     )
     .into_iter()
     .map(|s| s.name)
@@ -1135,6 +1156,7 @@ mod tests {
             now,
             |_| Some(ancient),
             |_| false,
+            |_| false,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "wire");
@@ -1163,6 +1185,7 @@ mod tests {
                 }
             },
             |_| false,
+            |_| false,
         );
         let names: Vec<_> = out.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["rosy-rook"]);
@@ -1179,6 +1202,7 @@ mod tests {
             Some(Duration::from_secs(7 * 86_400)),
             now,
             |_| None,
+            |_| false,
             |_| false,
         );
         assert!(out.is_empty());
@@ -1200,9 +1224,46 @@ mod tests {
             now,
             |_| None,                      // neither has ever synced
             |home| home.ends_with("real"), // only this one has a private.key
+            |_| false,
         );
         let names: Vec<_> = out.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["real"]);
+    }
+
+    #[test]
+    fn eligible_drops_retired_even_with_cwd_identity_or_no_cutoff() {
+        // The retire invariant: a `.retired` home is ineligible in EVERY
+        // configuration — with a cwd binding, with an identity, and even under
+        // `max_idle = None` (the spawn-for-all override). All three would
+        // otherwise keep it eligible; the retired filter must beat them all.
+        let now = SystemTime::now();
+        let sessions = vec![
+            mk_session("retired-proj", Some("/Users/p/proj")), // cwd-bound
+            mk_session("retired-id", None),                    // identity-ful
+            mk_session("live", Some("/Users/p/live")),
+        ];
+        let retired = |home: &Path| home.to_string_lossy().contains("retired-");
+        // With the 7-day cutoff.
+        let out = supervisor_eligible(
+            sessions.clone(),
+            Some(Duration::from_secs(7 * 86_400)),
+            now,
+            |_| Some(now),
+            |home| home.ends_with("retired-id"), // retired-id has identity
+            retired,
+        );
+        assert_eq!(
+            out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["live"],
+            "both retired homes dropped despite cwd/identity"
+        );
+        // And under the max_idle=None spawn-for-all override.
+        let out2 = supervisor_eligible(sessions, None, now, |_| Some(now), |_| true, retired);
+        assert_eq!(
+            out2.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["live"],
+            "retired dropped even with max_idle=None"
+        );
     }
 
     #[test]
@@ -1211,7 +1272,7 @@ mod tests {
         let now = SystemTime::now();
         let ancient = now - Duration::from_secs(999 * 86_400);
         let sessions = vec![mk_session("husk", None), mk_session("agate-nimbus", None)];
-        let out = supervisor_eligible(sessions, None, now, |_| Some(ancient), |_| false);
+        let out = supervisor_eligible(sessions, None, now, |_| Some(ancient), |_| false, |_| false);
         assert_eq!(out.len(), 2);
     }
 

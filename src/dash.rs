@@ -74,10 +74,14 @@ pub struct SessionSnapshot {
     pub peers: Vec<PeerRow>,
     pub cwd: Option<String>,
     /// A running daemon with no real pinned peers — the throwaway
-    /// Claude-session daemon pattern, a candidate for the husk reaper.
-    /// Deliberately NOT a "usage" claim: a live daemon heartbeat-syncs
-    /// regardless of use, so peers (not sync-age) are the honest signal.
+    /// Claude-session daemon pattern, a candidate for retire. Deliberately NOT
+    /// a "usage" claim: a live daemon heartbeat-syncs regardless of use, so
+    /// peers (not sync-age) are the honest signal. A retired identity is never
+    /// `likely_idle` (it's already handled).
     pub likely_idle: bool,
+    /// This identity has been retired (`wire retire`) — a `.retired` marker is
+    /// present; the supervisor won't keep a daemon for it.
+    pub retired: bool,
 }
 
 /// `/healthz` result for one distinct relay URL.
@@ -231,7 +235,8 @@ fn snapshot_one(si: &crate::session::SessionInfo) -> SessionSnapshot {
         ),
         None => (None, None, None, None),
     };
-    let likely_idle = daemon.is_running() && peers.is_empty();
+    let retired = crate::retire::is_retired(home);
+    let likely_idle = daemon.is_running() && peers.is_empty() && !retired;
     SessionSnapshot {
         key: si.name.clone(),
         handle: si.handle.clone(),
@@ -249,6 +254,7 @@ fn snapshot_one(si: &crate::session::SessionInfo) -> SessionSnapshot {
         peers,
         cwd: si.cwd.clone(),
         likely_idle,
+        retired,
     }
 }
 
@@ -439,6 +445,7 @@ mod tests {
                 peers: vec![],
                 cwd: Some("/tmp/x".into()),
                 likely_idle: false,
+                retired: false,
             }],
             relays: vec![],
         };
@@ -462,6 +469,7 @@ mod tests {
             "peers",
             "cwd",
             "likely_idle",
+            "retired",
         ] {
             assert!(s.get(key).is_some(), "missing golden field: {key}");
         }

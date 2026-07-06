@@ -36,33 +36,54 @@ fn emit(text: &str) {
     }
 }
 
-pub fn cmd_dash(watch: bool, json: bool, all: bool, probe: bool) -> Result<()> {
+/// Parsed `wire dash` flags.
+pub struct DashArgs {
+    pub watch: bool,
+    pub json: bool,
+    pub all: bool,
+    pub probe: bool,
+    pub retired: bool,
+    pub retire_idle: bool,
+    pub older_than: Option<u64>,
+    pub dry_run: bool,
+    pub force: bool,
+}
+
+pub fn cmd_dash(args: DashArgs) -> Result<()> {
+    if args.retire_idle {
+        return cmd_retire_idle(
+            args.older_than.unwrap_or(7),
+            args.dry_run,
+            args.force,
+            args.json,
+        );
+    }
     let opts = CollectOpts {
-        probe_relays: probe,
+        probe_relays: args.probe,
     };
     let color = std::io::stdout().is_terminal();
-    if watch {
+    if args.watch {
         // Watch is the outer loop: each tick emits JSON (one compact object)
         // or the table, so `--watch --json` streams and `--watch | pipe` keeps
         // looping instead of silently printing once.
         loop {
             let report = dash::collect(&opts)?;
             let mut frame = String::from("\x1b[2J\x1b[H"); // clear + home
-            if json {
+            if args.json {
                 frame.push_str(&serde_json::to_string(&report)?);
                 frame.push('\n');
             } else {
-                frame.push_str(&render(&report, all, color));
+                frame.push_str(&render(&report, args.all, args.retired, color));
             }
             emit(&frame);
             std::thread::sleep(Duration::from_secs(2));
         }
     }
     let report = dash::collect(&opts)?;
-    let frame = if json {
+    let frame = if args.json {
         format!("{}\n", serde_json::to_string_pretty(&report)?)
     } else {
-        render(&report, all, color)
+        render(&report, args.all, args.retired, color)
     };
     emit(&frame);
     Ok(())
@@ -122,7 +143,18 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
+/// The retired marker cell, fixed to `DAEMON_W` visible chars (magenta).
+fn retired_cell(color: bool) -> String {
+    let label = "◌ retd";
+    let padded = format!("{label:<DAEMON_W$}");
+    if color {
+        format!("\x1b[35m{padded}\x1b[0m")
+    } else {
+        padded
+    }
+}
+
+fn render(report: &dash::DashReport, all: bool, retired_only: bool, color: bool) -> String {
     let total = report.sessions.len();
     let running = report
         .sessions
@@ -135,6 +167,7 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
         .filter(|s| !s.peers.is_empty())
         .count();
     let idle = report.sessions.iter().filter(|s| s.likely_idle).count();
+    let retired_n = report.sessions.iter().filter(|s| s.retired).count();
     let husks = report
         .sessions
         .iter()
@@ -143,7 +176,7 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "wire dash — {total} identities · {running} running · {paired} paired · {idle} idle · {husks} husks\n"
+        "wire dash — {total} identities · {running} running · {paired} paired · {idle} idle · {retired_n} retired · {husks} husks\n"
     ));
     for r in &report.relays {
         let health = if r.unprobed {
@@ -179,13 +212,30 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
         color,
     ));
 
-    let mut hidden = 0usize;
+    let mut hidden_idle = 0usize;
+    let mut hidden_retired = 0usize;
+    let mut shown = 0usize;
     for s in &report.sessions {
-        // Collapse idle solo daemons unless --all.
-        if s.likely_idle && !all {
-            hidden += 1;
+        // Visibility: `--retired` shows only retired; otherwise idle solo
+        // daemons AND retired identities collapse unless `--all`.
+        let show = if retired_only {
+            s.retired
+        } else if all {
+            true
+        } else {
+            !s.likely_idle && !s.retired
+        };
+        if !show {
+            if !retired_only {
+                if s.retired {
+                    hidden_retired += 1;
+                } else if s.likely_idle {
+                    hidden_idle += 1;
+                }
+            }
             continue;
         }
+        shown += 1;
         let name = display_name(s);
         let emoji = s.emoji.as_deref().unwrap_or("·");
         let plain_name = format!("{emoji} {name}");
@@ -204,16 +254,21 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
         let peers = s.peers.len();
         let sync = fmt_age(s.last_sync_age_s);
         let relay = s.relay_url.as_deref().unwrap_or("—");
-        // cwd is the reap-decision signal for idle daemons — which project a
-        // stale daemon belongs to. Dim, truncated.
+        // cwd is the reap-decision signal — which project an idle/retired
+        // daemon belongs to. Dim, truncated.
         let cwd = s
             .cwd
             .as_deref()
             .map(|c| format!("  {}", dim(&truncate(c, CWD_MAX), color)))
             .unwrap_or_default();
+        // Retired identities show a distinct marker, not their (stopped) daemon.
+        let daemon = if s.retired {
+            retired_cell(color)
+        } else {
+            daemon_cell(&s.daemon, color)
+        };
         out.push_str(&format!(
-            "{name_col} {daemon} {fp:<FP_W$} {peers:>5} {sync:>6}  {relay}{cwd}\n",
-            daemon = daemon_cell(&s.daemon, color),
+            "{name_col} {daemon} {fp:<FP_W$} {peers:>5} {sync:>6}  {relay}{cwd}\n"
         ));
         // Pinned peers under a paired session (sanitized — handle/tier are
         // peer-published text that must not inject terminal escapes).
@@ -232,18 +287,219 @@ fn render(report: &dash::DashReport, all: bool, color: bool) -> String {
             out.push_str(&dim(&format!("    ↳ {}\n", list.join(", ")), color));
         }
     }
-    if hidden > 0 {
-        let plural = if hidden == 1 { "" } else { "s" };
-        out.push_str(&dim(
-            &format!("\n… {hidden} idle solo daemon{plural} hidden (--all to show)\n"),
-            color,
-        ));
+    if retired_only {
+        if shown == 0 {
+            out.push_str(&dim("no retired identities.\n", color));
+        }
+    } else {
+        if hidden_idle > 0 {
+            let p = if hidden_idle == 1 { "" } else { "s" };
+            out.push_str(&dim(
+                &format!(
+                    "\n… {hidden_idle} idle solo daemon{p} hidden (--all to show · `wire dash --retire-idle` to clean up)\n"
+                ),
+                color,
+            ));
+        }
+        if hidden_retired > 0 {
+            let noun = if hidden_retired == 1 {
+                "identity"
+            } else {
+                "identities"
+            };
+            out.push_str(&dim(
+                &format!(
+                    "… {hidden_retired} retired {noun} hidden (--retired to list · `wire revive <handle>` to restore)\n"
+                ),
+                color,
+            ));
+        }
     }
     out.push_str(&dim(
         "run `wire dash` on each box for a fleet view.\n",
         color,
     ));
     out
+}
+
+/// `wire dash --retire-idle` — reversibly retire every idle solo daemon.
+/// Selection: running daemon ∧ 0 pinned peers ∧ not the current identity ∧ no
+/// pending inbound pair ∧ not already retired ∧ daemon running longer than the
+/// cutoff. Dry-run unless confirmed; guards re-checked at kill time (TOCTOU).
+fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool) -> Result<()> {
+    use crate::retire;
+    // Fail closed: if we can't identify our own home, refuse — never risk
+    // retiring the identity the operator is using right now.
+    let current = retire::current_home().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve the current identity's home — refusing --retire-idle (would risk retiring the session you're using)"
+        )
+    })?;
+    let cutoff_s = older_than_days.saturating_mul(86_400);
+    let report = dash::collect(&CollectOpts::default())?;
+    // Snapshots don't carry home_dir; map key → home via list_sessions().
+    let sessions = crate::session::list_sessions()?;
+    let home_by_key: std::collections::HashMap<String, std::path::PathBuf> = sessions
+        .iter()
+        .map(|s| (s.name.clone(), s.home_dir.clone()))
+        .collect();
+
+    let is_candidate = |s: &SessionSnapshot, home: &std::path::Path| -> bool {
+        s.daemon.is_running()
+            && s.peers.is_empty()
+            && !s.retired
+            && std::fs::canonicalize(home)
+                .map(|h| h != current)
+                .unwrap_or(true)
+            && !retire::has_pending_inbound(home)
+            && retire::daemon_pidfile_age_s(home)
+                .map(|a| a >= cutoff_s)
+                .unwrap_or(false)
+    };
+    let candidates: Vec<&SessionSnapshot> = report
+        .sessions
+        .iter()
+        .filter(|s| {
+            home_by_key
+                .get(&s.key)
+                .map(|h| is_candidate(s, h))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        if json {
+            emit(&format!(
+                "{}\n",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"retired":[],"note":"no idle identities matched"})
+                )?
+            ));
+        } else {
+            eprintln!(
+                "no idle solo daemons to retire (running >{older_than_days}d, 0 peers, not current/paired/pending)."
+            );
+        }
+        return Ok(());
+    }
+
+    // JSON dry-run: structured preview for automation.
+    if json && dry_run {
+        let list: Vec<_> = candidates
+            .iter()
+            .map(|s| {
+                serde_json::json!({"handle": s.handle, "key": s.key, "fp": s.fingerprint, "cwd": s.cwd})
+            })
+            .collect();
+        emit(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"would_retire": list, "count": candidates.len()})
+            )?
+        ));
+        return Ok(());
+    }
+
+    // Always name the victims before the confirm gate (like `wire nuke`).
+    eprintln!(
+        "wire dash --retire-idle would retire {} idle identit{}:",
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" }
+    );
+    for s in &candidates {
+        let h = s.handle.as_deref().unwrap_or(&s.key);
+        eprintln!(
+            "  {} {}  {}  {}",
+            s.emoji.as_deref().unwrap_or("·"),
+            h,
+            s.fingerprint.as_deref().unwrap_or("—"),
+            s.cwd.as_deref().unwrap_or("")
+        );
+    }
+    if dry_run {
+        eprintln!(
+            "\n(dry run — nothing retired. Re-run without --dry-run; `wire revive <handle>` undoes any.)"
+        );
+        return Ok(());
+    }
+
+    // Typed confirm, unless --force. --force skips the prompt ONLY — it never
+    // bypasses the selection guards above.
+    if !force {
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "refusing to retire {} identities without a TTY confirmation (use --force for automation)",
+                candidates.len()
+            );
+        }
+        eprint!(
+            "\nType `retire` to retire these {} identities (reversible): ",
+            candidates.len()
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        if line.trim() != "retire" {
+            eprintln!("aborted — nothing retired.");
+            return Ok(());
+        }
+    }
+
+    // Execute, re-checking guards per target at kill time (TOCTOU: a candidate
+    // could have paired / become current / gotten a pending request during the
+    // confirm latency).
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut retired: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for s in &candidates {
+        let Some(home) = home_by_key.get(&s.key).cloned() else {
+            continue;
+        };
+        let label = s.handle.clone().unwrap_or_else(|| s.key.clone());
+        let peers = dash::read_peers(&home, s.did.as_deref(), s.handle.as_deref());
+        let ok = peers.is_empty()
+            && !retire::is_current(&home)
+            && !retire::has_pending_inbound(&home)
+            && !retire::is_retired(&home);
+        if !ok {
+            dropped.push(label);
+            continue;
+        }
+        match retire::retire_session(
+            &home,
+            "idle-sweep",
+            now_unix,
+            retire::stop_daemon_graceful_then_force,
+        ) {
+            Ok(_) => retired.push(label),
+            Err(e) => dropped.push(format!("{label} (error: {e})")),
+        }
+    }
+
+    if json {
+        emit(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"retired": retired, "dropped": dropped})
+            )?
+        ));
+    } else {
+        let drop_note = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!("dropped {} (changed during confirm). ", dropped.len())
+        };
+        eprintln!(
+            "\nretired {} idle identit{}. {drop_note}`wire dash --retired` lists them; `wire revive <handle>` restores one.",
+            retired.len(),
+            if retired.len() == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -279,6 +535,7 @@ mod tests {
                 .collect(),
             cwd: None,
             likely_idle: running && peers == 0,
+            retired: false,
         }
     }
 
@@ -294,7 +551,7 @@ mod tests {
                 unprobed: true,
             }],
         };
-        let collapsed = render(&report, false, false);
+        let collapsed = render(&report, false, false, false);
         assert!(collapsed.contains("paired"), "paired session always shown");
         assert!(
             collapsed.contains("1 idle solo daemon hidden"),
@@ -306,7 +563,7 @@ mod tests {
             "idle row is hidden:\n{collapsed}"
         );
 
-        let expanded = render(&report, true, false);
+        let expanded = render(&report, true, false, false);
         assert!(
             !expanded.contains("hidden"),
             "--all shows everything:\n{expanded}"
@@ -324,7 +581,7 @@ mod tests {
             sessions: vec![snap("a", true, 2), snap("b", true, 0), snap("c", false, 0)],
             relays: vec![],
         };
-        let out = render(&report, true, false);
+        let out = render(&report, true, false, false);
         assert!(out.contains("3 identities"), "{out}");
         assert!(out.contains("2 running"), "{out}");
         assert!(out.contains("1 paired"), "{out}");
@@ -345,7 +602,7 @@ mod tests {
             sessions: vec![s],
             relays: vec![],
         };
-        let out = render(&report, true, true);
+        let out = render(&report, true, false, true);
         // The live screen-clear escape (ESC[2J) must not survive into output.
         // sanitize_display_text strips the ESC byte; the inert "[2J" text may
         // remain, which is harmless (no ESC = no terminal action).
@@ -375,7 +632,7 @@ mod tests {
             sessions: vec![s],
             relays: vec![],
         };
-        let out = render(&report, false, false);
+        let out = render(&report, false, false, false);
         assert!(out.contains("/Users/x/Source/wire"), "cwd shown:\n{out}");
     }
 }

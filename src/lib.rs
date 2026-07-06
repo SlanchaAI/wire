@@ -50,6 +50,7 @@ pub mod probe;
 pub mod pull;
 pub mod relay_client;
 pub mod relay_server;
+pub mod retire;
 pub mod same_machine;
 pub mod send;
 pub mod service;
