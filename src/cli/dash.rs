@@ -352,7 +352,7 @@ fn cmd_retire_idle(older_than_days: u64, dry_run: bool, force: bool, json: bool)
                 .map(|h| h != current)
                 .unwrap_or(true)
             && !retire::has_pending_inbound(home)
-            && retire::daemon_pidfile_age_s(home)
+            && retire::identity_age_s(home)
                 .map(|a| a >= cutoff_s)
                 .unwrap_or(false)
     };

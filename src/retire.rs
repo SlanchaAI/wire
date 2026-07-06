@@ -157,13 +157,15 @@ pub fn has_pending_inbound(home: &Path) -> bool {
     }
 }
 
-/// Seconds since the home's daemon was spawned — the mtime of
-/// `state/wire/daemon.pid`, which is written on spawn and (deliberately) NOT
-/// refreshed each poll. Used as the "how long has this been running" signal so
-/// the bulk sweep never touches a freshly-started sibling session. `None` if no
-/// daemon pidfile.
-pub fn daemon_pidfile_age_s(home: &Path) -> Option<u64> {
-    let p = home.join("state").join("wire").join("daemon.pid");
+/// Seconds since this identity was created — the mtime of
+/// `config/wire/private.key`, written exactly once at keygen and never
+/// rewritten. This is the honest "how old is this throwaway" signal: unlike
+/// `daemon.pid` (which resets to now on every supervisor respawn) or
+/// `last_sync.json` (which a running daemon refreshes every heartbeat), the
+/// key's mtime tracks the identity's actual age, so a freshly-created sibling
+/// session is never swept. `None` if no key (not a real identity).
+pub fn identity_age_s(home: &Path) -> Option<u64> {
+    let p = home.join("config").join("wire").join("private.key");
     let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
     mtime.elapsed().ok().map(|d| d.as_secs())
 }
