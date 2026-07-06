@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::config;
 
 mod comms;
+mod dash;
 mod demo;
 mod group;
 mod identity;
@@ -123,6 +124,58 @@ pub enum Command {
     },
     /// List pinned peers with their tiers and capabilities.
     Peers {
+        #[arg(long)]
+        json: bool,
+    },
+    /// One pane for every wire identity on this box — daemon liveness,
+    /// pinned peers, relay binding, and sync recency. Read-only; paired
+    /// sessions float to the top, idle solo daemons collapse into a count.
+    Dash {
+        /// Live-refresh every 2s (Ctrl-C to exit).
+        #[arg(long)]
+        watch: bool,
+        /// Emit the full snapshot as JSON (the `wire-dash-v1` surface).
+        #[arg(long)]
+        json: bool,
+        /// Show idle solo daemons too (hidden by default).
+        #[arg(long)]
+        all: bool,
+        /// Probe each distinct relay's /healthz (one GET per relay).
+        #[arg(long)]
+        probe: bool,
+        /// List retired identities (otherwise collapsed/hidden).
+        #[arg(long)]
+        retired: bool,
+        /// Reversibly retire every idle solo daemon (0 peers, not current,
+        /// idle past the cutoff). Dry-run unless confirmed.
+        #[arg(long = "retire-idle")]
+        retire_idle: bool,
+        /// Idle cutoff in days for --retire-idle (default 7).
+        #[arg(long)]
+        older_than: Option<u64>,
+        /// Preview --retire-idle without retiring anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the typed confirmation for --retire-idle (automation).
+        /// Never bypasses the current/paired/pending/recent guards.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reversibly decommission an identity you're done with — stop its daemon
+    /// and stop the supervisor from respawning it. `wire revive` undoes it.
+    Retire {
+        /// Handle, fingerprint, or session key of the identity to retire.
+        target: String,
+        /// Retire even a paired (mesh-member) identity.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bring a retired identity back — the supervisor respawns its daemon.
+    Revive {
+        /// Handle, fingerprint, or session key of the identity to revive.
+        target: String,
         #[arg(long)]
         json: bool,
     },
@@ -1849,6 +1902,33 @@ pub fn run() -> Result<()> {
             colored,
         } => identity::cmd_whoami(json_default(json), short, colored),
         Command::Peers { json } => comms::cmd_peers(json_default(json)),
+        Command::Dash {
+            watch,
+            json,
+            all,
+            probe,
+            retired,
+            retire_idle,
+            older_than,
+            dry_run,
+            force,
+        } => dash::cmd_dash(dash::DashArgs {
+            watch,
+            json: json_default(json),
+            all,
+            probe,
+            retired,
+            retire_idle,
+            older_than,
+            dry_run,
+            force,
+        }),
+        Command::Retire {
+            target,
+            force,
+            json,
+        } => lifecycle::cmd_retire(target, force, json_default(json)),
+        Command::Revive { target, json } => lifecycle::cmd_revive(target, json_default(json)),
         Command::Here { json } => comms::cmd_here(json_default(json)),
         Command::Demo { json } => demo::cmd_demo(json_default(json)),
         Command::Completions { shell } => {

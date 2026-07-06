@@ -287,3 +287,81 @@ fn scrub_shell_lines(warnings: &mut Vec<String>) {
         }
     }
 }
+
+// ---------- retire / revive (reversible identity decommission) ----------
+
+/// `wire retire <handle|fp|key>` — reversibly decommission an identity you're
+/// done with: write a `.retired` marker (so the supervisor won't respawn) and
+/// stop its daemon. Guards: never the current identity; a paired identity
+/// (mesh member) needs `--force`.
+pub(crate) fn cmd_retire(target: String, force: bool, as_json: bool) -> Result<()> {
+    let s = crate::retire::resolve_target(&target)?;
+    let home = s.home_dir.clone();
+    let label = s.handle.clone().unwrap_or_else(|| s.name.clone());
+
+    // Hard refuse, no override: never retire the identity this process uses.
+    if crate::retire::is_current(&home) {
+        anyhow::bail!("'{label}' is the identity you're using right now — refusing to retire it");
+    }
+    // Paired = your live mesh; require an explicit --force to retire a member.
+    let peers = crate::dash::read_peers(&home, s.did.as_deref(), s.handle.as_deref());
+    if !peers.is_empty() && !force {
+        anyhow::bail!(
+            "'{label}' is paired with {} peer(s) — part of your mesh. Pass --force to retire it anyway.",
+            peers.len()
+        );
+    }
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = crate::retire::retire_session(
+        &home,
+        "manual",
+        now_unix,
+        crate::retire::stop_daemon_graceful_then_force,
+    )?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "retired": label, "key": s.name, "did": s.did, "stopped_pid": pid,
+            }))?
+        );
+    } else {
+        match pid {
+            Some(p) => eprintln!(
+                "retired {label} — stopped daemon pid {p}. `wire revive {label}` brings it back."
+            ),
+            None => eprintln!(
+                "retired {label} — no daemon was running. `wire revive {label}` brings it back."
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `wire revive <handle|fp|key>` — undo a retire: remove the marker; the
+/// supervisor respawns the daemon on its next poll. The identity, relay slot,
+/// and any mail that arrived while retired are all intact.
+pub(crate) fn cmd_revive(target: String, as_json: bool) -> Result<()> {
+    let s = crate::retire::resolve_target(&target)?;
+    let label = s.handle.clone().unwrap_or_else(|| s.name.clone());
+    let was = crate::retire::is_retired(&s.home_dir);
+    crate::retire::revive_session(&s.home_dir)?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"revived": label, "was_retired": was}))?
+        );
+    } else if was {
+        eprintln!(
+            "revived {label} — the supervisor will respawn its daemon within a poll (~10-60s)."
+        );
+    } else {
+        eprintln!("{label} was not retired — nothing to do.");
+    }
+    Ok(())
+}

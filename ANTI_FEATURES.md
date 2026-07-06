@@ -88,6 +88,18 @@ Self-hosted relay defaults to plain HTTP on localhost; operator chooses ingress.
 
 Foreground-first. `wire daemonize` opt-in. Won't change.
 
+## 21. No cross-agent memory store
+
+wire is transport, not a memory backend. Agents bring their own memory (a vault, a DB, whatever). We won't ship a "structured cross-agent memory" API — the thing BAND (band.ai) gates behind Enterprise and leaves off its own real-time bus, absent from its own core model. A message bus that also owns your agents' memory is two products; we are one. Won't change. (Deliberate divergence — verified against BAND's shipped API, 2026-07-04.)
+
+## 22. No task boards / kanban / workflow orchestration
+
+No per-room task board, no assignments, no goal tracker. Coordinating *what work happens* is the agent's job (or its orchestrator's); wire coordinates *messages between identities*. BAND ships a beta kanban; that's orchestration, a different lane (see #8). Won't change.
+
+## 23. No governance-UI / policy-engine product
+
+We won't build an approval-queue, a pre-action pause/kill console, or a policy engine as a product surface. wire's honest governance is the **signed, verifiable audit trail it already emits** (every envelope Ed25519-signed; see #11) — a stronger evidentiary claim than a self-reported event log, and it needs no dashboard to be true. Surfacing that audit queryably is fine; building "governance" theater on spec is not. Won't change pre-1.0.
+
 ---
 
 OSS projects die from scope creep faster than from any other cause. This list is the maintainer's pre-commitment device. Feature requests that violate any item: closed with link to this file.

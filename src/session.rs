@@ -892,6 +892,87 @@ fn valid_session_key(v: &str) -> bool {
     !v.is_empty() && !v.contains("${")
 }
 
+/// A session-identity SPLIT: the ENV-derived session key disagrees with the
+/// PID-file-derived one (Claude Code's authoritative live session). This is the
+/// "displayed name ≠ operational name" bug — usually a long-lived wire process
+/// (an MCP server) frozen to a stale session key while the live Claude session
+/// moved on (e.g. across a resume), so the process answers as the wrong
+/// identity. Both handles are resolved for a human-readable warning.
+#[derive(Debug, Clone)]
+pub struct IdentitySplit {
+    pub env_source: &'static str,
+    pub env_handle: Option<String>,
+    pub live_handle: Option<String>,
+}
+
+/// The session key from the ENV alone (first valid host var), independent of
+/// the PID-file adapter. Mirrors the env portion of [`resolve_session_key`].
+fn session_key_from_env() -> Option<(String, &'static str)> {
+    for (var, source) in [
+        ("WIRE_SESSION_ID", "override"),
+        ("CLAUDE_CODE_SESSION_ID", "claude-code"),
+        ("CODEX_SESSION_ID", "codex-cli"),
+        ("COPILOT_AGENT_SESSION_ID", "copilot-cli"),
+        ("VSCODE_GIT_REPOSITORY_ROOT", "vscode-workspace"),
+    ] {
+        if let Ok(v) = std::env::var(var)
+            && valid_session_key(&v)
+        {
+            return Some((v.trim().to_string(), source));
+        }
+    }
+    None
+}
+
+/// Two session keys conflict iff they sanitize to different by-key homes.
+fn keys_conflict(env_key: &str, live_key: &str) -> bool {
+    sanitize_name(env_key) != sanitize_name(live_key)
+}
+
+fn handle_for_key(key: &str) -> Option<String> {
+    let home = session_home_for_key(&sanitize_name(key)).ok()?;
+    let card = home.join("config").join("wire").join("agent-card.json");
+    read_card_identity(&card).1
+}
+
+/// Detect a session-identity split (see [`IdentitySplit`]). `None` in the
+/// healthy case — env and PID-file agree, or either is absent. The PID-file
+/// adapter walks this process's parent chain to the owning `claude` process, so
+/// it reflects the LIVE session; a disagreement means the env is stale.
+pub fn detect_identity_split() -> Option<IdentitySplit> {
+    let (env_key, env_source) = session_key_from_env()?;
+    let live_key = claude_code_session_from_pidfile()?;
+    if !keys_conflict(&env_key, &live_key) {
+        return None;
+    }
+    Some(IdentitySplit {
+        env_source,
+        env_handle: handle_for_key(&env_key),
+        live_handle: handle_for_key(&live_key),
+    })
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::{keys_conflict, valid_session_key};
+
+    #[test]
+    fn keys_conflict_only_on_different_homes() {
+        assert!(!keys_conflict("abc-123", "abc-123"), "same key ⇒ no split");
+        assert!(keys_conflict("abc-123", "xyz-999"), "different key ⇒ split");
+        // sanitize collapses equivalent forms → no false split.
+        assert!(!keys_conflict(" abc ", "abc"));
+    }
+
+    #[test]
+    fn unexpanded_template_key_is_invalid() {
+        // The ${...} literal that caused the historical collision stays rejected,
+        // so it can never be one side of a (false) split.
+        assert!(!valid_session_key("${CLAUDE_CODE_SESSION_ID}"));
+        assert!(valid_session_key("real-session-id"));
+    }
+}
+
 /// Recover the Claude Code session id from the per-session PID-file when it
 /// isn't available via the environment. Claude Code writes
 /// `~/.claude/sessions/<pid>.json` = `{"sessionId": "...", "cwd": "...", ...}`
