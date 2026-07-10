@@ -377,20 +377,32 @@ pub(crate) fn assert_relay_url_clean_for_publish(url: &str) -> Result<()> {
 
 // ---------- setup — one-shot MCP host registration ----------
 
+/// The canonical MCP-server entry `wire setup` upserts into every host config.
+///
+/// The `env` forward is load-bearing: the earlier "Claude Code propagates
+/// CLAUDE_CODE_SESSION_ID by default so this is redundant" assumption was FALSE
+/// in the failure case — the MCP server can boot before Claude writes its
+/// session PID-file, so the pidfile fallback misses and the server MINTS a
+/// throwaway identity, giving the "two names" split (operational identity ≠
+/// statusline). An explicit `${CLAUDE_CODE_SESSION_ID}` in the MCP env closes
+/// that race for every session, not just those launched from a project dir that
+/// happened to carry the mapping. Inert on non-Claude hosts: an unexpanded
+/// `${...}` is rejected by `session::valid_session_key` and falls through
+/// safely. Living in one function (not a hand-edit) is what makes it survive the
+/// next `wire setup --apply`, which upserts this exact shape.
+pub(crate) fn standard_mcp_entry() -> Value {
+    json!({
+        "command": "wire",
+        "args": ["mcp"],
+        "env": { "WIRE_SESSION_ID": "${CLAUDE_CODE_SESSION_ID}" }
+    })
+}
+
 pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
     use crate::adapters::harness::HARNESS_ADAPTERS;
     use std::path::PathBuf;
 
-    // v0.14.x: no `env` mapping. Per-session identity for Claude Code is
-    // resolved by `crate::session::resolve_session_key`, which reads
-    // `WIRE_SESSION_ID` then falls back to `CLAUDE_CODE_SESSION_ID`. Current
-    // Claude Code (verified 2026-05) propagates `CLAUDE_CODE_SESSION_ID`
-    // into every MCP subprocess by default, so the historical mapping was
-    // redundant and triggered a misleading MCP Config Diagnostics warning.
-    let entry = json!({
-        "command": "wire",
-        "args": ["mcp"]
-    });
+    let entry = standard_mcp_entry();
     let entry_pretty = serde_json::to_string_pretty(&json!({"wire": &entry}))?;
 
     // v0.14.2 (#92 category 1): per-host detection + upsert logic lives
@@ -683,6 +695,38 @@ fn resolve_git_bash() -> Option<String> {
 #[cfg(test)]
 mod statusline_tests {
     use super::*;
+
+    #[test]
+    fn setup_entry_forwards_session_id_env() {
+        // Regression: the MCP entry `wire setup` writes MUST carry the session-id
+        // env-forward. Without it the MCP server races the session PID-file and
+        // mints a throwaway identity — the "two names" split. This is the canonical
+        // shape upserted into every host config, so the guard belongs on the entry.
+        let e = standard_mcp_entry();
+        assert_eq!(e["command"], "wire");
+        assert_eq!(e["args"], json!(["mcp"]));
+        assert_eq!(
+            e["env"]["WIRE_SESSION_ID"], "${CLAUDE_CODE_SESSION_ID}",
+            "setup entry must forward CLAUDE_CODE_SESSION_ID into the MCP env"
+        );
+    }
+
+    #[test]
+    fn setup_entry_upserts_idempotently_with_env() {
+        // The env-carrying entry round-trips through upsert_standard: first apply
+        // writes it, second is a no-op (byte-match) — so re-running `wire setup
+        // --apply` on every machine is the propagation path, not a clobber.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        let entry = standard_mcp_entry();
+        assert!(crate::adapters::harness::upsert_standard(&path, "wire", &entry).unwrap());
+        assert!(!crate::adapters::harness::upsert_standard(&path, "wire", &entry).unwrap());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["wire"]["env"]["WIRE_SESSION_ID"],
+            "${CLAUDE_CODE_SESSION_ID}"
+        );
+    }
 
     #[test]
     fn statusline_merge_preserves_keys_and_is_idempotent() {
