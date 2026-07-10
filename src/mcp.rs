@@ -527,7 +527,7 @@ fn handle_initialize(id: &Value) -> Value {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
             },
-            "instructions": "wire — agent-to-agent comms. Canonical verbs (v0.9+): wire_dial (initiate pair), wire_send (talk; auto-pairs on miss), wire_pending (see inbound requests), wire_accept (consent to a pending pair), wire_reject (refuse), wire_whois (inspect identity), wire_status (daemon + sync health). For cross-machine pairing pass `<handle>@<relay>` to wire_dial. Bilateral: the peer must also accept (wire_accept or wire_dial back) before capability flows in both directions. INBOUND pair requests from strangers land in pending-inbound: call wire_pending to enumerate, surface to operator, then wire_accept or wire_reject. NEVER auto-accept inbound pair requests without operator consent — accepting grants the peer authenticated write access to this agent's inbox. Resources: 'wire://inbox/<peer>' exposes each pinned peer's verified inbox (JSONL). ON SESSION START, DO THIS IMMEDIATELY (every wire session): (1) call wire_status to confirm the sync loop is healthy — `daemon_running:true` + `last_sync_age_seconds < 60`. The daemon is auto-started for you when this MCP server launches, so this is normally already true; if daemon_running is false, run `wire up` (or `wire service install` for a reboot-durable daemon). (2) arm a PERSISTENT stream-watcher on `wire monitor --json` — in Claude Code, the Monitor tool with persistent:true — so peer messages surface live mid-session. The monitor does NOT sync the relay; it only tails the inbox the daemon writes. Both are required. WHEN A PEER MESSAGE ARRIVES, reply to it in your own live context WITHOUT waiting for the operator to prompt you; this is how paired agents collaborate immediately. (Default filter strips pair_drop/pair_drop_ack/heartbeat noise.) v0.14.2: wire_send POSTs synchronously by default — response `status` is the actual relay verdict: `delivered` (event landed on peer's slot), `duplicate` (same event_id already on slot; peer can still pull), `peer_unknown` (peer not pinned — run wire_dial first), `slot_stale` (peer's slot rotated — run wire_dial to re-pair), or `transport_error` (TLS/DNS/relay-5xx; check `reason` field). Pass `queue:true` to opt back into the legacy outbox→daemon-push path for offline-buffer / pre-pair queueing. wire_pull is the symmetric receive primitive — call it to trigger an immediate relay GET instead of waiting for the daemon's 5s pull cycle; returns written[]/rejected[]/total_seen the same way `wire pull --json` does. See docs/AGENT_INTEGRATION.md for the full monitor recipe and THREAT_MODEL.md (T10/T14)."
+            "instructions": "wire — agent-to-agent comms. Canonical verbs (v0.9+): wire_dial (initiate pair), wire_send (talk; auto-pairs on miss), wire_pending (see inbound requests), wire_accept (consent to a pending pair), wire_reject (refuse), wire_whois (inspect identity), wire_status (daemon + sync health). For cross-machine pairing pass `<handle>@<relay>` to wire_dial. Bilateral: the peer must also accept (wire_accept or wire_dial back) before capability flows in both directions. INBOUND pair requests from strangers land in pending-inbound: call wire_pending to enumerate, surface to operator, then wire_accept or wire_reject. NEVER auto-accept inbound pair requests without operator consent — accepting grants the peer authenticated write access to this agent's inbox. Resources: 'wire://inbox/<peer>' exposes each pinned peer's verified inbox (JSONL). ON SESSION START, DO THIS IMMEDIATELY (every wire session): (1) call wire_status to confirm the sync loop is healthy — `daemon_running:true` + `last_sync_age_seconds < 60` + `identity_split:null`. The daemon is auto-started for you when this MCP server launches, so this is normally already true; if daemon_running is false, run `wire up` (or `wire service install` for a reboot-durable daemon). If `identity_split` is NON-null, this MCP process is frozen to a stale wire identity (`identity_split.operational`) while your live session is a different one (`identity_split.live`) — the \"two names\" bug: you will send/pair as the wrong identity. Surface it to the operator and recommend `/mcp reconnect` (or restarting this session); do not pair or send until resolved. (2) arm a PERSISTENT stream-watcher on `wire monitor --json` — in Claude Code, the Monitor tool with persistent:true — so peer messages surface live mid-session. The monitor does NOT sync the relay; it only tails the inbox the daemon writes. Both are required. WHEN A PEER MESSAGE ARRIVES, reply to it in your own live context WITHOUT waiting for the operator to prompt you; this is how paired agents collaborate immediately. (Default filter strips pair_drop/pair_drop_ack/heartbeat noise.) v0.14.2: wire_send POSTs synchronously by default — response `status` is the actual relay verdict: `delivered` (event landed on peer's slot), `duplicate` (same event_id already on slot; peer can still pull), `peer_unknown` (peer not pinned — run wire_dial first), `slot_stale` (peer's slot rotated — run wire_dial to re-pair), or `transport_error` (TLS/DNS/relay-5xx; check `reason` field). Pass `queue:true` to opt back into the legacy outbox→daemon-push path for offline-buffer / pre-pair queueing. wire_pull is the symmetric receive primitive — call it to trigger an immediate relay GET instead of waiting for the daemon's 5s pull cycle; returns written[]/rejected[]/total_seen the same way `wire pull --json` does. See docs/AGENT_INTEGRATION.md for the full monitor recipe and THREAT_MODEL.md (T10/T14)."
         }
     })
 }
@@ -546,7 +546,7 @@ fn tool_defs() -> Vec<Value> {
     vec![
         json!({
             "name": "wire_whoami",
-            "description": "Return this agent's DID, fingerprint, key_id, public key, and capabilities. Read-only.",
+            "description": "Return this agent's DID, fingerprint, key_id, public key, and capabilities. Also `identity_split`: null when healthy, or {operational, live, hint} when THIS MCP process is frozen to a stale identity while the live Claude session is a different one (the \"two names\" bug) — surface it and /mcp reconnect. Read-only.",
             "inputSchema": {"type": "object", "properties": {}, "required": []}
         }),
         json!({
@@ -561,7 +561,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "wire_status",
-            "description": "v0.14.2 — daemon + sync-loop health check. Returns: daemon_running (pidfile pid alive), all_running_pids (pgrep for `wire daemon`), last_sync_age_seconds (age of the most recent successful daemon cycle; null if no cycle ever recorded), outbox_count, inbox_count, peer count. The daemon is auto-started for you on MCP launch; a healthy session shows daemon_running:true + last_sync_age_seconds < 60. Default `wire_send` is synchronous (its own status is the delivery verdict); only `queue:true` sends depend on the daemon to drain — a nonzero outbox_count with a stale last_sync means those are stuck. Read-only.",
+            "description": "v0.14.2 — daemon + sync-loop health check. Returns: daemon_running (pidfile pid alive), all_running_pids (pgrep for `wire daemon`), last_sync_age_seconds (age of the most recent successful daemon cycle; null if no cycle ever recorded), outbox_count, inbox_count, peer count. The daemon is auto-started for you on MCP launch; a healthy session shows daemon_running:true + last_sync_age_seconds < 60 + identity_split:null. `identity_split` is non-null ({operational, live, hint}) when this MCP process is frozen to a stale wire identity while the live Claude session is a different one (the \"two names\" bug — you'd send/pair as the wrong identity); surface it and /mcp reconnect. Default `wire_send` is synchronous (its own status is the delivery verdict); only `queue:true` sends depend on the daemon to drain — a nonzero outbox_count with a stale last_sync means those are stuck. Read-only.",
             "inputSchema": {"type": "object", "properties": {}, "required": []}
         }),
         json!({
@@ -958,6 +958,10 @@ fn tool_whoami() -> Result<Value, String> {
         "session_source".into(),
         json!(crate::session::session_source()),
     );
+    // Self-report the "two names" split: non-null when THIS long-lived MCP is
+    // frozen to a different identity than the live Claude session. Reaches the
+    // agent at the moment it inspects its own identity — no `wire dash` needed.
+    payload.insert("identity_split".into(), identity_split_json());
     for (k, v) in crate::cli::op_claims_from_card(&card) {
         payload.insert(k, v);
     }
@@ -1255,7 +1259,27 @@ fn tool_status() -> Result<Value, String> {
         "pending_push_count": pending_push_count,
         "pending_push_breakdown": pending_push_breakdown,
         "stream_state": stream_state,
+        // Non-null when this MCP process operates as a different identity than
+        // the live Claude session (the "two names" split). See identity_split_json.
+        "identity_split": identity_split_json(),
     }))
+}
+
+/// Additive `identity_split` field for `wire_status`/`wire_whoami`: non-null
+/// when THIS long-lived MCP process is frozen to a stale identity while the live
+/// Claude session resolves to a different one (the "two names" bug). Null when
+/// healthy (or unresolvable). Read INSIDE the frozen process, so it sees the
+/// stale served identity a fresh `wire dash` CLI cannot. Lets an agent
+/// self-detect the split at its session-start health check.
+fn identity_split_json() -> Value {
+    match crate::session::detect_identity_split() {
+        Some(s) => json!({
+            "operational": s.operational_handle,
+            "live": s.live_handle,
+            "hint": "this MCP process is frozen to a stale wire identity; the live Claude session is different. Fix: reconnect it (/mcp) or restart this session.",
+        }),
+        None => Value::Null,
+    }
 }
 
 fn tool_send(args: &Value) -> Result<Value, String> {

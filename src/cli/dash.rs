@@ -56,13 +56,13 @@ fn split_banner(color: bool) -> String {
     let Some(s) = crate::session::detect_identity_split() else {
         return String::new();
     };
-    let headline = match (s.env_handle.as_deref(), s.live_handle.as_deref()) {
-        (Some(env), Some(live)) => {
-            format!("this shell operates as {env} but your live Claude session is {live}")
+    let headline = match (s.operational_handle.as_deref(), s.live_handle.as_deref()) {
+        (Some(op), Some(live)) => {
+            format!("this process operates as {op} but your live Claude session is {live}")
         }
         _ => format!(
-            "the wire identity this shell resolves (via {}) doesn't match your live Claude session",
-            s.env_source
+            "the wire identity this process serves (via {}) doesn't match your live Claude session",
+            s.source
         ),
     };
     let body = format!(
