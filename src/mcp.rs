@@ -958,6 +958,10 @@ fn tool_whoami() -> Result<Value, String> {
         "session_source".into(),
         json!(crate::session::session_source()),
     );
+    // Self-report the "two names" split: non-null when THIS long-lived MCP is
+    // frozen to a different identity than the live Claude session. Reaches the
+    // agent at the moment it inspects its own identity — no `wire dash` needed.
+    payload.insert("identity_split".into(), identity_split_json());
     for (k, v) in crate::cli::op_claims_from_card(&card) {
         payload.insert(k, v);
     }
@@ -1255,7 +1259,27 @@ fn tool_status() -> Result<Value, String> {
         "pending_push_count": pending_push_count,
         "pending_push_breakdown": pending_push_breakdown,
         "stream_state": stream_state,
+        // Non-null when this MCP process operates as a different identity than
+        // the live Claude session (the "two names" split). See identity_split_json.
+        "identity_split": identity_split_json(),
     }))
+}
+
+/// Additive `identity_split` field for `wire_status`/`wire_whoami`: non-null
+/// when THIS long-lived MCP process is frozen to a stale identity while the live
+/// Claude session resolves to a different one (the "two names" bug). Null when
+/// healthy (or unresolvable). Read INSIDE the frozen process, so it sees the
+/// stale served identity a fresh `wire dash` CLI cannot. Lets an agent
+/// self-detect the split at its session-start health check.
+fn identity_split_json() -> Value {
+    match crate::session::detect_identity_split() {
+        Some(s) => json!({
+            "operational": s.operational_handle,
+            "live": s.live_handle,
+            "hint": "this MCP process is frozen to a stale wire identity; the live Claude session is different. Fix: reconnect it (/mcp) or restart this session.",
+        }),
+        None => Value::Null,
+    }
 }
 
 fn tool_send(args: &Value) -> Result<Value, String> {
