@@ -958,17 +958,35 @@ fn identity_split_between(
     }
 }
 
+/// An explicit operator `WIRE_HOME` pin — the RFC-008 §C "deliberate fleet-
+/// share" contract, where several sessions intentionally present as ONE shared
+/// identity. In that mode the served identity legitimately differs from the
+/// per-session one, so a "split" there is BY DESIGN, not the frozen-process bug.
+/// (`SESSION_SOURCE` is set to these exact labels only when `WIRE_HOME` was
+/// already in the env at adopt time — never for wire's own `minted`/`claude-*`
+/// resolution, which is the case the split detector targets.)
+fn is_deliberate_home_pin(source: &str) -> bool {
+    source == "env:WIRE_HOME" || source == "env:WIRE_HOME_FORCE"
+}
+
 /// Detect a session-identity split (see [`IdentitySplit`]). `None` in the
-/// healthy case (served identity == live Claude session) or when either side is
-/// unresolvable (bare CLI, uninitialized). Run INSIDE a long-lived MCP/daemon
-/// this catches the frozen-identity case the old env-vs-pidfile check missed:
-/// the served home is stale, the PID-file is live, they differ. Reads the
-/// PID-file (a bounded parent-chain walk) — cheap enough for the session-start
-/// health check, not a per-message hot path.
+/// healthy case (served identity == live Claude session), when either side is
+/// unresolvable (bare CLI, uninitialized), or when the operator DELIBERATELY
+/// pinned `WIRE_HOME` to share one identity across sessions (not a bug). Run
+/// INSIDE a long-lived MCP/daemon this catches the frozen-identity case the old
+/// env-vs-pidfile check missed: the served home is stale, the PID-file is live,
+/// they differ. Reads the (cached) parent-chain PID-files — cheap on the
+/// session-start health check, not a per-message hot path.
 pub fn detect_identity_split() -> Option<IdentitySplit> {
+    let source = session_source();
+    // Deliberate fleet-share (operator WIRE_HOME pin) is intentional, not a
+    // split — suppress it, else every such session cries wolf forever.
+    if is_deliberate_home_pin(source) {
+        return None;
+    }
     let operational = current_operational_handle();
     let live = claude_code_session_from_pidfile().and_then(|k| handle_for_key(&k));
-    identity_split_between(operational, live, session_source())
+    identity_split_between(operational, live, source)
 }
 
 #[cfg(test)]
@@ -1076,6 +1094,56 @@ mod split_tests {
     }
 
     #[test]
+    fn handle_for_key_reads_raw_key_home_not_truncated() {
+        // The load-bearing regression guard: drive handle_for_key itself. A
+        // 36-char session-id uuid exceeds sanitize_name's 32-char cap, so a
+        // sanitized lookup lands on a DIFFERENT home than creation wrote. If
+        // handle_for_key re-added sanitize_name, the raw-key assert below returns
+        // None and this test fails — catching the exact bug the fix closed.
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK held — serializes all in-process env access.
+        unsafe {
+            std::env::set_var("WIRE_HOME", tmp.path());
+        }
+        // Make sessions_root() resolve under the tempdir (never real state).
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let uuid = "7122130f-0a1b-431b-93d3-7818585770af";
+        let cfg = session_home_for_key(uuid)
+            .unwrap()
+            .join("config")
+            .join("wire");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("agent-card.json"),
+            br#"{"did":"did:wire:merry-spindle-82f38897","handle":"merry-spindle"}"#,
+        )
+        .unwrap();
+        // Raw-key lookup finds the card…
+        assert_eq!(handle_for_key(uuid).as_deref(), Some("merry-spindle"));
+        // …a sanitized (truncated) key lands on a different, empty home → None.
+        assert_ne!(sanitize_name(uuid), uuid);
+        assert!(handle_for_key(&sanitize_name(uuid)).is_none());
+        // SAFETY: ENV_LOCK still held.
+        unsafe {
+            std::env::remove_var("WIRE_HOME");
+        }
+    }
+
+    #[test]
+    fn deliberate_home_pin_suppresses_split() {
+        // RFC-008 fleet-share (operator WIRE_HOME pin) is intentional, not a bug.
+        assert!(is_deliberate_home_pin("env:WIRE_HOME"));
+        assert!(is_deliberate_home_pin("env:WIRE_HOME_FORCE"));
+        // wire's own resolution labels are NOT suppressed — that's the real bug.
+        assert!(!is_deliberate_home_pin("minted"));
+        assert!(!is_deliberate_home_pin("claude-code"));
+        assert!(!is_deliberate_home_pin("claude-code-pidfile"));
+    }
+
+    #[test]
     fn unexpanded_template_key_is_invalid() {
         // The ${...} literal that caused the historical collision stays rejected.
         assert!(!valid_session_key("${CLAUDE_CODE_SESSION_ID}"));
@@ -1135,33 +1203,43 @@ fn resolve_session_id_from_chain(
     None
 }
 
+/// The ancestor PID chain, walked ONCE per process and cached. A process's
+/// parentage is immutable, so repeat identity checks (`detect_identity_split`
+/// fires on every `wire_status`/`wire_whoami`) must re-read only the tiny
+/// PID-files, never re-fork `ps`. This keeps the session-start hot path off the
+/// per-call subprocess walk — the single bounded walk happens on first use
+/// (typically already paid by startup resolution).
+fn ancestor_chain_cached() -> &'static [u32] {
+    static ANCESTOR_CHAIN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    ANCESTOR_CHAIN.get_or_init(|| ancestor_chain(std::process::id(), 16, parent_pid))
+}
+
 /// Recover the Claude Code session id from the per-session PID-file when it
 /// isn't available via the environment. Claude Code writes
 /// `~/.claude/sessions/<pid>.json` = `{"sessionId": "...", "cwd": "...", ...}`
 /// for each live session, keyed by the owning `claude` process PID. The MCP
 /// server we run inside is a descendant of that process, so we walk our
-/// parent chain and return the `sessionId` of the first ancestor that has a
-/// PID-file. Cross-platform: the file exists on macOS/Linux/Windows alike.
+/// parent chain (cached — no per-call `ps` re-fork) and return the `sessionId`
+/// of the first ancestor that has a PID-file. Cross-platform.
 fn claude_code_session_from_pidfile() -> Option<String> {
     let dir = dirs::home_dir()?.join(".claude").join("sessions");
-    ancestor_chain(std::process::id(), 16, parent_pid)
-        .into_iter()
-        .find_map(|pid| read_session_id_from_pidfile(&dir, pid))
+    ancestor_chain_cached()
+        .iter()
+        .find_map(|&pid| read_session_id_from_pidfile(&dir, pid))
 }
 
 /// Retry variant for the MCP-startup RACE: Claude may not have written its
 /// session PID-file yet when the stdio MCP server boots, so a single read
 /// misses and the caller would mint a throwaway identity (the "two names" bug).
-/// Walk the ancestor chain ONCE (bounded `ps`/proc reads), then re-read only the
-/// cached ancestor PIDs across `attempts × backoff`. `None` if the live session
-/// is still unrecoverable after the window.
+/// Uses the cached ancestor chain (walked once), re-reading only those PID-files
+/// across `attempts × backoff`. `None` if the live session is still
+/// unrecoverable after the window.
 fn claude_code_session_from_pidfile_retry(
     attempts: u32,
     backoff: std::time::Duration,
 ) -> Option<String> {
     let dir = dirs::home_dir()?.join(".claude").join("sessions");
-    let chain = ancestor_chain(std::process::id(), 16, parent_pid);
-    resolve_session_id_from_chain(&dir, &chain, attempts, backoff)
+    resolve_session_id_from_chain(&dir, ancestor_chain_cached(), attempts, backoff)
 }
 
 /// MCP-startup race window: how many times / how long to re-poll the ancestor
