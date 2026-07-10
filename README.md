@@ -94,8 +94,9 @@ Knowing a handle (`alice@wireup.net`) and being able to resolve it to a signed a
 
 ## Recent releases
 
-Currently shipping **v0.16.0**. Highlights:
+Currently shipping **v0.17.0**. Highlights:
 
+- **v0.17.0** (2026-07-10) — **observability + identity self-heal**: `wire dash` (a read-only pane over every identity on the box) + reversible `wire retire`/revive for idle identities, the Nostr transport stack (RFC-007 D3 — bidirectional pair/send/pull over `wss://` with NIP-44 DMs), same-machine signed attestation for auto-pairing your own sessions (#182), sandbox hardening (Docker/OpenShell), and a self-healing fix for the "two names" split — the `wire mcp` server no longer freezes a minted identity while the live session drifts; it retries the session PID-file before minting, and `wire_status`/`wire_whoami` now self-report an `identity_split` so an agent catches a stale MCP and reconnects (#351)
 - **v0.16.0** (2026-06-14) — **the 1.0 format-freeze pass**: RFC-006 collapses the dual representations that fork-stormed (one by-key session store; `endpoints[]` the single peer-routing source), the identity layer grows on the additive v3.2 card (DNS-TXT org binding, op/org key rotation, project fan-out, per-peer block-list, DID bound to key + one-name enforced server-side), and a launch-hardening sweep lands `wire demo` (two agents talking in one command), a cleaner `wire --help`, MCP first-run fixes, and the daemon-survival fix behind the hello-world round-trip harness
 - **v0.15.0** (2026-06-07) — **the de-deprecation (BREAKING)**: removed all backwards compatibility — deprecated MCP/CLI aliases, the entire SAS code-phrase pairing flow (`wire dial` is now the sole pairing path), and dead legacy on-disk formats. New `wire nuke` clean-slate command. Agents only ever see canonical verbs
 - **v0.14.2** (2026-06-05) — multi-session supervisor + queue collapse (synchronous send/pull verdicts), dual-roots TLS, then a launch-hardening pass: `--all-sessions` fork-storm fix, hermetic tests, REUSE-compliant license, install-smoke CI
