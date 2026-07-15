@@ -23,9 +23,10 @@ Design: `docs/superpowers/specs/2026-07-14-codex-plugin-design.md`.
 
 ### Current phase
 
-Design approved conversationally. Written spec awaiting user review before implementation planning.
+Written spec approved. Implementation plan created; execution approach awaiting user choice.
 
 ## Artifacts
 
 - `docs/superpowers/specs/2026-07-14-codex-plugin-design.md` — product design, invariants, packaging, and verification criteria.
+- `docs/superpowers/plans/2026-07-14-codex-plugin.md` — test-first implementation and verification plan.
 - `SESSION_LOG_2026_07_14.md` — session decisions and artifact catalog.
