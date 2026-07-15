@@ -59,3 +59,27 @@ fn repository_marketplace_exposes_root_wire_plugin() {
             .is_file()
     );
 }
+
+#[test]
+fn bundled_skill_command_audit_rejects_removed_pairing_surface() {
+    let removed = [
+        "wire pair-list-pending",
+        "wire pair-confirm",
+        "wire init <handle>",
+        "/wire:wire-",
+    ];
+    for entry in fs::read_dir(repo_root().join("skills")).expect("read skills") {
+        let skill_path = entry.expect("skill entry").path().join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        let body = fs::read_to_string(&skill_path).expect("read skill");
+        for signature in removed {
+            assert!(
+                !body.contains(signature),
+                "{} advertises {signature}",
+                skill_path.display()
+            );
+        }
+    }
+}

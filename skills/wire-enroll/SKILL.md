@@ -1,4 +1,5 @@
 ---
+name: wire-enroll
 description: Enroll operator + organization identity per RFC-001 (the v0.14 identity layer). Use when the user wants to mint an op_did (long-lived operator anchor), create an org_did, issue/import member_certs, or republish their card with current enrollment. Personal-tier operators always carry a signing-key op_did regardless of SSO opt-in — wire-rooted identity is the security anchor.
 ---
 
