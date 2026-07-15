@@ -1,0 +1,20 @@
+{
+  "name": "wire",
+  "interface": {
+    "displayName": "Wire"
+  },
+  "plugins": [
+    {
+      "name": "wire",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
