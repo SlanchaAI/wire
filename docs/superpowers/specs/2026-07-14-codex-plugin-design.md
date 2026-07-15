@@ -146,4 +146,3 @@ Product smoke must cover a clean local Codex install:
 - Claude plugin behavior remains intact.
 - MCP-only users remain supported.
 - Plugin and marketplace validators pass from a clean checkout.
-
