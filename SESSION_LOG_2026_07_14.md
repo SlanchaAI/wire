@@ -23,7 +23,25 @@ Design: `docs/superpowers/specs/2026-07-14-codex-plugin-design.md`.
 
 ### Current phase
 
-Written spec approved. Implementation plan created; execution approach awaiting user choice.
+Implementation and verification complete: packaging, shared-skill modernization, install documentation, isolated Codex install smoke, plugin/skill validation, and full Rust regression suite.
+
+### Implementation findings
+
+- Codex packaging reuses the repository root through marketplace source `./`.
+- Codex skill validation requires explicit `name` frontmatter.
+- Shared skills advertised removed SAS/init commands; corrected before Codex distribution.
+- `wire mcp` keeps data synchronized, while Codex ingests messages through `wire_pull` and `wire_tail` at task checkpoints.
+- The local plugin validator requires PyYAML; `uv run --with pyyaml` provides it without changing project dependencies.
+- Isolated `CODEX_HOME` smoke discovered `wire@wire` v0.17.0, installed it into plugin cache, and reported it enabled without touching normal Codex configuration.
+- Final `cargo test -q` exited 0 across unit, integration, stress, and doctest batches; only pre-existing ignored tests remained ignored.
+
+### Implementation artifacts
+
+- `.codex-plugin/plugin.json` — Codex plugin manifest.
+- `.agents/plugins/marketplace.json` — repository marketplace entry.
+- `tests/plugin_contract.rs` — packaging and documentation contract tests.
+- `skills/*/SKILL.md` — shared Claude/Codex workflows.
+- `README.md` and `docs/PLUGIN.md` — install and operation guidance.
 
 ## Artifacts
 

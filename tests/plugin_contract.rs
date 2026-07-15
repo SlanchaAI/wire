@@ -10,8 +10,7 @@ fn read_json(relative: &str) -> Value {
     let path = repo_root().join(relative);
     let body = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    serde_json::from_str(&body)
-        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    serde_json::from_str(&body).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
 fn assert_shared_components(manifest: &Value) {
@@ -46,10 +45,7 @@ fn repository_marketplace_exposes_root_wire_plugin() {
     assert_eq!(plugins.len(), 1);
     let wire = &plugins[0];
     assert_eq!(wire["name"], "wire");
-    assert_eq!(
-        wire["source"],
-        json!({"source": "local", "path": "./"})
-    );
+    assert_eq!(wire["source"], json!({"source": "local", "path": "./"}));
     assert_eq!(wire["policy"]["installation"], "AVAILABLE");
     assert_eq!(wire["policy"]["authentication"], "ON_INSTALL");
     assert_eq!(wire["category"], "Developer Tools");
@@ -80,6 +76,21 @@ fn bundled_skill_command_audit_rejects_removed_pairing_surface() {
                 "{} advertises {signature}",
                 skill_path.display()
             );
+        }
+    }
+}
+
+#[test]
+fn codex_install_signatures_are_documented() {
+    let signatures = [
+        "codex plugin marketplace add SlanchaAi/wire",
+        "codex plugin add wire@wire",
+        "codex mcp add wire -- wire mcp",
+    ];
+    for relative in ["README.md", "docs/PLUGIN.md"] {
+        let body = fs::read_to_string(repo_root().join(relative)).expect("read docs");
+        for signature in signatures {
+            assert!(body.contains(signature), "{relative} missing `{signature}`");
         }
     }
 }

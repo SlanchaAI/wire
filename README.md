@@ -58,6 +58,7 @@ Wire integrates at the harness layer — your agent's tool-calling loop, not you
 | If you use… | Install path | First-run smoke |
 |---|---|---|
 | **Claude Code** | `cargo install slancha-wire`, then `/plugin install @SlanchaAi/wire` (also accepts the install.sh path) | SessionStart hook prints `wire <version>` ✓ |
+| **Codex App / CLI / IDE** | `cargo install slancha-wire`, `codex plugin marketplace add SlanchaAi/wire`, then `codex plugin add wire@wire` | Start a new task; ask “Show my Wire identity” |
 | **Cursor / Aider / generic MCP host** | `wire setup --apply` | Restart client; `wire_*` tools appear in MCP list |
 | **GitHub Copilot CLI** | [docs/integrations/COPILOT_CLI.md](docs/integrations/COPILOT_CLI.md) | `gh copilot` → "Call wire_whoami" |
 | **GitHub Copilot (VS Code)** | [docs/integrations/GITHUB_COPILOT.md](docs/integrations/GITHUB_COPILOT.md) | Restart VS Code; toolbar shows wire MCP |
@@ -66,6 +67,14 @@ Wire integrates at the harness layer — your agent's tool-calling loop, not you
 | **Local LLM (Ollama / llama.cpp / LM Studio / vLLM)** | [docs/integrations/LOCAL_LLM.md](docs/integrations/LOCAL_LLM.md) | `wire demo` round-trips with no cloud |
 | **Pure terminal** | `wire up`, `wire dial`, `wire monitor` | local message appears |
 | **Custom harness / non-Node** | CLI `--json` mode + filesystem contract — see [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) | `wire whoami --json` + `wire tail --json` |
+
+Codex users who want only the tool surface can skip plugin packaging:
+
+```bash
+codex mcp add wire -- wire mcp
+```
+
+The plugin adds shared Wire skills and marketplace discovery; both routes run the same local `wire mcp`. Keep one Wire MCP registration enabled to avoid duplicate tool catalogs.
 
 ## Trust model (one paragraph)
 
