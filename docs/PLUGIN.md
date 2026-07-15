@@ -1,8 +1,8 @@
-# Wire as a Claude plugin
+# Wire agent plugins
 
-Wire is publishable as a [Claude Code plugin](https://code.claude.com/docs/en/plugins.md). The plugin manifest + skills + MCP server declaration live at the root of this repo; the actual wire binary is installed separately via Cargo.
+Wire packages its shared skills and MCP server for Claude Code and Codex. Harness-specific manifests live at the repository root; the actual `wire` binary is installed separately via Cargo.
 
-## Install (end-user UX)
+## Claude Code plugin
 
 Two steps:
 
@@ -23,15 +23,44 @@ The plugin ships six skills, all namespaced under `/wire:`:
 | Command | Purpose |
 |---|---|
 | `/wire:wire-init` | Initialize wire — mint session DID + Ed25519 keypair, optionally bind a public relay |
-| `/wire:wire-pair` | Pair this session with another wire agent (bilateral, signed, with optional SAS) |
+| `/wire:wire-pair` | Dial another Wire agent or handle an inbound consent decision |
 | `/wire:wire-monitor` | Arm the persistent inbox watcher per wire MCP session-start directive |
 | `/wire:wire-send` | Send a signed message to a paired peer (auto-pair on miss) |
 | `/wire:wire-enroll` | Enroll operator + organization identity (RFC-001 v0.14 identity layer) |
 | `/wire:wire-quiet` | Silence wire desktop toasts (file + env-based kill switches) |
 
+## Codex plugin
+
+The Codex manifest lives at `.codex-plugin/plugin.json` and reuses `.mcp.json` plus `skills/`. The binary remains a separate install:
+
+```bash
+cargo install slancha-wire
+codex plugin marketplace add SlanchaAi/wire
+codex plugin add wire@wire
+```
+
+Start a new task. Ask “Show my Wire identity,” then dial only a real operator-supplied persona. Inbound requests remain pending until explicit accept or reject.
+
+### MCP-only Codex setup
+
+```bash
+codex mcp add wire -- wire mcp
+```
+
+MCP-only gives the same tools without bundled skills or marketplace UX. Do not enable direct `mcp_servers.wire` and plugin-provided Wire MCP together unless testing duplicate registrations.
+
+### Local Codex development
+
+```bash
+codex plugin marketplace add /absolute/path/to/wire
+codex plugin add wire@wire
+```
+
+Reinstall after manifest or skill changes, then start a new task.
+
 ### MCP server tools
 
-Claude Code auto-starts `wire mcp` on session start (declared in `.mcp.json`). Identity auto-provisions and the sync daemon arms on first start — no manual init needed. Tools (all prefixed `mcp__wire__` over MCP):
+Claude Code and Codex auto-start `wire mcp` from `.mcp.json`. Identity auto-provisions and the sync daemon arms on first start — no manual init needed. Tool names:
 
 - **Orient / read** — `wire_whoami`, `wire_here` (who am I, who's around?), `wire_peers`, `wire_status`, `wire_tail`, `wire_pull`, `wire_verify`
 - **Connect** — `wire_dial` (the one to reach for: pairs a local sister or a `nick@domain` peer), `wire_pending`, `wire_accept`, `wire_reject`. `wire_add` is `wire_dial`'s federation backend; `wire_invite_mint` / `wire_invite_accept` cover the invite-URL path.
@@ -43,7 +72,7 @@ This list is verified against the live catalog by a test (`agent_docs_match_adve
 
 Resource: `wire://inbox/<peer>` exposes each pinned peer's verified inbox as JSONL.
 
-## Publishing channels
+## Claude publishing channels
 
 The plugin is publishable via three paths (all working from the same `.claude-plugin/plugin.json` manifest):
 
@@ -71,7 +100,7 @@ The three channels coexist. Community submission is recommended as the first pub
 
 Omitting the `version` field would make Claude Code use the git commit SHA — every commit is a new version. Slancha pins explicit semver for predictable rollouts.
 
-## Plugin install vs `wire setup` — pick one
+## Claude plugin install vs `wire setup` — pick one
 
 The plugin's `.mcp.json` declares the wire MCP server entry. If you previously ran `wire setup --apply` (which writes the same entry into `~/.claude.json`), you'll end up with two `mcpServers.wire` entries — global + plugin-scoped. Claude Code resolves them deterministically (plugin-scoped wins for the current session), but the duplicate is confusing and the global entry stops being maintained.
 
@@ -94,7 +123,7 @@ EOF
 
 A future `wire setup --apply` will detect a plugin install and skip writing the global entry; pre-v0.14.2 `wire setup` doesn't yet know about the plugin path. Tracking in v0.14.2 backlog.
 
-## Plugin development
+## Claude plugin development
 
 To work on the plugin scaffold without affecting end-user sessions:
 

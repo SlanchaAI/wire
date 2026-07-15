@@ -1,54 +1,40 @@
 ---
-description: Arm a persistent live-watcher on the wire inbox so peer messages surface mid-session without polling. Use this on every wire-enabled session start — the watcher streams non-heartbeat events, the assistant reacts to peer messages in its own live context (paired-agent collaboration pattern), and operator notifications fire on lock-screen via os_notify. This is the canonical "wire is now active" arming verb.
+name: wire-monitor
+description: Keep a Wire session synchronized and surface peer messages using the listener mechanism available in the current agent host. Use at session start, when the user asks to watch Wire, or during active peer collaboration.
 ---
 
 # wire-monitor
 
-Per the wire MCP server's session-start directive: arm a persistent stream-watcher on `wire monitor --json --include-handshake` filtered for heartbeat/pair_drop noise. Peer messages surface live; the assistant replies in its own context immediately, NOT waiting for the operator to prompt.
+Wire daemon and MCP server keep relay inboxes synchronized. How messages enter model context depends on host.
 
-## When to use
+## Codex and generic MCP hosts
 
-- **Every wire-enabled session start.** The wire MCP server's instruction set says: arm this immediately as an early action. The SessionStart hook in this plugin already prints a reminder.
-- User says "monitor wire", "watch inbox", "arm wire"
-- After `/wire:wire-pair` succeeds and the user wants live message flow
+1. Call `wire_status` at session start.
+2. Confirm `daemon_running: true`, recent sync, and `identity_split: null`.
+3. Call `wire_pull` for an immediate relay fetch.
+4. Call `wire_tail` at collaboration checkpoints or on operator request.
 
-## Canonical arming form
+MCP does not inject unsolicited tool results into an active model turn. Wire can receive and notify in background, but Codex calls `wire_tail` to ingest messages into task context.
 
-In Claude Code, use the `Monitor` tool with `persistent: true`:
+## Hosts with persistent command monitors
 
-```text
-Monitor tool with:
-  command:  wire monitor --json --include-handshake 2>&1 | grep --line-buffered -vE '"kind":"(heartbeat|pair_drop|pair_drop_ack)"'
-  description: wire inbox live watcher
-  persistent: true
-  timeout_ms: 3600000  (max)
+Arm once for session lifetime:
+
+```bash
+wire monitor --json --include-handshake
 ```
 
-Filter strips three noise classes:
-- `kind=heartbeat` — daemon liveness pings
-- `kind=pair_drop` + `kind=pair_drop_ack` — bilateral pair-introduction events (RFC-001 §3)
+Filter heartbeat and handshake noise in host monitor layer. Keep listener across loop iterations; stop only when session ends or operator says stop everything.
 
-What remains: real peer messages (`kind=claim`, `kind=ack`, `kind=decision`, `kind=trust_*`) — the things worth surfacing to operator + the assistant.
+## Inbound requests
 
-## When a peer message arrives
+Call `wire_pending`, surface requests, and wait for operator consent. Never auto-accept.
 
-The task-notification arrives as a `<task-notification>` event in the assistant's context. **Reply in the assistant's own live context — do NOT wait for the operator to prompt.** This is how paired agents collaborate immediately.
+## Multiple sessions
 
-If the message asks a question requiring operator input (rare — paired agents typically discuss async), surface to the operator.
-
-## Inbound pair-request handling
-
-`wire pending` enumerates inbound pair requests. These do NOT auto-accept — surface to the operator for consent. Accepting grants the peer authenticated write access; see `/wire:wire-pair` skill for the consent + accept flow.
-
-## Multiple wire MCP servers / sister sessions
-
-Each Claude Code tab has its own `wire mcp` subprocess; each session has its own daemon + per-session config_dir. The Monitor armed here is THIS session's. Sister sessions need their own Monitor + their own `/wire:wire-monitor` invocation.
-
-## MCP tool variant
-
-`mcp__wire__wire_tail` returns the last N inbox events synchronously — useful for one-shot checks. The Monitor pattern above is for the continuous-stream case.
+Each session has its own identity, MCP process, daemon state, and inbox cursor. Check or monitor each independently.
 
 ## Reference
 
-- Wire MCP server instructions (system prompt) — the "ARM A PERSISTENT MONITOR" directive.
-- `docs/AGENT_INTEGRATION.md` in the wire repo (post-v0.13 doc).
+- MCP server instructions returned by `wire mcp`.
+- Agent integration: `docs/AGENT_INTEGRATION.md`.

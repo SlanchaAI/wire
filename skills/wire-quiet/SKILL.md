@@ -1,4 +1,5 @@
 ---
+name: wire-quiet
 description: Silence wire desktop notifications (toasts). Use when user says "wire quiet", "mute wire", "stop the toasts", or is in a focus / demo context where macOS Notification Center spam is unwanted. File-based kill switch persists across daemon restarts; env-based variant (WIRE_NO_TOASTS=1) covers launchd-spawned daemons.
 ---
 
@@ -40,7 +41,7 @@ Reports: `on` / `off` + mechanism (`via file` / `via env` / `none`).
 
 ## Multi-session / fleet-wide silence
 
-If the operator wants every Claude tab's daemon silenced:
+If the operator wants every local agent session's daemon silenced:
 
 ```bash
 # Global env (launchd) — covers future-spawned daemons
@@ -64,4 +65,4 @@ wire quiet off
 ## Reference
 
 - v0.14.1 release notes (`README.md` §"Status — v0.14.1") for the kill-switch design.
-- Memory: `feedback_wire_upgrade_skips_mcp_servers` — sister Claude sessions' wire mcp subprocesses need `/mcp` reconnect to pick up the silenced binary if `wire upgrade` ran.
+- After `wire upgrade`, restart or reconnect each host-pinned `wire mcp` subprocess so it uses the new binary.

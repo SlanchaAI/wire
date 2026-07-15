@@ -1,73 +1,74 @@
 ---
-description: Initialize wire on this machine — mint a session DID + Ed25519 keypair and (optionally) bind a public relay. Use when the user says "wire init", "set up wire", or asks how to start using wire. Wire is a magic-wormhole-for-agents bus; the init step writes ~/.config/wire/ (Unix) or %APPDATA%/wire/ (Windows) and is required exactly once per session.
+name: wire-init
+description: Bootstrap Wire with the canonical wire up flow, creating a per-session DID-derived identity and optionally binding local or federation relays. Use when the user says "wire init", "wire up", "set up wire", or asks how to start using Wire.
 ---
 
 # wire-init
 
-Set up wire identity on a fresh machine or fresh per-session WIRE_HOME. Idempotent — running twice is safe.
+Set up Wire on a fresh machine or in a fresh per-session home. `wire up` is idempotent and owns identity creation, relay binding, persona claim, and daemon startup.
 
 ## When to use
 
-- User says "set up wire", "wire init", "wire up", "install wire"
-- User wants to start using wire but their session has no identity (`wire whoami` errors with "not initialized")
-- A fresh per-session WIRE_HOME (e.g. new Claude Code session inheriting a clean state)
+- User says "set up wire", "wire init", "wire up", or "install wire".
+- `wire_whoami` reports that no session identity exists.
+- A new agent session needs its own DID-derived persona.
 
 ## Pre-flight
 
-Verify wire is on PATH:
+Verify the binary is on `PATH`:
 
 ```bash
-command -v wire || echo "wire not installed — see install instructions below"
+command -v wire
 ```
 
-If not installed: `cargo install slancha-wire` (requires Rust toolchain) OR download a prebuilt binary from https://github.com/SlanchaAi/wire/releases.
+If absent, install `slancha-wire` with Cargo or use a prebuilt release from https://github.com/SlanchaAi/wire/releases.
 
 ## Workflow
 
-### Option A — public-relay default (`wireup.net`, recommended for first install)
+### Public relay
 
 ```bash
-wire up
+wire up @wireup.net
 ```
 
-This single verb: mints a session DID + Ed25519 keypair, claims a persona on `wireup.net`, registers a federation handle. Output shows the DID + nickname + emoji. Per the v0.11 one-name rule, the claimed nickname always matches the DID-derived persona.
+This mints the session identity, binds federation, claims the DID-derived persona, opportunistically adds local routing, and starts the daemon. Operator never chooses a separate handle.
 
-### Option B — offline / local-only
+### Offline identity
 
 ```bash
-wire init <handle> --offline
+wire up --offline
 ```
 
-No relay binding. Local-only identity. Use when the operator doesn't want to publish to `wireup.net`.
+Bind a relay later with `wire bind-relay <url>`.
 
-### Option C — bind a custom relay (sovereign-fleet / org-tier)
+### Custom relay
 
 ```bash
-wire init <handle>
-wire bind-relay https://relay.<your-domain>
+wire up https://relay.example.com
 ```
-
-For org-tier deployments per RFC-003. The DNS-TXT `_wire-org.<domain>` should already be published before binding.
 
 ## Verify
 
+Prefer `wire_whoami` and `wire_status` through MCP. CLI equivalent:
+
 ```bash
-wire whoami --json | jq
+wire whoami --json
+wire status --json
 ```
 
-Expected fields: `did`, `handle`, `op_did` (if enrolled per RFC-001), `schema_version` (v3.2 if v0.14+ + op claims attached), `capabilities`.
+Verify DID-derived `persona`, `config_dir`, endpoints, daemon health, and `identity_split: null`.
 
 ## Common errors
 
-- **`not initialized`** — `wire whoami` was called before init. Run one of A/B/C above.
-- **`relay unreachable`** — Option A failed; user is offline. Fall back to B (`--offline`).
-- **`handle already claimed on relay`** — collision on `wireup.net`. Use Option B + bind to a non-public relay, OR pick a different handle.
+- **`wire` not found** — install binary, then start a new agent task.
+- **Relay unreachable** — use offline mode or a reachable local/custom relay.
+- **`identity_split` non-null** — restart stale MCP host.
 
-## v0.14 identity layer (optional, post-init)
+## Organization identity
 
-If the user wants the RFC-001 operator + org identity layer (auto-pair across sessions, ORG_VERIFIED tier), see the `/wire:wire-enroll` skill.
+Use the `wire-enroll` skill for operator and organization enrollment.
 
 ## Reference
 
-- README: https://github.com/SlanchaAi/wire#status--v0141-latest
-- RFC-001 identity layer: `docs/rfc/0001-identity-layer.md` in the wire repo.
+- README: https://github.com/SlanchaAi/wire#pick-your-harness
+- Agent integration: `docs/AGENT_INTEGRATION.md`.

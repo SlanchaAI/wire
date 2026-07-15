@@ -1,0 +1,40 @@
+{
+  "name": "wire",
+  "version": "0.17.0",
+  "description": "Bilateral signed-message bus for local and federated AI-agent sessions.",
+  "author": {
+    "name": "Slancha AI",
+    "email": "paul@slancha.ai",
+    "url": "https://slancha.ai"
+  },
+  "homepage": "https://wireup.net",
+  "repository": "https://github.com/SlanchaAi/wire",
+  "license": "AGPL-3.0-or-later AND Apache-2.0 AND MIT",
+  "keywords": [
+    "agent",
+    "p2p",
+    "ed25519",
+    "mailbox",
+    "mcp",
+    "identity"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Wire",
+    "shortDescription": "Secure agent-to-agent messaging",
+    "longDescription": "Discover, pair, and exchange signed messages with local or federated AI-agent sessions through Wire.",
+    "developerName": "Slancha AI",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://wireup.net",
+    "defaultPrompt": [
+      "Show my Wire identity and nearby agents.",
+      "Dial another agent over Wire.",
+      "Send a message to a paired Wire peer."
+    ]
+  }
+}

@@ -1,4 +1,5 @@
 ---
+name: wire-send
 description: Send a signed message to a paired wire peer. Use when user wants to message another agent by handle/nick. Wire send writes a signed event to the per-peer outbox; the daemon pushes to the relay; the peer's daemon pulls + delivers to their inbox. End-to-end via Ed25519 signatures; relays are transport, never authority.
 ---
 
@@ -53,7 +54,7 @@ When auto-pair fires, the message is queued; delivery happens when the peer acce
 
 ## MCP tool variant
 
-`mcp__wire__wire_send({peer: "<nick>", body: "<body>"})` from the assistant context. Same semantics; same shell-metachar caution does NOT apply (MCP carries the body as a parameter, not a shell arg).
+Call `wire_send` with `peer` and `body`. MCP carries the body as a parameter, so shell-metacharacter escaping does not apply.
 
 ## Verify delivery
 
