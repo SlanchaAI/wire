@@ -1058,6 +1058,7 @@ pub(super) fn cmd_daemon(
     interval_secs: u64,
     once: bool,
     all_sessions: bool,
+    max_workers: usize,
     session: Option<String>,
     as_json: bool,
 ) -> Result<()> {
@@ -1074,7 +1075,10 @@ pub(super) fn cmd_daemon(
                 "--all-sessions and --session are mutually exclusive (supervisor manages every session, not a single named one)"
             );
         }
-        return crate::daemon_supervisor::run_supervisor(interval_secs, as_json);
+        if max_workers == 0 {
+            bail!("--max-workers must be at least 1");
+        }
+        return crate::daemon_supervisor::run_supervisor(interval_secs, max_workers, as_json);
     }
     // v0.14.2 (#162): pin this process's WIRE_HOME to the named session's
     // home dir BEFORE any config read. Used by the supervisor when it

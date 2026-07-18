@@ -15,7 +15,7 @@
 //! from the project cwd. That works for one session but doesn't scale
 //! to N. The architectural fix is a supervisor that owns the
 //! multi-session orchestration: one supervisor process per launchd
-//! unit, N child `wire daemon --session <name>` processes — each with
+//! unit, a bounded set of child `wire daemon` processes — each with
 //! its own pinned `WIRE_HOME` and its own pidfile under that session's
 //! state dir. `wire status` from any cwd then sees its session's child
 //! pid and reports truthfully.
@@ -39,11 +39,12 @@
 //!   session (corrupt key, missing relay) from fork-bombing.
 //! - **Don't exit on zero sessions.** Sleep and re-poll the registry —
 //!   new sessions get picked up without supervisor restart.
-//! - **Adopt orphaned children on supervisor restart.** When launchd
-//!   relaunches the supervisor, the previous supervisor's children
-//!   keep running (correct: they're still syncing). New supervisor
-//!   sees their pidfiles, skips re-spawning, and lets them keep going
-//!   until their next natural exit (then it spawns a fresh child).
+//! - **Lease-backed lifecycle.** A registry binding, live process lease,
+//!   or pending outbox makes a session eligible. A private key and sync
+//!   timestamps do not. Retired and inactive homes stay inactive across
+//!   supervisor restarts.
+//! - **Hard worker cap.** Excess eligible sessions remain in an
+//!   observable queue instead of expanding process count without bound.
 //!
 //! ## Invariants
 //!
@@ -77,43 +78,76 @@ const REGISTRY_POLL_SECS: u64 = 10;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const RAPID_FAIL_WINDOW: Duration = Duration::from_secs(10);
+pub const DEFAULT_MAX_WORKERS: usize = 16;
 
-/// Default idle cutoff for registry-unbound sessions. `list_sessions()`
-/// enumerates *every* session home ever minted on the machine — and
-/// because each Claude tab / `wire session new` mints a fresh persona
-/// home, a long-lived box accumulates hundreds (honey-pine's had 147).
-/// Spawning one daemon per home turns `--all-sessions` into a fork
-/// storm. A session is kept regardless of age if it has a registry cwd
-/// binding (operator deliberately bound it) OR holds a real identity
-/// (`config/wire/private.key` — not a husk); an unbound, identity-less
-/// session is only kept if it has been active within this window. Override
-/// via `WIRE_ALL_SESSIONS_MAX_IDLE_DAYS` (0 disables the filter → legacy
-/// spawn-for-all behavior).
-const DEFAULT_MAX_IDLE_DAYS: u64 = 7;
-
-/// Parse the idle cutoff. `None` raw → default; a `0` value → `None`
-/// (no filter, spawn for every session); any other integer → that many
-/// days; unparseable → default. Pure, so it's unit-testable without
-/// mutating process env.
-fn parse_max_idle(raw: Option<&str>) -> Option<Duration> {
-    match raw {
-        Some(v) => {
-            let days: u64 = v.trim().parse().unwrap_or(DEFAULT_MAX_IDLE_DAYS);
-            (days != 0).then(|| Duration::from_secs(days * 86_400))
-        }
-        None => Some(Duration::from_secs(DEFAULT_MAX_IDLE_DAYS * 86_400)),
+fn next_worker_backoff(previous: Option<Duration>, rapid_failure: bool) -> Duration {
+    if rapid_failure {
+        (previous.unwrap_or(INITIAL_BACKOFF) * 2).min(MAX_BACKOFF)
+    } else {
+        INITIAL_BACKOFF
     }
 }
 
-/// Read the idle cutoff from the environment. `None` means "no idle
-/// filter" (spawn a daemon for every session — pre-fix behavior),
-/// selected by setting `WIRE_ALL_SESSIONS_MAX_IDLE_DAYS=0`.
-fn max_idle_from_env() -> Option<Duration> {
-    parse_max_idle(
-        std::env::var("WIRE_ALL_SESSIONS_MAX_IDLE_DAYS")
-            .ok()
-            .as_deref(),
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerVersion {
+    Current,
+    Skewed,
+}
+
+fn classify_session_worker(
+    record: &crate::ensure_up::DaemonPid,
+    alive: bool,
+    cmdline: Option<&str>,
+) -> Option<WorkerVersion> {
+    if !alive
+        || record.schema != crate::ensure_up::DAEMON_PID_SCHEMA
+        || record.pid == std::process::id()
+    {
+        return None;
+    }
+    let cmdline = cmdline?;
+    let args: Vec<&str> = cmdline.split_whitespace().collect();
+    if !args.contains(&"daemon") || args.contains(&"--all-sessions") {
+        return None;
+    }
+    Some(if record.version == env!("CARGO_PKG_VERSION") {
+        WorkerVersion::Current
+    } else {
+        WorkerVersion::Skewed
+    })
+}
+
+/// Stop one pidfile-owned worker for a session that lifecycle planning did
+/// not select. Validation is deliberately narrow: JSON pidfile, live PID,
+/// daemon command line, and never the all-session supervisor. No process
+/// family signal and no home mutation.
+fn retire_inactive_worker(session: &crate::session::SessionInfo) {
+    let pidfile = session
+        .home_dir
+        .join("state")
+        .join("wire")
+        .join("daemon.pid");
+    let Ok(body) = std::fs::read_to_string(pidfile) else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<crate::ensure_up::DaemonPid>(&body) else {
+        return;
+    };
+    let alive = crate::platform::process_alive(record.pid);
+    let cmdline = crate::platform::pid_cmdline(record.pid);
+    let Some(version) = classify_session_worker(&record, alive, cmdline.as_deref()) else {
+        return;
+    };
+    eprintln!(
+        "supervisor: retiring unselected session worker '{}' pid={} version={version:?}",
+        session.name, record.pid
+    );
+    if !crate::platform::kill_process(record.pid, false) {
+        eprintln!(
+            "supervisor: failed to signal unselected session worker '{}' pid={}",
+            session.name, record.pid
+        );
+    }
 }
 
 /// Newest mtime among a session home's activity files — the
@@ -137,26 +171,6 @@ fn fs_last_active(home: &Path) -> Option<SystemTime> {
         .max()
 }
 
-/// True iff the session home holds a real wire identity (an initialized
-/// `config/wire/private.key`). Such a home ran `wire up`/`init` — it is NOT a
-/// husk, so it must keep a daemon to push its outbox AND pull inbound mail even
-/// when idle + registry-unbound. Otherwise a real-but-idle (or never-synced)
-/// session is starved forever: ineligible → no daemon → never syncs → never
-/// eligible (the wildflower-gleam catch-22 a live audit surfaced — for outbound
-/// mail and, equally, inbound never-pulled mail). Husks (ephemeral read-only
-/// home mints) have no private.key and stay excluded, so the idle filter still
-/// stops their fork-storm. This generalizes #340's pending-outbox keep: a queued
-/// outbox implies an identity, so identity subsumes it. Injected into
-/// `supervisor_eligible` so the filter stays unit-testable.
-fn fs_has_identity(home: &Path) -> bool {
-    // A real wire identity = an initialized `config/wire/private.key`. Same
-    // signal the husk-reaper uses to decide "not a husk".
-    home.join("config")
-        .join("wire")
-        .join("private.key")
-        .exists()
-}
-
 /// True iff the session home has been retired (`state/wire/retired.json`).
 /// A retired home is ineligible for a daemon regardless of cwd/identity/idle —
 /// the supervisor kills any running child and never respawns. Pure existence
@@ -165,60 +179,100 @@ fn fs_is_retired(home: &Path) -> bool {
     crate::retire::is_retired(home)
 }
 
-/// Filter `list_sessions()` down to the sessions the supervisor should
-/// own a daemon for. A session is eligible iff it has a registry cwd
-/// binding OR it was active within `max_idle`. `max_idle == None`
-/// disables the filter (every session eligible). Pure: the activity
-/// probe is injected so this is unit-testable without touching disk.
-fn supervisor_eligible<F, G, H>(
+fn fs_has_live_lease(home: &Path) -> bool {
+    !crate::session_lifecycle::active_leases_at(
+        home,
+        time::OffsetDateTime::now_utc(),
+        crate::platform::process_alive,
+    )
+    .is_empty()
+}
+
+fn fs_has_pending_outbox(home: &Path) -> bool {
+    let outbox = home.join("state").join("wire").join("outbox");
+    let Ok(entries) = std::fs::read_dir(outbox) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+            && !path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.ends_with(".pushed.jsonl"))
+            && std::fs::read_to_string(path).is_ok_and(|body| !body.trim().is_empty())
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorPlan {
+    selected: Vec<crate::session::SessionInfo>,
+    queued: Vec<String>,
+    inactive: Vec<String>,
+    retired: Vec<String>,
+}
+
+#[cfg(test)]
+impl SupervisorPlan {
+    fn selected_names(&self) -> Vec<&str> {
+        self.selected
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect()
+    }
+}
+
+fn plan_supervisor_sessions<F, G, H>(
     sessions: Vec<crate::session::SessionInfo>,
-    max_idle: Option<Duration>,
-    now: SystemTime,
-    last_active: F,
-    has_identity: G,
+    max_workers: usize,
+    has_live_lease: F,
+    has_pending_outbox: G,
     is_retired: H,
-) -> Vec<crate::session::SessionInfo>
+) -> SupervisorPlan
 where
-    F: Fn(&Path) -> Option<SystemTime>,
+    F: Fn(&Path) -> bool,
     G: Fn(&Path) -> bool,
     H: Fn(&Path) -> bool,
 {
-    // Retired homes are ineligible in EVERY configuration — filtered FIRST,
-    // ahead of the `max_idle == None` early-return and the cwd/identity keeps
-    // below. A retired identity's daemon must stop and never respawn; an
-    // `is_retired` check placed after either branch would let a cwd-bound or
-    // identity-ful retired home stay eligible and get respawned.
-    let sessions: Vec<crate::session::SessionInfo> = sessions
-        .into_iter()
-        .filter(|s| !is_retired(&s.home_dir))
+    let mut eligible = Vec::new();
+    let mut inactive = Vec::new();
+    let mut retired = Vec::new();
+    for session in sessions {
+        if is_retired(&session.home_dir) {
+            retired.push(session.name);
+            continue;
+        }
+        if session.did.is_none() {
+            inactive.push(session.name);
+            continue;
+        }
+        if session.cwd.is_some()
+            || has_live_lease(&session.home_dir)
+            || has_pending_outbox(&session.home_dir)
+        {
+            eligible.push(session);
+        } else {
+            inactive.push(session.name);
+        }
+    }
+    eligible.sort_by(|a, b| {
+        b.cwd
+            .is_some()
+            .cmp(&a.cwd.is_some())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let split = eligible.len().min(max_workers);
+    let queued = eligible[split..]
+        .iter()
+        .map(|session| session.name.clone())
         .collect();
-    let Some(max_idle) = max_idle else {
-        return sessions;
-    };
-    sessions
-        .into_iter()
-        .filter(|s| {
-            if s.cwd.is_some() {
-                return true;
-            }
-            // A real wire identity (private.key) is not a husk → keep a daemon so
-            // it can push its outbox AND pull inbound mail, regardless of idle.
-            // Closes the wildflower-gleam catch-22 (ineligible → no daemon →
-            // never syncs → never eligible) for BOTH outbound-queued and
-            // never-sent/inbound-waiting sessions. Generalizes #340's
-            // pending-outbox keep (an outbox implies an identity). Husks have no
-            // identity → still excluded, so the idle fork-storm guard stands.
-            if has_identity(&s.home_dir) {
-                return true;
-            }
-            match last_active(&s.home_dir) {
-                // `duration_since` errors when the file mtime is in the
-                // future (clock skew) — treat that as "active now".
-                Some(t) => now.duration_since(t).map(|d| d <= max_idle).unwrap_or(true),
-                None => false,
-            }
-        })
-        .collect()
+    let selected = eligible.into_iter().take(split).collect();
+    SupervisorPlan {
+        selected,
+        queued,
+        inactive,
+        retired,
+    }
 }
 
 // ---- husk reaper (the 175-dir by-key accumulation fix) ----
@@ -237,7 +291,7 @@ const HUSK_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Parse the husk reap cutoff. `None` raw → default; a `0` value →
 /// `None` (reaper disabled); any other integer → that many hours;
-/// unparseable → default. Pure, mirrors `parse_max_idle`.
+/// unparseable → default.
 fn parse_husk_reap_max_age(raw: Option<&str>) -> Option<Duration> {
     match raw {
         Some(v) => {
@@ -264,9 +318,9 @@ fn husk_reap_max_age_from_env() -> Option<Duration> {
 /// Every wire invocation inside an agent terminal mints a
 /// `sessions/by-key/<hash>/` home via session adoption (RFC-008), even
 /// for read-only commands, and nothing ever deleted them — a dev box
-/// accumulated 175 empty dirs in two weeks. The idle filter
-/// (`supervisor_eligible`) stops the daemon fork-storm but leaves the
-/// dirs. This is the complement: the filter hides, the reaper removes.
+/// accumulated 175 empty dirs in two weeks. Lifecycle planning prevents
+/// those homes from starting workers; this reaper removes old identityless
+/// husks without touching initialized identities.
 ///
 /// A dir is reaped only if ALL of these hold:
 /// - its name has the by-key shape (exactly 16 lowercase hex chars,
@@ -349,7 +403,7 @@ struct ChildState {
 
 /// Entrypoint for `wire daemon --all-sessions`. Loops forever; only
 /// returns Err on a setup error (e.g. cannot resolve sessions_root).
-pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
+pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> Result<()> {
     // Supervisor singleton — one per machine. Separate pidfile from the
     // per-session daemon pidfile so the two layers can't collide.
     let pid_path = supervisor_pid_path()?;
@@ -375,7 +429,7 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
 
     if !as_json {
         eprintln!(
-            "wire daemon --all-sessions: supervisor up. interval={interval_secs}s, registry-poll={REGISTRY_POLL_SECS}s. SIGINT to stop."
+            "wire daemon --all-sessions: supervisor up. interval={interval_secs}s, registry-poll={REGISTRY_POLL_SECS}s, max-workers={max_workers}. SIGINT to stop."
         );
     } else {
         println!(
@@ -384,20 +438,10 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
                 "status": "supervisor_started",
                 "interval_secs": interval_secs,
                 "registry_poll_secs": REGISTRY_POLL_SECS,
+                "max_workers": max_workers,
             })
         );
     }
-
-    // Idle cutoff for registry-unbound sessions — read once at startup
-    // (env doesn't change under a running supervisor).
-    let max_idle = max_idle_from_env();
-    eprintln!(
-        "supervisor: idle cutoff for unbound sessions = {}",
-        match max_idle {
-            Some(d) => format!("{} days", d.as_secs() / 86_400),
-            None => "disabled (spawn-for-all)".to_string(),
-        }
-    );
 
     // Husk reap cutoff — also read once at startup.
     let husk_max_age = husk_reap_max_age_from_env();
@@ -429,15 +473,7 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
                     "supervisor: child '{name}' exited (status={status:?}, lived={}s, rapid={rapid})",
                     lived.as_secs()
                 );
-                let next_backoff = if rapid {
-                    let prev = session_backoff
-                        .get(name)
-                        .copied()
-                        .unwrap_or(INITIAL_BACKOFF);
-                    (prev * 2).min(MAX_BACKOFF)
-                } else {
-                    INITIAL_BACKOFF
-                };
+                let next_backoff = next_worker_backoff(session_backoff.get(name).copied(), rapid);
                 session_backoff.insert(name.clone(), next_backoff);
                 session_last_exit.insert(name.clone(), Instant::now());
                 exited.push(name.clone());
@@ -447,26 +483,35 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
             children.remove(&n);
         }
 
-        // 2. Read registry, identify wanted sessions. Filter out
-        //    registry-unbound sessions that have been idle past the
-        //    cutoff so the supervisor doesn't fan out a daemon per
-        //    every ephemeral persona home (the 147-home fork storm).
+        // 2. Read registry and select only explicitly live sessions.
+        //    Private keys and sync timestamps are historical state, not
+        //    liveness signals.
         let all_sessions = crate::session::list_sessions().unwrap_or_default();
         let total_sessions = all_sessions.len();
-        let wanted: Vec<crate::session::SessionInfo> = supervisor_eligible(
-            all_sessions,
-            max_idle,
-            SystemTime::now(),
-            fs_last_active,
-            fs_has_identity,
+        for session in &all_sessions {
+            crate::session_lifecycle::prune_stale_leases_at(
+                &session.home_dir,
+                time::OffsetDateTime::now_utc(),
+                crate::platform::process_alive,
+            );
+        }
+        let plan = plan_supervisor_sessions(
+            all_sessions.clone(),
+            max_workers,
+            fs_has_live_lease,
+            fs_has_pending_outbox,
             fs_is_retired,
         );
-        if wanted.len() != total_sessions {
+        let wanted = plan.selected;
+        if wanted.len() != total_sessions || !plan.queued.is_empty() {
             eprintln!(
-                "supervisor: {} of {} sessions eligible (skipped {} registry-unbound + idle > cutoff)",
+                "supervisor: {} running target(s), {} queued, {} inactive, {} retired from {} discovered (cap {})",
                 wanted.len(),
+                plan.queued.len(),
+                plan.inactive.len(),
+                plan.retired.len(),
                 total_sessions,
-                total_sessions - wanted.len()
+                max_workers,
             );
         }
 
@@ -525,6 +570,11 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
                 let _ = state.child.wait();
             }
         }
+        for session in &all_sessions {
+            if !wanted_names.contains(&session.name) {
+                retire_inactive_worker(session);
+            }
+        }
 
         // 4. Spawn missing children, respecting backoff + existing
         //    pidfiles (operator-spawned daemons coexist).
@@ -574,11 +624,8 @@ pub fn run_supervisor(interval_secs: u64, as_json: bool) -> Result<()> {
                     );
                     // Treat spawn failure as a rapid failure so the
                     // backoff curve kicks in.
-                    let prev = session_backoff
-                        .get(&info.name)
-                        .copied()
-                        .unwrap_or(INITIAL_BACKOFF);
-                    session_backoff.insert(info.name.clone(), (prev * 2).min(MAX_BACKOFF));
+                    let next = next_worker_backoff(session_backoff.get(&info.name).copied(), true);
+                    session_backoff.insert(info.name.clone(), next);
                     session_last_exit.insert(info.name.clone(), Instant::now());
                 }
             }
@@ -695,15 +742,10 @@ pub struct SupervisorState {
     /// future `wire upgrade --refresh-stale-children` to force the
     /// supervisor to respawn them on the current binary.
     pub stale_binary_sessions: Vec<String>,
-    /// v0.16.x (#275): the subset of `stale_binary_sessions` the
-    /// `--all-sessions` supervisor would NOT respawn — i.e. sessions
-    /// the supervisor's eligibility filter (`supervisor_eligible`:
-    /// registry-bound OR active within the idle cutoff) drops. Killing
-    /// one of these (which `wire upgrade --refresh-stale-children` used
-    /// to do indiscriminately) orphans it: the supervisor never brings
-    /// it back, so the identity silently stops syncing. `wire upgrade`
-    /// must NOT kill these — it surfaces them as "relaunch manually"
-    /// instead.
+    /// Subset of `stale_binary_sessions` that lacks a registry binding,
+    /// live lease, or pending outbox. The supervisor will not respawn
+    /// these inactive sessions, so upgrade must not kill them under the
+    /// assumption that a replacement worker will appear.
     pub stale_unmanaged_sessions: Vec<String>,
 }
 
@@ -747,19 +789,17 @@ pub fn read_supervisor_state() -> Result<SupervisorState> {
     // pidfile + last_sync.
     let infos = crate::session::list_sessions().unwrap_or_default();
 
-    // #275: the names the `--all-sessions` supervisor would actually own a
-    // daemon for, computed with the SAME predicate the supervisor loop uses
-    // (`supervisor_eligible`: registry-bound OR active within the idle cutoff).
-    // Used below to flag stale sessions the supervisor will NOT respawn, so
-    // `wire upgrade --refresh-stale-children` doesn't kill-and-orphan them.
-    let eligible_names: std::collections::HashSet<String> = supervisor_eligible(
+    // Use the same lifecycle predicate as the supervisor. No cap here: this
+    // set answers whether a worker is respawnable eventually, not whether it
+    // occupies a slot in this poll.
+    let eligible_names: std::collections::HashSet<String> = plan_supervisor_sessions(
         infos.clone(),
-        max_idle_from_env(),
-        SystemTime::now(),
-        fs_last_active,
-        fs_has_identity,
+        usize::MAX,
+        fs_has_live_lease,
+        fs_has_pending_outbox,
         fs_is_retired,
     )
+    .selected
     .into_iter()
     .map(|s| s.name)
     .collect();
@@ -929,6 +969,17 @@ fn supervisor_pid_path() -> Result<PathBuf> {
     Ok(root.join("supervisor.pid"))
 }
 
+/// True when the machine-wide all-session supervisor owns daemon lifecycle.
+/// Read-only and fail-closed: a missing, corrupt, or dead pidfile does not
+/// suppress normal single-session recovery.
+pub fn supervisor_is_alive() -> bool {
+    supervisor_pid_path()
+        .and_then(|path| read_alive_supervisor_pid(&path))
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn read_alive_supervisor_pid(path: &std::path::Path) -> Result<Option<u32>> {
     if !path.exists() {
         return Ok(None);
@@ -1064,52 +1115,49 @@ mod tests {
         assert!(existing_daemon_for_session(tmp.path()).unwrap());
     }
 
-    // ---- supervisor eligibility filter (the 147-home fork-storm fix) ----
-
-    fn mk_session(name: &str, cwd: Option<&str>) -> crate::session::SessionInfo {
-        crate::session::SessionInfo {
-            name: name.to_string(),
-            cwd: cwd.map(String::from),
-            home_dir: PathBuf::from(format!("/sessions/{name}")),
+    #[test]
+    fn inactive_worker_classification_distinguishes_version_skew() {
+        let mut record = crate::ensure_up::DaemonPid {
+            schema: crate::ensure_up::DAEMON_PID_SCHEMA.to_string(),
+            pid: 4242,
+            bin_path: "/opt/wire".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: "2026-07-17T00:00:00Z".to_string(),
             did: None,
-            handle: None,
-            daemon_running: false,
-            character: None,
-        }
+            relay_url: None,
+        };
+        assert_eq!(
+            classify_session_worker(&record, true, Some("/opt/wire daemon --interval 5")),
+            Some(WorkerVersion::Current)
+        );
+        record.version = "0.16.0".to_string();
+        assert_eq!(
+            classify_session_worker(&record, true, Some("/opt/wire daemon --interval 5")),
+            Some(WorkerVersion::Skewed)
+        );
+        assert_eq!(
+            classify_session_worker(&record, true, Some("/opt/wire daemon --all-sessions")),
+            None,
+            "never classify the supervisor itself as a session worker"
+        );
+        assert_eq!(classify_session_worker(&record, false, None), None);
     }
 
     #[test]
-    fn parse_max_idle_default_when_unset() {
+    fn crashed_worker_backoff_is_bounded_and_healthy_run_resets() {
+        assert_eq!(next_worker_backoff(None, true), Duration::from_secs(2));
         assert_eq!(
-            parse_max_idle(None),
-            Some(Duration::from_secs(DEFAULT_MAX_IDLE_DAYS * 86_400))
+            next_worker_backoff(Some(Duration::from_secs(32)), true),
+            MAX_BACKOFF
+        );
+        assert_eq!(next_worker_backoff(Some(MAX_BACKOFF), true), MAX_BACKOFF);
+        assert_eq!(
+            next_worker_backoff(Some(MAX_BACKOFF), false),
+            INITIAL_BACKOFF
         );
     }
 
-    #[test]
-    fn parse_max_idle_zero_disables_filter() {
-        assert_eq!(parse_max_idle(Some("0")), None);
-    }
-
-    #[test]
-    fn parse_max_idle_explicit_days() {
-        assert_eq!(
-            parse_max_idle(Some("3")),
-            Some(Duration::from_secs(3 * 86_400))
-        );
-        assert_eq!(
-            parse_max_idle(Some("  14 ")),
-            Some(Duration::from_secs(14 * 86_400))
-        );
-    }
-
-    #[test]
-    fn parse_max_idle_garbage_falls_back_to_default() {
-        assert_eq!(
-            parse_max_idle(Some("not-a-number")),
-            Some(Duration::from_secs(DEFAULT_MAX_IDLE_DAYS * 86_400))
-        );
-    }
+    // ---- stale binary lifecycle partitioning ----
 
     #[test]
     fn partition_stale_splits_respawnable_from_unmanaged() {
@@ -1139,141 +1187,6 @@ mod tests {
         let (respawnable, unmanaged) = partition_stale_by_eligibility(&stale, &eligible);
         assert!(respawnable.is_empty());
         assert_eq!(unmanaged, stale);
-    }
-
-    #[test]
-    fn eligible_keeps_cwd_bound_even_when_ancient() {
-        // A registry-bound session is kept no matter how idle — the
-        // operator deliberately attached it to a project dir. (This is
-        // the real-world case: the cwd-bound `wire`/`slancha-*` sessions
-        // were the *oldest* on the box, yet must survive.)
-        let now = SystemTime::now();
-        let ancient = now - Duration::from_secs(365 * 86_400);
-        let sessions = vec![mk_session("wire", Some("/Users/p/Source/wire"))];
-        let out = supervisor_eligible(
-            sessions,
-            Some(Duration::from_secs(7 * 86_400)),
-            now,
-            |_| Some(ancient),
-            |_| false,
-            |_| false,
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "wire");
-    }
-
-    #[test]
-    fn eligible_keeps_unbound_recent_drops_unbound_idle() {
-        // The live-but-unbound persona sessions (each Claude tab) are
-        // recent → kept. The abandoned ones are idle → dropped.
-        let now = SystemTime::now();
-        let recent = now - Duration::from_secs(2 * 86_400);
-        let stale = now - Duration::from_secs(30 * 86_400);
-        let sessions = vec![
-            mk_session("rosy-rook", None),    // live tab
-            mk_session("agate-nimbus", None), // abandoned
-        ];
-        let out = supervisor_eligible(
-            sessions,
-            Some(Duration::from_secs(7 * 86_400)),
-            now,
-            |home| {
-                if home.ends_with("rosy-rook") {
-                    Some(recent)
-                } else {
-                    Some(stale)
-                }
-            },
-            |_| false,
-            |_| false,
-        );
-        let names: Vec<_> = out.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["rosy-rook"]);
-    }
-
-    #[test]
-    fn eligible_drops_unbound_with_no_activity_signal() {
-        // A never-synced husk (no activity files at all) and no cwd →
-        // dropped: nothing says it's a session anyone is using.
-        let now = SystemTime::now();
-        let sessions = vec![mk_session("husk", None)];
-        let out = supervisor_eligible(
-            sessions,
-            Some(Duration::from_secs(7 * 86_400)),
-            now,
-            |_| None,
-            |_| false,
-            |_| false,
-        );
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn eligible_keeps_unbound_idle_session_with_identity() {
-        // The wildflower-gleam catch-22, generalized: no cwd binding, never
-        // synced (last_active None → normally dropped). A home with a real
-        // identity (private.key) MUST stay eligible so a daemon spawns to push
-        // its outbox AND pull inbound mail — otherwise it strands forever
-        // (ineligible → no daemon → never syncs → never eligible). The
-        // identity-less husk sibling is still correctly dropped.
-        let now = SystemTime::now();
-        let sessions = vec![mk_session("real", None), mk_session("husk", None)];
-        let out = supervisor_eligible(
-            sessions,
-            Some(Duration::from_secs(7 * 86_400)),
-            now,
-            |_| None,                      // neither has ever synced
-            |home| home.ends_with("real"), // only this one has a private.key
-            |_| false,
-        );
-        let names: Vec<_> = out.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["real"]);
-    }
-
-    #[test]
-    fn eligible_drops_retired_even_with_cwd_identity_or_no_cutoff() {
-        // The retire invariant: a `.retired` home is ineligible in EVERY
-        // configuration — with a cwd binding, with an identity, and even under
-        // `max_idle = None` (the spawn-for-all override). All three would
-        // otherwise keep it eligible; the retired filter must beat them all.
-        let now = SystemTime::now();
-        let sessions = vec![
-            mk_session("retired-proj", Some("/Users/p/proj")), // cwd-bound
-            mk_session("retired-id", None),                    // identity-ful
-            mk_session("live", Some("/Users/p/live")),
-        ];
-        let retired = |home: &Path| home.to_string_lossy().contains("retired-");
-        // With the 7-day cutoff.
-        let out = supervisor_eligible(
-            sessions.clone(),
-            Some(Duration::from_secs(7 * 86_400)),
-            now,
-            |_| Some(now),
-            |home| home.ends_with("retired-id"), // retired-id has identity
-            retired,
-        );
-        assert_eq!(
-            out.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["live"],
-            "both retired homes dropped despite cwd/identity"
-        );
-        // And under the max_idle=None spawn-for-all override.
-        let out2 = supervisor_eligible(sessions, None, now, |_| Some(now), |_| true, retired);
-        assert_eq!(
-            out2.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["live"],
-            "retired dropped even with max_idle=None"
-        );
-    }
-
-    #[test]
-    fn eligible_none_cutoff_keeps_everything() {
-        // Override = 0 (max_idle None) restores legacy spawn-for-all.
-        let now = SystemTime::now();
-        let ancient = now - Duration::from_secs(999 * 86_400);
-        let sessions = vec![mk_session("husk", None), mk_session("agate-nimbus", None)];
-        let out = supervisor_eligible(sessions, None, now, |_| Some(ancient), |_| false, |_| false);
-        assert_eq!(out.len(), 2);
     }
 
     // ---- husk reaper ----
@@ -1438,5 +1351,90 @@ mod tests {
             parse_husk_reap_max_age(Some("soon")),
             Some(Duration::from_secs(48 * 3600))
         );
+    }
+
+    fn initialized_session(name: &str, bound: bool) -> crate::session::SessionInfo {
+        crate::session::SessionInfo {
+            name: name.to_string(),
+            cwd: bound.then(|| format!("/projects/{name}")),
+            home_dir: PathBuf::from(format!("/sessions/{name}")),
+            did: Some(format!("did:wire:{name}-1234abcd")),
+            handle: Some(format!("{name}-1234abcd")),
+            daemon_running: false,
+            character: None,
+        }
+    }
+
+    #[test]
+    fn planner_covers_one_ten_and_655_homes_with_hard_cap() {
+        for total in [1usize, 10, 655] {
+            let sessions: Vec<_> = (0..total)
+                .map(|i| initialized_session(&format!("s{i:03}"), false))
+                .collect();
+            let plan = plan_supervisor_sessions(sessions, 16, |_| true, |_| false, |_| false);
+            assert_eq!(plan.selected.len(), total.min(16));
+            assert_eq!(plan.queued.len(), total.saturating_sub(16));
+            assert!(plan.inactive.is_empty());
+        }
+    }
+
+    #[test]
+    fn planner_keeps_five_live_and_leaves_650_stale_inactive() {
+        let sessions: Vec<_> = (0..655)
+            .map(|i| initialized_session(&format!("s{i:03}"), false))
+            .collect();
+        let plan = plan_supervisor_sessions(
+            sessions,
+            16,
+            |home| {
+                home.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix('s'))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|i| i < 5)
+            },
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(plan.selected.len(), 5);
+        assert!(plan.queued.is_empty());
+        assert_eq!(plan.inactive.len(), 650);
+    }
+
+    #[test]
+    fn private_key_without_bound_lease_or_outbox_is_inactive() {
+        let tmp = tempdir().unwrap();
+        let config = tmp.path().join("config/wire");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("private.key"), [7u8; 32]).unwrap();
+        let mut session = initialized_session("historical", false);
+        session.home_dir = tmp.path().to_path_buf();
+
+        let plan = plan_supervisor_sessions(vec![session], 16, |_| false, |_| false, |_| false);
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.inactive, vec!["historical"]);
+    }
+
+    #[test]
+    fn planner_state_is_restart_stable_and_retirement_wins() {
+        let sessions = vec![
+            initialized_session("bound", true),
+            initialized_session("leased", false),
+            initialized_session("retired", true),
+        ];
+        let build = || {
+            plan_supervisor_sessions(
+                sessions.clone(),
+                16,
+                |home| home.ends_with("leased"),
+                |_| false,
+                |home| home.ends_with("retired"),
+            )
+        };
+        let before = build();
+        let after_restart = build();
+        assert_eq!(before.selected_names(), after_restart.selected_names());
+        assert_eq!(before.retired, vec!["retired"]);
+        assert_eq!(before.selected_names(), vec!["bound", "leased"]);
     }
 }

@@ -578,6 +578,9 @@ pub enum Command {
         /// at login without the operator running N tmux panes.
         #[arg(long)]
         all_sessions: bool,
+        /// Maximum session workers in `--all-sessions` supervisor mode.
+        #[arg(long, default_value_t = crate::daemon_supervisor::DEFAULT_MAX_WORKERS)]
+        max_workers: usize,
         /// v0.14.2 (#162): run the daemon loop pinned to a specific
         /// named session by setting WIRE_HOME for the process. The
         /// supervisor (`--all-sessions`) spawns children with this
@@ -1792,6 +1795,12 @@ pub enum ServiceAction {
         /// Install the local-relay service instead of the daemon.
         #[arg(long)]
         local_relay: bool,
+        /// Daemon sync interval. Omitted preserves an existing service value.
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Supervisor worker cap. Omitted preserves an existing service value.
+        #[arg(long)]
+        max_workers: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -2061,9 +2070,10 @@ pub fn run() -> Result<()> {
             interval,
             once,
             all_sessions,
+            max_workers,
             session,
             json,
-        } => relay::cmd_daemon(interval, once, all_sessions, session, json),
+        } => relay::cmd_daemon(interval, once, all_sessions, max_workers, session, json),
         Command::Session(cmd) => cmd_session(cmd),
         Command::Identity { cmd } => identity::cmd_identity(cmd),
         Command::Mesh(cmd) => cmd_mesh(cmd),

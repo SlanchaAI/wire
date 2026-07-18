@@ -970,6 +970,8 @@ pub struct DoctorCheck {
     pub id: String,
     /// PASS / WARN / FAIL.
     pub status: String,
+    /// `runtime_health`, `operator_config`, or `wire_defect`.
+    pub classification: String,
     /// One-line human summary.
     pub detail: String,
     /// Optional remediation hint shown after the failing line.
@@ -982,6 +984,7 @@ impl DoctorCheck {
         Self {
             id: id.into(),
             status: "PASS".into(),
+            classification: "runtime_health".into(),
             detail: detail.into(),
             fix: None,
         }
@@ -990,6 +993,7 @@ impl DoctorCheck {
         Self {
             id: id.into(),
             status: "WARN".into(),
+            classification: "runtime_health".into(),
             detail: detail.into(),
             fix: Some(fix.into()),
         }
@@ -998,10 +1002,284 @@ impl DoctorCheck {
         Self {
             id: id.into(),
             status: "FAIL".into(),
+            classification: "runtime_health".into(),
             detail: detail.into(),
             fix: Some(fix.into()),
         }
     }
+
+    fn classified(mut self, classification: &str) -> Self {
+        self.classification = classification.into();
+        self
+    }
+}
+
+fn supervisor_fanout_verdict(
+    workers: usize,
+    cap: usize,
+    homes: usize,
+    inactive_homes: usize,
+) -> DoctorCheck {
+    if workers > cap {
+        DoctorCheck::fail(
+            "supervisor_fanout",
+            format!(
+                "{workers} live session workers exceed cap {cap} across {homes} homes; {inactive_homes} homes have no active lifecycle signal"
+            ),
+            "install this Wire build, then restart through the existing service manager; do not hand-start daemons or wildcard-kill processes",
+        )
+        .classified("wire_defect")
+    } else {
+        DoctorCheck::pass(
+            "supervisor_fanout",
+            format!(
+                "{workers} live session workers within cap {cap}; {inactive_homes}/{homes} homes inactive"
+            ),
+        )
+    }
+}
+
+fn session_override_collision_verdict(processes: usize, distinct_homes: usize) -> DoctorCheck {
+    if processes > 1 && distinct_homes < processes {
+        DoctorCheck::warn(
+            "session_id_collision",
+            format!(
+                "{processes} concurrent MCP processes share {distinct_homes} session identity from a literal WIRE_SESSION_ID override"
+            ),
+            "remove the fixed WIRE_SESSION_ID from the launcher and pass one stable, unique session id per Codex session; Wire configuration is behaving as requested",
+        )
+        .classified("operator_config")
+    } else {
+        DoctorCheck::pass(
+            "session_id_collision",
+            format!(
+                "{processes} concurrent MCP process(es) map to {distinct_homes} distinct session home(s)"
+            ),
+        )
+    }
+}
+
+fn stale_mcp_verdict(live: usize, skewed: usize) -> DoctorCheck {
+    if skewed > 0 {
+        DoctorCheck::warn(
+            "stale_mcp",
+            format!("{skewed}/{live} live MCP process(es) record a different Wire version"),
+            "reconnect affected MCP hosts after deploying the new binary; do not kill all MCP processes as a first step",
+        )
+    } else {
+        DoctorCheck::pass(
+            "stale_mcp",
+            format!("{live} live MCP process(es), no version skew"),
+        )
+    }
+}
+
+fn executable_path_verdict(path_first_is_current: bool, service_is_current: bool) -> DoctorCheck {
+    if !path_first_is_current {
+        DoctorCheck::warn(
+            "path_shadow",
+            "the first `wire` on PATH is not this running executable",
+            "remove or reorder the older PATH entry; confirm with `type -a wire` and `wire --version`",
+        )
+        .classified("operator_config")
+    } else if !service_is_current {
+        DoctorCheck::warn(
+            "path_shadow",
+            "the installed daemon service points at a different Wire executable",
+            "re-run `wire service install` from the intended binary; existing interval and worker cap will be preserved",
+        )
+    } else {
+        DoctorCheck::pass(
+            "path_shadow",
+            "PATH and installed service resolve to this executable",
+        )
+    }
+}
+
+fn local_relay_verdict(installed: bool, reachable: bool) -> DoctorCheck {
+    if reachable {
+        DoctorCheck::pass("local_relay", "127.0.0.1:8771 accepts connections")
+    } else {
+        DoctorCheck::fail(
+            "local_relay",
+            format!(
+                "127.0.0.1:8771 refuses connections; local-relay service installed={installed}"
+            ),
+            if installed {
+                "inspect `wire service status --local-relay` and launchd/systemd logs; recover through the service manager"
+            } else {
+                "install with `wire service install --local-relay`"
+            },
+        )
+    }
+}
+
+fn check_supervisor_fanout() -> DoctorCheck {
+    let sessions = crate::session::list_sessions().unwrap_or_default();
+    let workers = sessions
+        .iter()
+        .filter_map(|session| crate::session::session_daemon_pid(&session.home_dir))
+        .filter(|pid| crate::platform::process_alive(*pid))
+        .count();
+    let inactive = sessions
+        .iter()
+        .filter(|session| {
+            session.cwd.is_none()
+                && crate::session_lifecycle::active_leases_at(
+                    &session.home_dir,
+                    time::OffsetDateTime::now_utc(),
+                    crate::platform::process_alive,
+                )
+                .is_empty()
+        })
+        .count();
+    let cap = crate::service::installed_daemon_options().max_workers;
+    supervisor_fanout_verdict(workers, cap, sessions.len(), inactive)
+}
+
+fn check_session_id_collisions() -> DoctorCheck {
+    let processes = actual_wire_role_pids("mcp").len();
+    let (live_homes, _) = live_mcp_inventory();
+    if codex_has_fixed_session_override() && processes > 1 {
+        DoctorCheck::warn(
+            "session_id_collision",
+            format!(
+                "Codex launcher config sets one literal WIRE_SESSION_ID while {processes} Wire MCP processes run; every Codex session inheriting it collapses to one identity"
+            ),
+            "remove the fixed WIRE_SESSION_ID from ~/.codex/config.toml and pass one stable, unique session id per Codex session; Wire configuration is behaving as requested",
+        )
+        .classified("operator_config")
+    } else if crate::session::session_source() == "override" {
+        session_override_collision_verdict(processes, live_homes)
+    } else {
+        DoctorCheck::pass(
+            "session_id_collision",
+            format!(
+                "current session source is {}; {processes} concurrent MCP process(es), {live_homes} independently addressable live home(s)",
+                crate::session::session_source()
+            ),
+        )
+    }
+}
+
+fn codex_has_fixed_session_override() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let Ok(body) = std::fs::read_to_string(
+        std::path::PathBuf::from(home)
+            .join(".codex")
+            .join("config.toml"),
+    ) else {
+        return false;
+    };
+    codex_config_has_fixed_session_override(&body)
+}
+
+fn codex_config_has_fixed_session_override(body: &str) -> bool {
+    let mut in_set_section = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_set_section = line == "[shell_environment_policy.set]";
+            continue;
+        }
+        if in_set_section
+            && line.split_once('=').is_some_and(|(key, value)| {
+                key.trim() == "WIRE_SESSION_ID" && !value.trim().is_empty()
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn actual_wire_role_pids(role: &str) -> Vec<u32> {
+    crate::platform::find_processes_by_cmdline(&format!("wire {role}"))
+        .into_iter()
+        .filter(|pid| {
+            crate::platform::pid_cmdline(*pid).is_some_and(|cmdline| {
+                let mut tokens = cmdline.split_whitespace();
+                let executable = tokens.next().and_then(|token| {
+                    std::path::Path::new(token)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                });
+                executable.is_some_and(|name| name == "wire" || name == "wire.exe")
+                    && tokens.next() == Some(role)
+            })
+        })
+        .collect()
+}
+
+fn live_mcp_inventory() -> (usize, usize) {
+    let mut live_homes = 0usize;
+    let mut skewed = 0usize;
+    for session in crate::session::list_sessions().unwrap_or_default() {
+        let pidfile = session.home_dir.join("state").join("wire").join("mcp.pid");
+        let Ok(body) = std::fs::read_to_string(pidfile) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<crate::ensure_up::DaemonPid>(&body) else {
+            continue;
+        };
+        if crate::platform::process_alive(record.pid) {
+            live_homes += 1;
+            skewed += usize::from(record.version != env!("CARGO_PKG_VERSION"));
+        }
+    }
+    (live_homes, skewed)
+}
+
+fn check_stale_mcp_processes() -> DoctorCheck {
+    let (live, skewed) = live_mcp_inventory();
+    stale_mcp_verdict(live, skewed)
+}
+
+fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let resolved =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved(a) == resolved(b)
+}
+
+fn check_executable_paths() -> DoctorCheck {
+    let Ok(current) = crate::platform::current_exe_resolved() else {
+        return DoctorCheck::warn(
+            "path_shadow",
+            "could not resolve current Wire executable",
+            "run `type -a wire` and inspect the installed service executable",
+        );
+    };
+    let path_first = std::process::Command::new("which")
+        .args(["-a", "wire"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(std::path::PathBuf::from)
+        });
+    let path_matches = path_first
+        .as_deref()
+        .is_some_and(|path| paths_match(path, &current));
+    let service_matches = crate::service::installed_daemon_executable()
+        .as_deref()
+        .is_none_or(|path| paths_match(path, &current));
+    executable_path_verdict(path_matches, service_matches)
+}
+
+fn check_local_relay_health() -> DoctorCheck {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 8771));
+    let reachable =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300))
+            .is_ok();
+    let installed = crate::service::status_kind(crate::service::ServiceKind::LocalRelay)
+        .map(|report| report.status != "absent")
+        .unwrap_or(false);
+    local_relay_verdict(installed, reachable)
 }
 
 /// `wire doctor` — single-command diagnostic for the silent-fail classes
@@ -1010,6 +1288,11 @@ impl DoctorCheck {
 /// so operators don't have to know where each lives.
 pub(super) fn cmd_doctor(as_json: bool, recent_rejections: usize) -> Result<()> {
     let checks: Vec<DoctorCheck> = vec![
+        check_supervisor_fanout(),
+        check_session_id_collisions(),
+        check_executable_paths(),
+        check_stale_mcp_processes(),
+        check_local_relay_health(),
         check_daemon_health(),
         check_daemon_pid_consistency(),
         check_relay_reachable(),
@@ -1017,7 +1300,7 @@ pub(super) fn cmd_doctor(as_json: bool, recent_rejections: usize) -> Result<()> 
         check_sync_freshness(),
         check_cursor_progress(),
         check_peer_staleness(7),
-        check_and_heal_self_userinfo_endpoints(),
+        check_self_userinfo_endpoints(),
         check_stale_inbound_pairs(),
     ];
 
@@ -1049,7 +1332,10 @@ pub(super) fn cmd_doctor(as_json: bool, recent_rejections: usize) -> Result<()> 
                 "FAIL" => "✗",
                 _ => "?",
             };
-            println!("  {bullet} [{}] {}: {}", c.status, c.id, c.detail);
+            println!(
+                "  {bullet} [{}] {} {}: {}",
+                c.status, c.classification, c.id, c.detail
+            );
             if let Some(fix) = &c.fix {
                 println!("      fix: {fix}");
             }
@@ -1415,6 +1701,55 @@ fn check_pair_rejections(recent_n: usize) -> DoctorCheck {
     )
 }
 
+/// Read-only check for malformed self relay endpoints. Doctor never rewrites
+/// relay state; it reports the count and delegates repair to explicit bind and
+/// claim commands.
+fn check_self_userinfo_endpoints() -> DoctorCheck {
+    let Ok(state) = config::read_relay_state() else {
+        return DoctorCheck::pass(
+            "self-userinfo-endpoints",
+            "no relay state yet — nothing published",
+        );
+    };
+    let Some(self_block) = state.get("self") else {
+        return DoctorCheck::pass(
+            "self-userinfo-endpoints",
+            "no self block in relay state — nothing published",
+        );
+    };
+    let endpoint_count = self_block
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|endpoint| {
+            endpoint
+                .get("relay_url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| super::setup::assert_relay_url_clean_for_publish(url).is_err())
+        })
+        .count();
+    let legacy_bad = self_block
+        .get("relay_url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| super::setup::assert_relay_url_clean_for_publish(url).is_err());
+    let malformed = endpoint_count + usize::from(legacy_bad);
+    if malformed == 0 {
+        DoctorCheck::pass(
+            "self-userinfo-endpoints",
+            "no malformed endpoints in self-state",
+        )
+    } else {
+        DoctorCheck::warn(
+            "self-userinfo-endpoints",
+            format!(
+                "{malformed} malformed userinfo-bearing self endpoint(s); doctor made no changes"
+            ),
+            "bind a clean relay explicitly, then republish with `wire claim <your-persona>`; inspect state before removing legacy entries",
+        )
+    }
+}
+
 /// Check: cursor isn't stuck. We can't tell without polling — but we can
 /// report the current cursor position so operators see if it changes.
 /// Real "stuck" detection needs two pulls separated in time; defer that
@@ -1478,6 +1813,7 @@ fn check_pair_rejections(recent_n: usize) -> DoctorCheck {
 /// round-trip + persona arg. Operators get the explicit next step in
 /// the WARN fix text. Two-step is the right friction: heal silently,
 /// claim explicitly.
+#[cfg(test)]
 fn check_and_heal_self_userinfo_endpoints() -> DoctorCheck {
     let mut state = match config::read_relay_state() {
         Ok(s) => s,
@@ -1805,6 +2141,39 @@ fn check_cursor_progress() -> DoctorCheck {
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
+
+    #[test]
+    fn supervisor_fanout_verdict_catches_655_home_failure() {
+        let c = supervisor_fanout_verdict(566, 16, 655, 650);
+        assert_eq!(c.status, "FAIL");
+        assert_eq!(c.classification, "wire_defect");
+        assert!(c.detail.contains("566") && c.detail.contains("16"));
+    }
+
+    #[test]
+    fn duplicate_literal_override_is_operator_configuration() {
+        let c = session_override_collision_verdict(2, 1);
+        assert_eq!(c.status, "WARN");
+        assert_eq!(c.classification, "operator_config");
+        assert!(c.detail.contains("2"));
+        assert_eq!(session_override_collision_verdict(2, 2).status, "PASS");
+        assert!(codex_config_has_fixed_session_override(
+            "[shell_environment_policy.set]\nWIRE_SESSION_ID = \"fixed\""
+        ));
+        assert!(!codex_config_has_fixed_session_override(
+            "[shell_environment_policy]\ninherit = \"core\""
+        ));
+    }
+
+    #[test]
+    fn stale_mcp_path_skew_and_local_relay_have_precise_verdicts() {
+        assert_eq!(stale_mcp_verdict(41, 7).status, "WARN");
+        assert_eq!(
+            executable_path_verdict(false, true).classification,
+            "operator_config"
+        );
+        assert_eq!(local_relay_verdict(false, false).status, "FAIL");
+    }
 
     #[test]
     fn sync_freshness_fails_when_stale_with_queued_events() {

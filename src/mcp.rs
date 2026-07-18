@@ -117,9 +117,11 @@ pub fn run() -> Result<()> {
     // identity (and early-returns for already-initialized homes), so arm the
     // daemon unconditionally here. Idempotent (singleton-guarded) and gated on
     // an existing identity + the same skip env bootstrap honors.
-    if std::env::var("WIRE_MCP_SKIP_AUTO_UP").is_err()
-        && crate::config::is_initialized().unwrap_or(false)
-    {
+    if should_start_embedded_daemon(
+        std::env::var("WIRE_MCP_SKIP_AUTO_UP").is_err(),
+        crate::config::is_initialized().unwrap_or(false),
+        crate::daemon_supervisor::supervisor_is_alive(),
+    ) {
         let _ = crate::ensure_up::ensure_daemon_running();
     }
 
@@ -1607,6 +1609,14 @@ fn ensure_session_bootstrapped() {
     }
 }
 
+fn should_start_embedded_daemon(
+    auto_up_enabled: bool,
+    initialized: bool,
+    supervisor_alive: bool,
+) -> bool {
+    auto_up_enabled && initialized && !supervisor_alive
+}
+
 fn tool_init(args: &Value) -> Result<Value, String> {
     let handle = args
         .get("handle")
@@ -2151,6 +2161,14 @@ fn error_response(id: &Value, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_ownership_suppresses_per_mcp_daemon() {
+        assert!(should_start_embedded_daemon(true, true, false));
+        assert!(!should_start_embedded_daemon(true, true, true));
+        assert!(!should_start_embedded_daemon(false, true, false));
+        assert!(!should_start_embedded_daemon(true, false, false));
+    }
 
     #[test]
     fn mcp_stale_binary_note_flags_only_real_mismatch() {
