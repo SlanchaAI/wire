@@ -27,7 +27,7 @@ unset WIRE_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
 # read it back. Each call is a fresh process => fresh OnceLock capture, exactly
 # like a brand-new terminal tab. init is idempotent on an already-keyed home.
 who(){
-  env "$@" "$BIN" init seed --offline >/dev/null 2>&1
+  env "$@" "$BIN" init --offline >/dev/null 2>&1
   env "$@" "$BIN" whoami --json 2>/dev/null \
     | jq -r '"\(.handle)|\(.config_dir)|\(.session_source)"'
 }
