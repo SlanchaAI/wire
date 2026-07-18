@@ -78,3 +78,69 @@ Install the merged binary atomically, then remove only the fixed
 a mode/timestamp-retaining backup; do not touch shell dotfiles. Existing Codex
 processes keep inherited identity until they exit; fresh processes use their
 thread ID.
+
+## Codex adapter merge and deployment
+
+- PR #368 merged through branch protection as
+  `4b9985c68d57fe5a87ad37691d499496245a8071`. The first merge attempt was
+  rejected because `main` advanced with the Gemini plugin manifest. Merged the
+  new base into the branch, reran the focused adapter test and full canonical
+  gate, then waited for all replacement checks. Linux, Windows, integration,
+  demos, docs, and CodeRabbit review passed.
+- Verified the branch tree and merged `main` tree were identical before the
+  release build. Installed SHA-256
+  `6cb24f98d42352e804a2d07e8a80b984e2ae4532234e6206b495733f530e2f44`
+  atomically at `~/.cargo/bin/wire`; candidate, staged, and installed hashes
+  matched. Preserved the preceding binary at
+  `~/.cargo/bin/wire.pre-codex-thread-20260718`.
+- Backed up Codex configuration byte-for-byte at
+  `~/.codex/config.toml.pre-wire-session-fix-20260718`, preserving mode and
+  timestamps, then removed only the fixed Wire identity override block from
+  the app-managed config. `codex --version` parsed the resulting config and the
+  override key is absent. No shell dotfile changed.
+- Existing Codex/MCP processes retain their inherited literal until exit.
+  `wire doctor` therefore still emits the correct operator-configuration
+  collision warning for those old processes; this is not evidence that the
+  config edit failed. Fresh Codex processes inherit `CODEX_THREAD_ID` and the
+  merged Wire binary resolves it as `codex-cli`.
+
+## Final runtime measurements
+
+- 13 daemon processes (one launchd supervisor plus 12 child workers, below the
+  configured cap of 16), 47 inherited MCP processes, and 525,344 KiB combined
+  daemon+MCP RSS.
+- 719 historical by-key homes; doctor reports 707 without active lifecycle
+  signals. They remain inactive rather than becoming supervisor children.
+- Local relay TCP healthy; launchd daemon unit loaded; PATH/service binary
+  consistent; no reported MCP version skew.
+- Doctor's aggregate `supervisor_fanout` check still counts old MCP-owned
+  workers and reports 53 live workers. The managed supervisor itself owns only
+  12 children. No broad process kill or extra service restart was used; old
+  MCP-owned workers age out with their Codex sessions.
+
+## Missed runtime-test caller
+
+`test-env/runtime-210.sh` still invoked the removed positional form
+`wire init seed --offline`. Before correction its runtime gate reported 1 pass
+and 10 failures with uninitialized identities. Changing that caller to
+`wire init --offline` produced 11 passes and 0 failures in the isolated Docker
+XDG root. This one-line follow-up and this final rollout record are carried on
+`fix/codex-thread-rollout-record` for a second protected merge.
+
+## Artifacts
+
+- `docs/superpowers/specs/2026-07-18-codex-thread-identity-design.md` — approved
+  caller adapter design.
+- `docs/superpowers/plans/2026-07-18-codex-thread-identity.md` — implementation,
+  merge, and rollout plan.
+- `SESSION_LOG_2026_07_18.md` — investigation, tests, merge, deployment, and
+  before/after measurements.
+- `~/.cargo/bin/wire.pre-codex-thread-20260718` — pre-adapter binary rollback.
+- `~/.codex/config.toml.pre-wire-session-fix-20260718` — pre-migration Codex
+  config rollback.
+
+Caller documentation handoff: the dirty dotfiles worktree was not modified.
+Its source file `~/Source/dotfiles-claude/codex/AGENTS.preamble.md` still says a
+fixed Wire session override is current. The owner of that worktree should
+replace that statement with: Codex exposes `CODEX_THREAD_ID`; Wire v0.17.0+
+uses it automatically; do not set one global `WIRE_SESSION_ID`.
