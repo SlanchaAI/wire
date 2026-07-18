@@ -21,10 +21,15 @@ FROM rust:1.88-bookworm
 RUN rustup component add clippy rustfmt \
     && apt-get update \
     && apt-get install -y --no-install-recommends jq \
+    && printf '776972652d74657374656e762d303031\n' > /etc/machine-id \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /wire
 ENV CARGO_TERM_COLOR=always
+# CI jobs use disposable workspaces. Disable incremental compilation here too:
+# Cargo 1.88 can lose incremental/fingerprint paths on Docker named volumes
+# when `clippy --all-targets` compiles the lib and lib-test targets together.
+ENV CARGO_INCREMENTAL=0
 
 # Default command = the full CI gate. Overridden by any args passed to
 # `docker run` (see run.sh).

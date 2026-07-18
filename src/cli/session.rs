@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 fn resolve_session_name(name: Option<&str>) -> Result<String> {
@@ -1191,10 +1191,10 @@ pub(super) fn cmd_session_pair_all_local(
     Ok(())
 }
 
-/// Drive one bilateral pair handshake between two sister sessions
-/// using their session home dirs as `WIRE_HOME`. Sequential 8-step
-/// flow so failures bubble up at the offending step, not buried in
-/// a parallel race. See `cmd_session_pair_all_local` docstring.
+/// Drive one bilateral pair handshake between two sister sessions.
+/// `wire add --local-sister` now performs relay preflight, reverse dial,
+/// both pulls, and VERIFIED convergence synchronously, so orchestration
+/// no longer repeats the old manual pull/accept choreography.
 ///
 /// v0.6.6: step 1 (the `wire add`) uses `--local-sister` instead of
 /// federation `.well-known/wire/agent` resolution. Reads B's card +
@@ -1208,18 +1208,23 @@ pub(super) fn cmd_session_pair_all_local(
 fn drive_bilateral_pair(
     a_home: &std::path::Path,
     a_name: &str,
-    b_home: &std::path::Path,
+    _b_home: &std::path::Path,
     b_name: &str,
     _fed_host: &str,
     _federation_relay: &str,
-    settle_secs: u64,
+    _settle_secs: u64,
 ) -> Result<()> {
-    use std::time::Duration;
     let bin = std::env::current_exe().context("locating self exe")?;
 
     let run = |home: &std::path::Path, args: &[&str]| -> Result<()> {
         let out = std::process::Command::new(&bin)
             .env("WIRE_HOME", home)
+            .env("WIRE_HOME_FORCE", "1")
+            .env_remove("WIRE_SESSION_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CODEX_SESSION_ID")
+            .env_remove("COPILOT_AGENT_SESSION_ID")
+            .env_remove("VSCODE_GIT_REPOSITORY_ROOT")
             .env_remove("RUST_LOG")
             .args(args)
             .output()
@@ -1234,50 +1239,8 @@ fn drive_bilateral_pair(
         Ok(())
     };
 
-    // v0.11: each session's agent-card.handle is the DID-derived
-    // character, not the session name. wire-accept lookups key on the
-    // CARD HANDLE, so we discover each side's canonical handle from
-    // its agent-card on disk before driving the pair flow.
-    let read_card_handle = |home: &std::path::Path| -> Result<String> {
-        let card_path = home.join("config").join("wire").join("agent-card.json");
-        let bytes = std::fs::read(&card_path)
-            .with_context(|| format!("reading agent-card at {card_path:?}"))?;
-        let card: Value = serde_json::from_slice(&bytes)?;
-        card.get("handle")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("agent-card at {card_path:?} missing `handle` field"))
-    };
-    let a_handle = read_card_handle(a_home)
-        .with_context(|| format!("session {a_name} (a): read agent-card.handle"))?;
-    let b_handle = read_card_handle(b_home)
-        .with_context(|| format!("session {b_name} (b): read agent-card.handle"))?;
-
-    // 1. A initiates via --local-sister (uses the session NAME for
-    // the registry lookup; cmd_add_local_sister auto-resolves
-    // session→handle internally).
     run(a_home, &["add", b_name, "--local-sister", "--json"])
-        .with_context(|| format!("step 1/8: {a_name} `wire add {b_name} --local-sister`"))?;
-
-    // 3. settle so pair_drop reaches B's slot
-    std::thread::sleep(Duration::from_secs(settle_secs));
-
-    // 4. B pulls pair_drop → 5. B accept (pins A by CARD HANDLE,
-    // not by session name — under v0.11 these differ) → 6. B push ack
-    run(b_home, &["pull", "--json"]).with_context(|| format!("step 4/8: {b_name} `wire pull`"))?;
-    run(b_home, &["accept", &a_handle, "--json"]).with_context(|| {
-        format!("step 5/8: {b_name} `wire accept {a_handle}` (a session={a_name})")
-    })?;
-    run(b_home, &["push", "--json"]).with_context(|| format!("step 6/8: {b_name} `wire push`"))?;
-
-    // 7. settle so ack reaches A's slot
-    std::thread::sleep(Duration::from_secs(settle_secs));
-
-    // 8. A pulls ack (pins B by CARD HANDLE)
-    run(a_home, &["pull", "--json"]).with_context(|| format!("step 8/8: {a_name} `wire pull`"))?;
-    // suppress unused warning when both handles are consumed
-    let _ = &b_handle;
-
+        .with_context(|| format!("{a_name} `wire add {b_name} --local-sister`"))?;
     Ok(())
 }
 

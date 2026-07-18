@@ -821,6 +821,49 @@ pub(crate) struct LocalSisterDrop {
     pub event_id: String,
     pub delivered_via: String,
     pub delivery_relay_url: String,
+    pub bilateral_verified: bool,
+}
+
+fn run_wire_for_session(home: &std::path::Path, args: &[&str], one_way: bool) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving Wire executable for sister handshake")?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .env("WIRE_HOME", home)
+        .env("WIRE_HOME_FORCE", "1")
+        .env("WIRE_QUIET_AUTOSESSION", "1")
+        .env_remove("WIRE_SESSION_ID")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_SESSION_ID")
+        .env_remove("COPILOT_AGENT_SESSION_ID")
+        .env_remove("VSCODE_GIT_REPOSITORY_ROOT");
+    if one_way {
+        command.env("WIRE_LOCAL_PAIR_ONE_WAY", "1");
+    } else {
+        command.env_remove("WIRE_LOCAL_PAIR_ONE_WAY");
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("running isolated `wire {}`", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "isolated `wire {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn home_effective_tier(home: &std::path::Path, peer: &str) -> Option<String> {
+    let read = |name: &str| {
+        std::fs::read(home.join("config").join("wire").join(name))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    let trust = read("trust.json")?;
+    let relay = read("relay.json")?;
+    Some(crate::trust::effective_tier(&trust, &relay, peer))
 }
 
 /// Core of the local-sister pair: resolve the sister, pin them VERIFIED,
@@ -833,7 +876,7 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
     // 1. Locate sister session by name OR character nickname.
     let sessions = crate::session::list_sessions()?;
     let sister = match resolve_local_session(&sessions, sister_name) {
-        Ok(s) => s,
+        Ok(s) => s.clone(),
         Err(ResolveError::NotFound) => bail!(
             "no sister session named `{sister_name}` (matched by session name or character nickname). \
              Run `wire session list` to see what's available."
@@ -907,6 +950,14 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
         None => sister_endpoints[0].clone(),
     };
 
+    let client = crate::relay_client::RelayClient::new(&delivery_endpoint.relay_url);
+    client.check_healthz().map_err(|error| {
+        anyhow!(
+            "local relay preflight failed for {}: {error:#}; no pairing state changed. Check `wire service status --local-relay` and recover through the service manager",
+            delivery_endpoint.relay_url
+        )
+    })?;
+
     // 4. Ensure WE have a slot to advertise back. For local-only sessions
     // this is the local slot; for dual-slot sessions, federation is fine.
     // `ensure_self_with_relay(None)` defaults to wireup.net which is wrong
@@ -973,7 +1024,6 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
     // 7. Deliver direct to sister's local slot. Skip /v1/handle/intro
     // (the federation handle indexer) — we already know the slot coords
     // from disk, so post_event is sufficient.
-    let client = crate::relay_client::RelayClient::new(&delivery_endpoint.relay_url);
     client
         .post_event(
             &delivery_endpoint.slot_id,
@@ -981,6 +1031,32 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
             &signed,
         )
         .with_context(|| format!("delivering pair_drop to `{sister_name}`'s local slot"))?;
+
+    let one_way = std::env::var("WIRE_LOCAL_PAIR_ONE_WAY").is_ok();
+    if !one_way {
+        let our_session = sessions
+            .iter()
+            .find(|session| session.did.as_deref() == Some(our_did.as_str()))
+            .ok_or_else(|| {
+                anyhow!("current identity is not present in the local session registry")
+            })?;
+        run_wire_for_session(
+            &sister.home_dir,
+            &["add", &our_session.name, "--local-sister", "--json"],
+            true,
+        )?;
+        run_wire_for_session(&our_session.home_dir, &["pull", "--json"], false)?;
+        run_wire_for_session(&sister.home_dir, &["pull", "--json"], false)?;
+        run_wire_for_session(&our_session.home_dir, &["pull", "--json"], false)?;
+
+        let our_tier = home_effective_tier(&our_session.home_dir, &sister_handle);
+        let sister_tier = home_effective_tier(&sister.home_dir, &our_handle);
+        if our_tier.as_deref() != Some("VERIFIED") || sister_tier.as_deref() != Some("VERIFIED") {
+            bail!(
+                "local sister handshake did not converge: initiator={our_tier:?}, sister={sister_tier:?}"
+            );
+        }
+    }
 
     let delivered_via = match delivery_endpoint.scope {
         crate::endpoints::EndpointScope::Local => "local",
@@ -996,6 +1072,7 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
         event_id,
         delivered_via,
         delivery_relay_url: delivery_endpoint.relay_url.clone(),
+        bilateral_verified: !one_way,
     })
 }
 
@@ -1020,12 +1097,12 @@ pub(crate) fn cmd_add_local_sister(sister_name: &str, as_json: bool) -> Result<(
                 "peer_handle": drop.peer_handle,
                 "event_id": drop.event_id,
                 "delivered_via": drop.delivered_via,
-                "status": "drop_sent",
+                "status": if drop.bilateral_verified { "verified" } else { "drop_sent" },
             }))?
         );
     } else {
         println!(
-            "→ found sister `{sister_name}` (did={})\n→ pinned peer locally\n→ pair_drop delivered to {} slot on {}\nawaiting pair_drop_ack from {} to complete bilateral pin.",
+            "→ found sister `{sister_name}` (did={})\n→ pair_drop delivered to {} slot on {}\n→ bilateral local-sister pair VERIFIED with {}.",
             drop.paired_with_did, drop.delivered_via, drop.delivery_relay_url, drop.peer_handle
         );
     }
