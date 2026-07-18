@@ -181,10 +181,10 @@ pub fn run() -> Result<()> {
     let shutdown_w = shutdown.clone();
     let lease_w = session_lease.clone();
     let watcher_handle = std::thread::spawn(move || {
-        let mut watcher = match crate::inbox_watch::InboxWatcher::from_head() {
-            Ok(w) => w,
-            Err(_) => return,
-        };
+        // Inbox notification setup is best-effort. Lease heartbeat is not:
+        // a transient watcher failure must not make a live MCP identity age
+        // out of supervisor eligibility. Retry watcher creation on poll.
+        let mut watcher = crate::inbox_watch::InboxWatcher::from_head().ok();
         let poll_interval = Duration::from_secs(2);
         let mut next_poll = Instant::now() + poll_interval;
         let mut next_lease_heartbeat =
@@ -213,16 +213,21 @@ pub fn run() -> Result<()> {
             let mut affected: HashSet<String> = HashSet::new();
 
             // ---- inbox events ----
-            if !subs_snapshot.is_empty()
-                && let Ok(events) = watcher.poll()
-            {
-                for ev in &events {
-                    if subs_snapshot.contains("wire://inbox/all") {
-                        affected.insert("wire://inbox/all".to_string());
-                    }
-                    let peer_uri = format!("wire://inbox/{}", ev.peer);
-                    if subs_snapshot.contains(&peer_uri) {
-                        affected.insert(peer_uri);
+            if !subs_snapshot.is_empty() {
+                if watcher.is_none() {
+                    watcher = crate::inbox_watch::InboxWatcher::from_head().ok();
+                }
+                if let Some(watcher) = watcher.as_mut()
+                    && let Ok(events) = watcher.poll()
+                {
+                    for ev in &events {
+                        if subs_snapshot.contains("wire://inbox/all") {
+                            affected.insert("wire://inbox/all".to_string());
+                        }
+                        let peer_uri = format!("wire://inbox/{}", ev.peer);
+                        if subs_snapshot.contains(&peer_uri) {
+                            affected.insert(peer_uri);
+                        }
                     }
                 }
             }

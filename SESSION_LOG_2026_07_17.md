@@ -201,3 +201,19 @@ Remove that fixed override and have the Codex launcher/session adapter pass a
 stable unique `CODEX_SESSION_ID` (or unique `WIRE_SESSION_ID`) per concurrent
 session. Wire doctor now classifies this as `operator_config` and warns when
 concurrent Wire MCP processes share the fixed launcher identity.
+
+## Final review
+
+- Build-loop cross-provider review was attempted twice through the read-only
+  Claude subscription reviewer: once with the complete 137 KiB diff (300s),
+  then with the 84 KiB executable-only diff (420s). Both timed out without a
+  verdict or findings. No reviewer approval is claimed; no third retry was
+  made.
+- Manual review covered every critical diff named by GitNexus. It found one
+  lifecycle edge: MCP heartbeat shared the inbox watcher thread's early-return
+  path, so a watcher initialization failure could let a live MCP lease expire.
+  The watcher is now best-effort and retries while the same thread continues
+  the authoritative heartbeat. Focused MCP tests passed after the correction.
+- GitNexus impact for `mcp::run` was LOW with no upstream dependants. Final
+  staged/compare change detection and the full canonical gate were rerun after
+  the correction before commit.
