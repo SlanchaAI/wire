@@ -41,3 +41,40 @@ GitNexus impact for `resolve_session_key` is LOW: four direct dependants, six
 impacted symbols, and two affected runtime entry flows (`cli::run` and
 `mcp::run`). Selected fix is documented in
 `docs/superpowers/specs/2026-07-18-codex-thread-identity-design.md`.
+
+## Codex thread adapter implementation
+
+- Added `CODEX_THREAD_ID` immediately after the existing
+  `CODEX_SESSION_ID` compatibility adapter. Both resolve with source
+  `codex-cli`; explicit Wire and Claude Code overrides retain precedence.
+- RED: the focused Codex adapter test failed with `CODEX_THREAD_ID` resolving
+  to `None` before the production change.
+- GREEN: three session-key adapter tests passed. The isolated lifecycle,
+  655-stale-home supervisor, relay-unavailable, and bilateral local-sister
+  suites passed; local-sister dial converged without manual pull.
+- `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- Added `CODEX_THREAD_ID` cleanup anywhere an isolated test process already
+  removed the older Codex variable. Every temporary `WIRE_HOME` spawn in this
+  scope retains `WIRE_HOME_FORCE=1`.
+
+## Canonical gate
+
+- First `test-env/run.sh` attempt passed 653 library tests, then Cargo could
+  not execute its just-built zero-test `src/bin/wire.rs` harness because that
+  artifact was absent from the shared Docker target volume. Source inspection
+  found no test invoking binary purge, no concurrent Wire test container, and
+  a Dockerfile note documenting Cargo 1.88 target-path loss on named volumes.
+- Rebuilding that single bin-test target in the same container volume passed.
+- A second full `test-env/run.sh` run passed end-to-end, including formatting,
+  clippy, all serial Cargo targets, release build, demos, and shell integration
+  checks.
+
+## Deployment decision
+
+Push and merge through protected checks before changing caller configuration.
+Install the merged binary atomically, then remove only the fixed
+`WIRE_SESSION_ID` assignment from Codex's app-managed configuration. Preserve
+a mode/timestamp-retaining backup; do not touch shell dotfiles. Existing Codex
+processes keep inherited identity until they exit; fresh processes use their
+thread ID.
