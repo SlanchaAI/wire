@@ -1488,6 +1488,47 @@ fn sync_freshness_verdict(last_sync_age: Option<u64>, pending_total: u64) -> Doc
     }
 }
 
+fn sync_freshness_verdict_for_lifecycle(
+    last_sync_age: Option<u64>,
+    pending_total: u64,
+    worker_expected: bool,
+) -> DoctorCheck {
+    if !worker_expected && pending_total == 0 {
+        DoctorCheck::pass(
+            "sync_freshness",
+            "identity inactive with no queued events; supervisor correctly leaves its worker retired",
+        )
+    } else {
+        sync_freshness_verdict(last_sync_age, pending_total)
+    }
+}
+
+fn current_session_worker_expected(pending_total: u64) -> bool {
+    if pending_total > 0 {
+        return true;
+    }
+    let Some(home) = std::env::var_os("WIRE_HOME").map(std::path::PathBuf::from) else {
+        return true;
+    };
+    let Some(session) = crate::session::list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|session| session.home_dir == home)
+    else {
+        return true;
+    };
+    if crate::retire::is_retired(&home) {
+        return false;
+    }
+    session.cwd.is_some()
+        || !crate::session_lifecycle::active_leases_at(
+            &home,
+            time::OffsetDateTime::now_utc(),
+            crate::platform::process_alive,
+        )
+        .is_empty()
+}
+
 /// Check: the daemon's sync loop is actually advancing, not just alive.
 /// Reuses the same shared helpers `wire status` surfaces (last_sync age +
 /// pending-push breakdown) so the two agree by construction.
@@ -1497,7 +1538,9 @@ fn check_sync_freshness() -> DoctorCheck {
         .iter()
         .map(|p| p.count)
         .sum();
-    sync_freshness_verdict(last_sync_age, pending_total)
+    let (_, supervisor_alive, _, _, _) = supervisor_runtime_topology();
+    let worker_expected = !supervisor_alive || current_session_worker_expected(pending_total);
+    sync_freshness_verdict_for_lifecycle(last_sync_age, pending_total, worker_expected)
 }
 
 /// Check: daemon running, exactly one instance, no orphans.
@@ -2352,6 +2395,13 @@ mod doctor_tests {
         // message — WARN, not FAIL (don't cry wolf on an idle box).
         let c = sync_freshness_verdict(Some(3600), 0);
         assert_eq!(c.status, "WARN");
+    }
+
+    #[test]
+    fn sync_freshness_passes_for_intentionally_inactive_identity() {
+        let c = sync_freshness_verdict_for_lifecycle(Some(3600), 0, false);
+        assert_eq!(c.status, "PASS");
+        assert!(c.detail.contains("inactive"));
     }
 
     #[test]

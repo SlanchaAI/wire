@@ -163,6 +163,26 @@ The canonical `test-env/run.sh` gate then passed end-to-end: 657 library tests,
 all serial Rust targets, release build, demos, and 11/11 integration scripts.
 No service mutation occurred during this audit.
 
+PR #370 merged the topology correction through 14 green protected checks as
+`b6a6d490610705d98a6d9a40c878ca46726df192`. The merged and reviewed trees
+matched. Installed release SHA-256
+`569ae2eb7b8ce356bc05d43930d4459a88c19221a58935ad368ca42d1991e28b`
+atomically and preserved the prior adapter binary at
+`~/.cargo/bin/wire.pre-doctor-topology-20260718`; launchd was not restarted.
+
+The installed audit then exposed one last lifecycle-policy mismatch:
+`sync_freshness` warned that an intentionally inactive identity's loop might be
+wedged and recommended reactivation. The supervisor correctly had no worker
+for that home, no lease was live, and no event was queued. GitNexus rated the
+doctor-only change MEDIUM (five direct diagnostic/test callers, no execution
+flows). TDD added an inactive-identity verdict: stale sync now PASSes only when
+the supervisor is healthy, the current registered home has no cwd binding or
+live lease, and nothing is queued. Queued work and explicitly live identities
+retain the existing stale-sync WARN/FAIL behavior. The live candidate changed
+that warning to: `identity inactive with no queued events; supervisor correctly
+leaves its worker retired`. Final `test-env/run.sh` passed 659 library tests,
+all serial Rust targets, the release demos, and 11/11 integration scripts.
+
 ## Artifacts
 
 - `docs/superpowers/specs/2026-07-18-codex-thread-identity-design.md` — approved
