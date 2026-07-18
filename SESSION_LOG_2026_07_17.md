@@ -153,3 +153,51 @@ literal Codex override.
 655 initialized but stale homes and started the real all-session supervisor
 twice with a cap of four. Restart 0: 0 children, 12,336 KiB RSS. Restart 1:
 0 children, 12,608 KiB RSS. The live installation remained unchanged.
+
+## Canonical gate repair
+
+- The first complete `test-env/run.sh` attempt passed formatting, clippy, and
+  every Rust test, then Cargo 1.88 lost a release bytecode path in the shared
+  Docker target volume. A release-only build succeeded on a fresh task-scoped
+  volume, while fresh full-gate builds reproduced missing incremental and
+  fingerprint paths on both volume names.
+- `CARGO_INCREMENTAL=0` made the same failed clippy cache pass immediately.
+  The test image now disables incremental compilation, matching CI's
+  disposable job workspaces and avoiding Docker named-volume rename races.
+- The full gate then exposed a pre-existing fixture gap in
+  `100-fleet-link.sh`: the minimal Debian image had neither Linux machine-id
+  path, so Wire correctly failed closed. The image now supplies a deterministic
+  non-secret machine-id fixture. Focused fleet-link then passed all assertions.
+- One generated, unmounted, corrupt `wire-testenv-target` cache volume was
+  removed and recreated. No source, service state, or identity state lived in
+  that volume.
+
+## Final verification
+
+- `test-env/run.sh`: exit 0. Formatting and clippy passed; Rust unit and
+  integration targets passed serially; the 655-home restart test passed;
+  release build and both demos passed; shell integration suite reported
+  11 passed, 0 failed.
+- Focused lifecycle, supervisor, relay-down, bilateral local-sister, mesh, and
+  fleet-link tests passed before the full gate.
+- Test subprocess audit confirmed temporary `WIRE_HOME` helpers set
+  `WIRE_HOME_FORCE=1`; `tests/it/lib.sh` exports it for shell fixtures.
+
+## Final live read-only snapshot
+
+Captured after verification, before push: 575 `wire daemon` processes,
+4,596,528 KiB aggregate RSS, 52 `wire mcp` processes, 681 by-key homes, and no
+new-format live lease files because the deployed binary predates this branch.
+The daemon launchd unit remains loaded. Local relay `127.0.0.1:8771` still
+refuses connections. Counts grew during the session under the unchanged legacy
+service, confirming that no live remediation or restart occurred.
+
+## Caller-side handoff
+
+Do not change this repo to compensate for the launcher collision. In
+`/Users/laul_pogan/.codex/config.toml`, caller Codex configuration currently
+sets one literal `WIRE_SESSION_ID` under `[shell_environment_policy.set]`.
+Remove that fixed override and have the Codex launcher/session adapter pass a
+stable unique `CODEX_SESSION_ID` (or unique `WIRE_SESSION_ID`) per concurrent
+session. Wire doctor now classifies this as `operator_config` and warns when
+concurrent Wire MCP processes share the fixed launcher identity.
