@@ -105,15 +105,23 @@ pub fn run() -> Result<()> {
     // WIRE_MCP_SKIP_AUTO_UP (tests + manual-identity operators).
     ensure_session_bootstrapped();
 
+    // A live MCP host is the authoritative activity signal for this identity.
+    // Publish the lease before daemon orchestration so the all-session
+    // supervisor can admit this home without treating private-key existence or
+    // daemon-generated sync timestamps as permanent liveness.
+    let session_lease = Arc::new(crate::session_lifecycle::LeaseGuard::acquire("mcp")?);
+
     // v0.15.x: minting an identity isn't enough — without a running sync loop
     // the session is "born deaf" (never pulls inbound, never pushes outbound),
     // the #1 MCP first-run failure. `ensure_session_bootstrapped` only creates
     // identity (and early-returns for already-initialized homes), so arm the
     // daemon unconditionally here. Idempotent (singleton-guarded) and gated on
     // an existing identity + the same skip env bootstrap honors.
-    if std::env::var("WIRE_MCP_SKIP_AUTO_UP").is_err()
-        && crate::config::is_initialized().unwrap_or(false)
-    {
+    if should_start_embedded_daemon(
+        std::env::var("WIRE_MCP_SKIP_AUTO_UP").is_err(),
+        crate::config::is_initialized().unwrap_or(false),
+        crate::daemon_supervisor::supervisor_is_alive(),
+    ) {
         let _ = crate::ensure_up::ensure_daemon_running();
     }
 
@@ -171,18 +179,28 @@ pub fn run() -> Result<()> {
     let subs_w = state.subscribed.clone();
     let tx_w = tx.clone();
     let shutdown_w = shutdown.clone();
+    let lease_w = session_lease.clone();
     let watcher_handle = std::thread::spawn(move || {
-        let mut watcher = match crate::inbox_watch::InboxWatcher::from_head() {
-            Ok(w) => w,
-            Err(_) => return,
-        };
+        // Inbox notification setup is best-effort. Lease heartbeat is not:
+        // a transient watcher failure must not make a live MCP identity age
+        // out of supervisor eligibility. Retry watcher creation on poll.
+        let mut watcher = crate::inbox_watch::InboxWatcher::from_head().ok();
         let poll_interval = Duration::from_secs(2);
         let mut next_poll = Instant::now() + poll_interval;
+        let mut next_lease_heartbeat =
+            Instant::now() + crate::session_lifecycle::LEASE_HEARTBEAT_INTERVAL;
         loop {
             if shutdown_w.load(Ordering::SeqCst) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
+            if Instant::now() >= next_lease_heartbeat {
+                if let Err(e) = lease_w.heartbeat() {
+                    eprintln!("wire mcp: session lease heartbeat failed: {e:#}");
+                }
+                next_lease_heartbeat =
+                    Instant::now() + crate::session_lifecycle::LEASE_HEARTBEAT_INTERVAL;
+            }
             if Instant::now() < next_poll {
                 continue;
             }
@@ -195,16 +213,21 @@ pub fn run() -> Result<()> {
             let mut affected: HashSet<String> = HashSet::new();
 
             // ---- inbox events ----
-            if !subs_snapshot.is_empty()
-                && let Ok(events) = watcher.poll()
-            {
-                for ev in &events {
-                    if subs_snapshot.contains("wire://inbox/all") {
-                        affected.insert("wire://inbox/all".to_string());
-                    }
-                    let peer_uri = format!("wire://inbox/{}", ev.peer);
-                    if subs_snapshot.contains(&peer_uri) {
-                        affected.insert(peer_uri);
+            if !subs_snapshot.is_empty() {
+                if watcher.is_none() {
+                    watcher = crate::inbox_watch::InboxWatcher::from_head().ok();
+                }
+                if let Some(watcher) = watcher.as_mut()
+                    && let Ok(events) = watcher.poll()
+                {
+                    for ev in &events {
+                        if subs_snapshot.contains("wire://inbox/all") {
+                            affected.insert("wire://inbox/all".to_string());
+                        }
+                        let peer_uri = format!("wire://inbox/{}", ev.peer);
+                        if subs_snapshot.contains(&peer_uri) {
+                            affected.insert(peer_uri);
+                        }
                     }
                 }
             }
@@ -1591,6 +1614,14 @@ fn ensure_session_bootstrapped() {
     }
 }
 
+fn should_start_embedded_daemon(
+    auto_up_enabled: bool,
+    initialized: bool,
+    supervisor_alive: bool,
+) -> bool {
+    auto_up_enabled && initialized && !supervisor_alive
+}
+
 fn tool_init(args: &Value) -> Result<Value, String> {
     let handle = args
         .get("handle")
@@ -1707,6 +1738,7 @@ fn tool_dial(args: &Value) -> Result<Value, String> {
                 "paired_with": drop.paired_with_did,
                 "event_id": drop.event_id,
                 "delivered_via": drop.delivered_via,
+                "tier": if drop.bilateral_verified { "VERIFIED" } else { "PENDING_ACK" },
             }))
         }
         // Unresolvable: surface the resolver's own did-you-mean message
@@ -2135,6 +2167,14 @@ fn error_response(id: &Value, code: i32, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_ownership_suppresses_per_mcp_daemon() {
+        assert!(should_start_embedded_daemon(true, true, false));
+        assert!(!should_start_embedded_daemon(true, true, true));
+        assert!(!should_start_embedded_daemon(false, true, false));
+        assert!(!should_start_embedded_daemon(true, false, false));
+    }
 
     #[test]
     fn mcp_stale_binary_note_flags_only_real_mismatch() {

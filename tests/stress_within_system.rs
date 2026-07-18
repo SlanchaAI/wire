@@ -546,6 +546,142 @@ async fn local_only_sessions_pair_without_federation_v0_6_6() {
     assert_eq!(bs["failed"].as_u64().unwrap_or(99), 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_sister_dial_converges_bilaterally_without_manual_pull() {
+    let local_url = spawn_local_only_relay().await;
+    let root = fresh_dir("bilateral-local-dial");
+    for name in ["alpha", "beta"] {
+        let out = wire(
+            &root,
+            &[
+                "session",
+                "new",
+                name,
+                "--local-only",
+                "--local-relay",
+                &local_url,
+                "--no-daemon",
+                "--json",
+            ],
+        );
+        assert!(out.status.success(), "session new failed: {out:?}");
+    }
+    let alpha = session_home_for(&root, "alpha");
+    let beta = session_home_for(&root, "beta");
+    let alpha_handle = handle_for_session(&root, "alpha");
+    let beta_handle = handle_for_session(&root, "beta");
+
+    let dial = wire(&alpha, &["add", &beta_handle, "--local-sister", "--json"]);
+    assert!(
+        dial.status.success(),
+        "local sister dial failed: {}",
+        String::from_utf8_lossy(&dial.stderr)
+    );
+    let dial_json: Value = serde_json::from_slice(&dial.stdout).unwrap();
+    assert_eq!(dial_json["status"], "verified");
+
+    for (home, peer) in [(&alpha, &beta_handle), (&beta, &alpha_handle)] {
+        let peers = wire(home, &["peers", "--json"]);
+        let peers: Value = serde_json::from_slice(&peers.stdout).unwrap();
+        assert!(
+            peers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["handle"] == *peer && entry["tier"] == "VERIFIED" }),
+            "{home:?} did not converge to VERIFIED for {peer}: {peers}"
+        );
+    }
+
+    let send = wire(&alpha, &["send", &beta_handle, "claim", "bilateral-ready"]);
+    assert!(
+        send.status.success(),
+        "direct send after dial failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    assert!(wire(&beta, &["pull", "--json"]).status.success());
+    let tail = wire(&beta, &["tail", &alpha_handle, "--json"]);
+    assert!(String::from_utf8_lossy(&tail.stdout).contains("bilateral-ready"));
+
+    let alpha_relay_path = alpha.join("config").join("wire").join("relay.json");
+    let mut alpha_relay: Value =
+        serde_json::from_slice(&std::fs::read(&alpha_relay_path).unwrap()).unwrap();
+    for endpoint in alpha_relay["peers"][&beta_handle]["endpoints"]
+        .as_array_mut()
+        .unwrap()
+    {
+        endpoint["relay_url"] = Value::String("http://127.0.0.1:9".into());
+    }
+    for endpoint in alpha_relay["self"]["endpoints"].as_array_mut().unwrap() {
+        endpoint["relay_url"] = Value::String("http://127.0.0.1:9".into());
+    }
+    std::fs::write(
+        &alpha_relay_path,
+        serde_json::to_vec_pretty(&alpha_relay).unwrap(),
+    )
+    .unwrap();
+    let unavailable = wire(&alpha, &["send", &beta_handle, "claim", "relay-down"]);
+    assert!(!unavailable.status.success());
+    assert!(
+        String::from_utf8_lossy(&unavailable.stdout).contains("local relay unavailable"),
+        "{}",
+        String::from_utf8_lossy(&unavailable.stdout)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_local_relay_does_not_leave_half_pair_state() {
+    let local_url = spawn_local_only_relay().await;
+    let root = fresh_dir("local-relay-preflight");
+    for name in ["alpha", "beta"] {
+        assert!(
+            wire(
+                &root,
+                &[
+                    "session",
+                    "new",
+                    name,
+                    "--local-only",
+                    "--local-relay",
+                    &local_url,
+                    "--no-daemon",
+                    "--json",
+                ],
+            )
+            .status
+            .success()
+        );
+    }
+    let alpha = session_home_for(&root, "alpha");
+    let beta_handle = handle_for_session(&root, "beta");
+    let beta_relay = session_home_for(&root, "beta")
+        .join("config")
+        .join("wire")
+        .join("relay.json");
+    let mut relay: Value = serde_json::from_slice(&std::fs::read(&beta_relay).unwrap()).unwrap();
+    relay["self"]["relay_url"] = Value::String("http://127.0.0.1:9".into());
+    for endpoint in relay["self"]["endpoints"].as_array_mut().unwrap() {
+        endpoint["relay_url"] = Value::String("http://127.0.0.1:9".into());
+    }
+    std::fs::write(&beta_relay, serde_json::to_vec_pretty(&relay).unwrap()).unwrap();
+
+    let dial = wire(&alpha, &["add", &beta_handle, "--local-sister", "--json"]);
+    assert!(!dial.status.success());
+    let stderr = String::from_utf8_lossy(&dial.stderr);
+    assert!(stderr.contains("local relay preflight failed"), "{stderr}");
+    assert!(stderr.contains("no pairing state changed"), "{stderr}");
+    let alpha_relay: Value = serde_json::from_slice(
+        &std::fs::read(alpha.join("config").join("wire").join("relay.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        alpha_relay
+            .get("peers")
+            .and_then(Value::as_object)
+            .is_none_or(serde_json::Map::is_empty)
+    );
+}
+
 // ---------- TEST 8: mesh route picks one sister by role + strategy (v0.6.5 / #21) ----------
 
 /// v0.6.5 (issue #21): `wire mesh route <role>` filters sister sessions by

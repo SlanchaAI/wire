@@ -207,7 +207,15 @@ pub fn attempt_deliver(peer_handle: &str, signed_event: &Value) -> Result<SyncDe
                 });
             }
             Err(e) => {
-                let detail = crate::relay_client::format_transport_error(&e);
+                let transport = crate::relay_client::format_transport_error(&e);
+                let detail = if ep.scope == crate::endpoints::EndpointScope::Local {
+                    format!(
+                        "local relay unavailable at {}: {transport}. No send state changed; check `wire service status --local-relay`",
+                        ep.relay_url
+                    )
+                } else {
+                    transport
+                };
                 // Classify 4xx/410 (stale slot) distinctly from transport
                 // errors; reuse the relay's error-text classifier so both
                 // paths agree. Keep as last_failure and try the next endpoint.

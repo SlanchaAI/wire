@@ -17,6 +17,14 @@ First run builds the image (`wire-testenv`) and warms the build cache; later
 runs reuse the cached `target/` and cargo registry (named Docker volumes), so
 they're fast and never touch your host `target/`.
 
+Incremental compilation is disabled inside the container. CI jobs use
+disposable workspaces, and Cargo 1.88 can race incremental-directory renames
+when `clippy --all-targets` writes to a Docker named volume.
+
+The image also carries a deterministic, non-secret machine-id fixture. Minimal
+Debian images omit both Linux machine-id paths, but the fleet-link integration
+test needs a stable same-machine identity to exercise its fail-closed path.
+
 ## What it mirrors
 
 The default command is exactly the CI gate from `.github/workflows/ci.yml`:

@@ -47,6 +47,59 @@ pub enum ServiceKind {
     LocalRelay,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonServiceOptions {
+    pub interval_secs: u64,
+    pub max_workers: usize,
+}
+
+impl Default for DaemonServiceOptions {
+    fn default() -> Self {
+        Self {
+            interval_secs: 5,
+            max_workers: crate::daemon_supervisor::DEFAULT_MAX_WORKERS,
+        }
+    }
+}
+
+fn value_after_flag(text: &str, flag: &str) -> Option<u64> {
+    let tail = text.split_once(flag)?.1;
+    let digits = tail
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_daemon_service_options(text: &str) -> Option<DaemonServiceOptions> {
+    let interval_secs = value_after_flag(text, "--interval")?;
+    let max_workers = value_after_flag(text, "--max-workers")? as usize;
+    (interval_secs > 0 && max_workers > 0).then_some(DaemonServiceOptions {
+        interval_secs,
+        max_workers,
+    })
+}
+
+fn resolve_daemon_service_options(
+    existing: Option<DaemonServiceOptions>,
+    interval_secs: Option<u64>,
+    max_workers: Option<usize>,
+) -> Result<DaemonServiceOptions> {
+    let baseline = existing.unwrap_or_default();
+    let resolved = DaemonServiceOptions {
+        interval_secs: interval_secs.unwrap_or(baseline.interval_secs),
+        max_workers: max_workers.unwrap_or(baseline.max_workers),
+    };
+    if resolved.interval_secs == 0 {
+        bail!("service daemon --interval must be at least 1");
+    }
+    if resolved.max_workers == 0 {
+        bail!("service daemon --max-workers must be at least 1");
+    }
+    Ok(resolved)
+}
+
 impl ServiceKind {
     /// launchd Label / systemd unit base name (without `.service`).
     fn label(self) -> &'static str {
@@ -83,12 +136,22 @@ impl ServiceKind {
     /// isolation gap. Operators upgrading from a pre-0.14.2 install
     /// must re-run `wire service install` (or `wire upgrade
     /// --restart-service`) to pick up the new ProgramArguments line.
-    fn binary_args(self) -> &'static [&'static str] {
+    fn binary_args(self, daemon_options: DaemonServiceOptions) -> Vec<String> {
         match self {
-            ServiceKind::Daemon => &["daemon", "--all-sessions", "--interval", "5"],
-            ServiceKind::LocalRelay => {
-                &["relay-server", "--bind", "127.0.0.1:8771", "--local-only"]
-            }
+            ServiceKind::Daemon => vec![
+                "daemon".into(),
+                "--all-sessions".into(),
+                "--interval".into(),
+                daemon_options.interval_secs.to_string(),
+                "--max-workers".into(),
+                daemon_options.max_workers.to_string(),
+            ],
+            ServiceKind::LocalRelay => vec![
+                "relay-server".into(),
+                "--bind".into(),
+                "127.0.0.1:8771".into(),
+                "--local-only".into(),
+            ],
         }
     }
 
@@ -153,6 +216,25 @@ pub fn status() -> Result<ServiceReport> {
 
 /// Install a user-scope service unit for the given kind.
 pub fn install_kind(kind: ServiceKind) -> Result<ServiceReport> {
+    install_kind_with_options(kind, None, None)
+}
+
+pub fn install_kind_with_options(
+    kind: ServiceKind,
+    interval_secs: Option<u64>,
+    max_workers: Option<usize>,
+) -> Result<ServiceReport> {
+    let daemon_options = if kind == ServiceKind::Daemon {
+        let existing = existing_service_text(kind)
+            .as_deref()
+            .and_then(parse_daemon_service_options);
+        resolve_daemon_service_options(existing, interval_secs, max_workers)?
+    } else {
+        if interval_secs.is_some() || max_workers.is_some() {
+            bail!("--interval and --max-workers apply only to the daemon service");
+        }
+        DaemonServiceOptions::default()
+    };
     // Robust to a `cargo install` in-place replace mid-`wire upgrade`: the
     // kernel marks `/proc/self/exe` with a trailing ` (deleted)` that, written
     // verbatim into ExecStart=, corrupts the unit (issue #274).
@@ -175,7 +257,7 @@ pub fn install_kind(kind: ServiceKind) -> Result<ServiceReport> {
         if let Some(parent) = plist_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
         }
-        let plist = launchd_plist_xml(kind, &exe_str, &log_str);
+        let plist = launchd_plist_xml(kind, &exe_str, &log_str, daemon_options);
         std::fs::write(&plist_path, plist).with_context(|| format!("writing {plist_path:?}"))?;
 
         // launchctl bootstrap is idempotent if we bootout first.
@@ -201,7 +283,10 @@ pub fn install_kind(kind: ServiceKind) -> Result<ServiceReport> {
                 "written".into()
             },
             detail: if loaded {
-                format!("plist written + bootstrapped; logs at {log_str}")
+                format!(
+                    "plist written + bootstrapped; interval={}s, max-workers={}; logs at {log_str}",
+                    daemon_options.interval_secs, daemon_options.max_workers
+                )
             } else {
                 format!(
                     "plist written; `launchctl bootstrap` failed — try `launchctl bootstrap {} {}` manually",
@@ -217,7 +302,7 @@ pub fn install_kind(kind: ServiceKind) -> Result<ServiceReport> {
         if let Some(parent) = unit_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
         }
-        let unit = systemd_unit_text(kind, &exe_str);
+        let unit = systemd_unit_text(kind, &exe_str, daemon_options);
         std::fs::write(&unit_path, unit).with_context(|| format!("writing {unit_path:?}"))?;
 
         // Reload + enable + start. Each is idempotent on linux.
@@ -273,7 +358,7 @@ pub fn install_kind(kind: ServiceKind) -> Result<ServiceReport> {
     }
     if cfg!(target_os = "windows") {
         let task_name = kind.windows_task_name();
-        let xml = windows_task_xml(kind, &exe_str);
+        let xml = windows_task_xml(kind, &exe_str, daemon_options);
         // schtasks /Create /XML reads the file at the given path. UTF-8
         // without BOM is accepted on Win10+; older builds expected
         // UTF-16LE-BOM. We write UTF-8 — if a user hits a parse error
@@ -579,9 +664,71 @@ fn ensure_macos_log_path(_kind: ServiceKind) -> Result<PathBuf> {
     Ok(PathBuf::new())
 }
 
-fn launchd_plist_xml(kind: ServiceKind, exe: &str, log_path: &str) -> String {
+fn existing_service_text(kind: ServiceKind) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return launchd_plist_path(kind)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+    }
+    if cfg!(target_os = "linux") {
+        return systemd_unit_path(kind)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+    }
+    if cfg!(target_os = "windows") {
+        let output = Command::new("schtasks.exe")
+            .args(["/Query", "/TN", kind.windows_task_name(), "/XML"])
+            .output()
+            .ok()?;
+        return output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    None
+}
+
+fn parse_service_executable(text: &str) -> Option<String> {
+    if let Some(program_args) = text.split_once("<key>ProgramArguments</key>") {
+        let after = program_args.1.split_once("<string>")?.1;
+        return after
+            .split_once("</string>")
+            .map(|(exe, _)| exe.to_string());
+    }
+    if let Some(exec_start) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+    {
+        return exec_start.split_whitespace().next().map(str::to_string);
+    }
+    let after = text.split_once("<Command>")?.1;
+    after
+        .split_once("</Command>")
+        .map(|(exe, _)| exe.to_string())
+}
+
+pub fn installed_daemon_options() -> DaemonServiceOptions {
+    existing_service_text(ServiceKind::Daemon)
+        .as_deref()
+        .and_then(parse_daemon_service_options)
+        .unwrap_or_default()
+}
+
+pub fn installed_daemon_executable() -> Option<PathBuf> {
+    existing_service_text(ServiceKind::Daemon)
+        .as_deref()
+        .and_then(parse_service_executable)
+        .map(PathBuf::from)
+}
+
+fn launchd_plist_xml(
+    kind: ServiceKind,
+    exe: &str,
+    log_path: &str,
+    daemon_options: DaemonServiceOptions,
+) -> String {
     let args_xml = kind
-        .binary_args()
+        .binary_args(daemon_options)
         .iter()
         .map(|a| format!("        <string>{a}</string>"))
         .collect::<Vec<_>>()
@@ -624,8 +771,8 @@ fn systemd_unit_path(kind: ServiceKind) -> Result<PathBuf> {
         .join(kind.systemd_unit_name()))
 }
 
-fn systemd_unit_text(kind: ServiceKind, exe: &str) -> String {
-    let args = kind.binary_args().join(" ");
+fn systemd_unit_text(kind: ServiceKind, exe: &str, daemon_options: DaemonServiceOptions) -> String {
+    let args = kind.binary_args(daemon_options).join(" ");
     let desc = kind.description();
     format!(
         r#"[Unit]
@@ -655,9 +802,9 @@ WantedBy=default.target
 ///
 /// Returned as a String for `cfg!(test)` cross-target compilation; the
 /// caller writes it to disk via `std::fs::write` which handles encoding.
-fn windows_task_xml(kind: ServiceKind, exe: &str) -> String {
+fn windows_task_xml(kind: ServiceKind, exe: &str, daemon_options: DaemonServiceOptions) -> String {
     let desc = kind.description();
-    let args = kind.binary_args().join(" ");
+    let args = kind.binary_args(daemon_options).join(" ");
     // Escape XML special chars in fields that take operator-influenced
     // strings. exe is `std::env::current_exe()` (trusted) but args may
     // grow operator-passed values later.
@@ -727,11 +874,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_service_options_preserve_then_override_existing_values() {
+        let launchd = "<string>--interval</string><string>17</string><string>--max-workers</string><string>9</string>";
+        let systemd = "ExecStart=/opt/wire daemon --all-sessions --interval 23 --max-workers 11";
+        let task = "<Arguments>daemon --all-sessions --interval 31 --max-workers 13</Arguments>";
+        for (text, expected) in [(launchd, (17, 9)), (systemd, (23, 11)), (task, (31, 13))] {
+            let parsed = parse_daemon_service_options(text).unwrap();
+            assert_eq!((parsed.interval_secs, parsed.max_workers), expected);
+            let resolved = resolve_daemon_service_options(Some(parsed), Some(41), None).unwrap();
+            assert_eq!(resolved.interval_secs, 41);
+            assert_eq!(resolved.max_workers, expected.1);
+        }
+    }
+
+    #[test]
+    fn daemon_service_options_first_install_defaults_and_rejects_zero() {
+        let options = resolve_daemon_service_options(None, None, None).unwrap();
+        assert_eq!(options.interval_secs, 5);
+        assert_eq!(
+            options.max_workers,
+            crate::daemon_supervisor::DEFAULT_MAX_WORKERS
+        );
+        assert!(resolve_daemon_service_options(None, Some(0), None).is_err());
+        assert!(resolve_daemon_service_options(None, None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn installed_executable_parser_handles_all_service_formats() {
+        assert_eq!(
+            parse_service_executable(
+                "<key>ProgramArguments</key><array><string>/opt/wire</string><string>daemon</string>"
+            )
+            .as_deref(),
+            Some("/opt/wire")
+        );
+        assert_eq!(
+            parse_service_executable("ExecStart=/usr/local/bin/wire daemon --all-sessions")
+                .as_deref(),
+            Some("/usr/local/bin/wire")
+        );
+        assert_eq!(
+            parse_service_executable("<Command>C:\\wire\\wire.exe</Command>").as_deref(),
+            Some("C:\\wire\\wire.exe")
+        );
+    }
+
+    #[test]
     fn launchd_plist_xml_for_daemon_contains_required_keys() {
         let xml = launchd_plist_xml(
             ServiceKind::Daemon,
             "/usr/local/bin/wire",
             "/tmp/wire-daemon.log",
+            DaemonServiceOptions::default(),
         );
         assert!(xml.contains("<key>Label</key>"));
         assert!(xml.contains(ServiceKind::Daemon.label()));
@@ -739,6 +933,7 @@ mod tests {
         assert!(xml.contains("<string>daemon</string>"));
         assert!(xml.contains("<string>--all-sessions</string>"));
         assert!(xml.contains("<string>--interval</string>"));
+        assert!(xml.contains("<string>--max-workers</string>"));
         assert!(xml.contains("<key>KeepAlive</key>"));
         assert!(xml.contains("<key>RunAtLoad</key>"));
         assert!(xml.contains("<true/>"));
@@ -753,6 +948,7 @@ mod tests {
             ServiceKind::LocalRelay,
             "/usr/local/bin/wire",
             "/tmp/wire-local-relay.log",
+            DaemonServiceOptions::default(),
         );
         assert!(xml.contains(ServiceKind::LocalRelay.label()));
         assert!(xml.contains("<string>relay-server</string>"));
@@ -765,18 +961,30 @@ mod tests {
 
     #[test]
     fn systemd_unit_text_for_daemon_contains_required_directives() {
-        let unit = systemd_unit_text(ServiceKind::Daemon, "/usr/local/bin/wire");
+        let unit = systemd_unit_text(
+            ServiceKind::Daemon,
+            "/usr/local/bin/wire",
+            DaemonServiceOptions::default(),
+        );
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
         assert!(unit.contains("[Install]"));
-        assert!(unit.contains("/usr/local/bin/wire daemon --all-sessions --interval 5"));
+        assert!(
+            unit.contains(
+                "/usr/local/bin/wire daemon --all-sessions --interval 5 --max-workers 16"
+            )
+        );
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]
     fn systemd_unit_text_for_local_relay_uses_correct_exec() {
-        let unit = systemd_unit_text(ServiceKind::LocalRelay, "/usr/local/bin/wire");
+        let unit = systemd_unit_text(
+            ServiceKind::LocalRelay,
+            "/usr/local/bin/wire",
+            DaemonServiceOptions::default(),
+        );
         assert!(
             unit.contains("/usr/local/bin/wire relay-server --bind 127.0.0.1:8771 --local-only")
         );
@@ -804,7 +1012,11 @@ mod tests {
 
     #[test]
     fn windows_task_xml_for_daemon_contains_required_elements_v0_7_2() {
-        let xml = windows_task_xml(ServiceKind::Daemon, r"C:\Program Files\wire\wire.exe");
+        let xml = windows_task_xml(
+            ServiceKind::Daemon,
+            r"C:\Program Files\wire\wire.exe",
+            DaemonServiceOptions::default(),
+        );
         // Schema declaration + 1.2 task version (Win 7+ / matches what
         // schtasks /XML expects).
         assert!(xml.contains(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
@@ -827,12 +1039,18 @@ mod tests {
         // Actual exec line uses XML-escaped exe path + correct daemon
         // args.
         assert!(xml.contains(r"C:\Program Files\wire\wire.exe"));
-        assert!(xml.contains("<Arguments>daemon --all-sessions --interval 5</Arguments>"));
+        assert!(xml.contains(
+            "<Arguments>daemon --all-sessions --interval 5 --max-workers 16</Arguments>"
+        ));
     }
 
     #[test]
     fn windows_task_xml_for_local_relay_uses_correct_args_v0_7_2() {
-        let xml = windows_task_xml(ServiceKind::LocalRelay, r"C:\wire\wire.exe");
+        let xml = windows_task_xml(
+            ServiceKind::LocalRelay,
+            r"C:\wire\wire.exe",
+            DaemonServiceOptions::default(),
+        );
         assert!(xml.contains(r"C:\wire\wire.exe"));
         assert!(
             xml.contains("<Arguments>relay-server --bind 127.0.0.1:8771 --local-only</Arguments>")

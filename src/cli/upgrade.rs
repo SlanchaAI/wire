@@ -14,9 +14,15 @@ pub(crate) fn cmd_service(action: ServiceAction) -> Result<()> {
         }
     };
     let (report, as_json) = match action {
-        ServiceAction::Install { local_relay, json } => {
-            (crate::service::install_kind(kind(local_relay))?, json)
-        }
+        ServiceAction::Install {
+            local_relay,
+            interval,
+            max_workers,
+            json,
+        } => (
+            crate::service::install_kind_with_options(kind(local_relay), interval, max_workers)?,
+            json,
+        ),
         ServiceAction::Uninstall { local_relay, json } => {
             (crate::service::uninstall_kind(kind(local_relay))?, json)
         }
