@@ -835,20 +835,16 @@ pub fn detect_session_wire_home(cwd: &std::path::Path) -> Option<PathBuf> {
 ///   1. `WIRE_SESSION_ID` — explicit universal override (any harness).
 ///   2. `CLAUDE_CODE_SESSION_ID` — Claude Code adapter (stable per
 ///      conversation; the same id the auto-memory system keys off).
-///   3. `CODEX_SESSION_ID` — OpenAI Codex CLI adapter. Stable per Codex
-///      thread (the same UUIDv7 emitted in `thread.started` and used as
-///      the rollout-file suffix under `$CODEX_HOME/sessions/`). Codex
-///      does not yet forward this var to MCP children out of the box —
-///      operators must set it via `[mcp_servers.<name>.env]` in
-///      `~/.codex/config.toml` (or upstream Codex must add it to the
-///      MCP child env). Wiring the name in advance means once Codex
-///      ships the env, wire picks it up with zero further code change.
-///   4. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
+///   3. `CODEX_SESSION_ID` — Codex compatibility adapter for hosts that
+///      forward this older name.
+///   4. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
+///      per thread and inherited by tool subprocesses.
+///   5. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
 ///      `copilot`) adapter. Set by the Copilot CLI host for every
 ///      session; stable per conversation; UUID-shaped.
-///   5. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
+///   6. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
 ///      identity (stable per workspace).
-///   6. `None` — caller falls back to legacy cwd-detect (bare CLI /
+///   7. `None` — caller falls back to legacy cwd-detect (bare CLI /
 ///      pre-v0.13 hosts). Future host adapters slot in before this.
 ///
 /// Returns `(key, source-label)`.
@@ -857,6 +853,7 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
         ("WIRE_SESSION_ID", "override"),
         ("CLAUDE_CODE_SESSION_ID", "claude-code"),
         ("CODEX_SESSION_ID", "codex-cli"),
+        ("CODEX_THREAD_ID", "codex-cli"),
         ("COPILOT_AGENT_SESSION_ID", "copilot-cli"),
         ("VSCODE_GIT_REPOSITORY_ROOT", "vscode-workspace"),
     ] {
@@ -1870,6 +1867,7 @@ mod tests {
         let prev_override = std::env::var_os("WIRE_SESSION_ID");
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -1877,6 +1875,7 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
@@ -1933,6 +1932,7 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -1943,6 +1943,9 @@ mod tests {
             }
             if let Some(v) = prev_codex {
                 std::env::set_var("CODEX_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex_thread {
+                std::env::set_var("CODEX_THREAD_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
@@ -1980,6 +1983,7 @@ mod tests {
         let prev_override = std::env::var_os("WIRE_SESSION_ID");
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -1987,6 +1991,7 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
@@ -2047,6 +2052,7 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -2057,6 +2063,9 @@ mod tests {
             }
             if let Some(v) = prev_codex {
                 std::env::set_var("CODEX_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex_thread {
+                std::env::set_var("CODEX_THREAD_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
@@ -2069,21 +2078,15 @@ mod tests {
 
     #[test]
     fn resolve_session_key_codex_cli_adapter_and_priority() {
-        // Per-adapter test for the OpenAI Codex CLI path (#__pr_codex__).
-        // resolve_session_key reads CODEX_SESSION_ID as a TARGETED env adapter
-        // — exactly like CLAUDE_CODE_SESSION_ID and COPILOT_AGENT_SESSION_ID.
-        // Until Codex itself forwards the thread id to MCP child env, operators
-        // wire it via `[mcp_servers.<name>.env]` in `~/.codex/config.toml`;
-        // landing the adapter now means once Codex ships the env it works
-        // with zero further code change. Holds three invariants:
+        // Per-adapter test for the OpenAI Codex path. Current Codex processes
+        // expose CODEX_THREAD_ID; CODEX_SESSION_ID remains a higher-priority
+        // compatibility name. Holds three invariants:
         //
         //   (a) Set to a real thread id -> that key wins resolution and two
         //       distinct threads map to two distinct session homes
         //       (per-thread identity contract).
-        //   (b) WIRE_SESSION_ID overrides CODEX_SESSION_ID (priority 1
-        //       trumps priority 3); CLAUDE_CODE_SESSION_ID also outranks
-        //       CODEX_SESSION_ID (priority 2 trumps priority 3) — the
-        //       Codex adapter slots between Claude Code and Copilot.
+        //   (b) WIRE_SESSION_ID and CLAUDE_CODE_SESSION_ID outrank both Codex
+        //       names; CODEX_SESSION_ID outranks CODEX_THREAD_ID.
         //   (c) Unexpanded ${...} literal is rejected by the ${} guard,
         //       falling through rather than collapsing all sessions
         //       (mirrors the guard inherited from every other adapter).
@@ -2096,6 +2099,7 @@ mod tests {
         let prev_override = std::env::var_os("WIRE_SESSION_ID");
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -2103,12 +2107,30 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
 
-        // (a) CODEX_SESSION_ID set -> wins resolution over the no-id baseline;
-        //     distinct thread ids map to distinct session homes.
+        // (a) CODEX_THREAD_ID is the runtime value current Codex processes
+        //     expose. Distinct thread ids must map to distinct session homes.
+        unsafe { std::env::set_var("CODEX_THREAD_ID", "019f1111-1111-7111-8111-111111111111") };
+        let thread_a = resolve_session_key();
+        assert!(
+            matches!(&thread_a, Some((key, source))
+                if key == "019f1111-1111-7111-8111-111111111111" && *source == "codex-cli"),
+            "CODEX_THREAD_ID must resolve as codex-cli; got {thread_a:?}"
+        );
+        let thread_home_a = session_home_for_key(&thread_a.as_ref().unwrap().0).unwrap();
+        unsafe { std::env::set_var("CODEX_THREAD_ID", "019f2222-2222-7222-8222-222222222222") };
+        let thread_home_b = session_home_for_key(&resolve_session_key().unwrap().0).unwrap();
+        assert_ne!(
+            thread_home_a, thread_home_b,
+            "distinct CODEX_THREAD_ID values must map to distinct session homes"
+        );
+
+        // CODEX_SESSION_ID remains the higher-priority compatibility name;
+        // distinct session ids map to distinct session homes.
         unsafe { std::env::set_var("CODEX_SESSION_ID", "019e66ad-277e-7be3-bdd9-b7708e069f3b") };
         let r1 = resolve_session_key();
         assert!(
@@ -2134,8 +2156,8 @@ mod tests {
             "same Codex thread id must yield the same home across calls"
         );
 
-        // (b) WIRE_SESSION_ID at priority 1 overrides CODEX_SESSION_ID at
-        //     priority 3 (operator explicit override always wins).
+        // (b) WIRE_SESSION_ID overrides both Codex names (operator explicit
+        //     override always wins).
         unsafe { std::env::set_var("WIRE_SESSION_ID", "operator-override") };
         let r_override = resolve_session_key();
         assert!(
@@ -2144,9 +2166,8 @@ mod tests {
         );
         unsafe { std::env::remove_var("WIRE_SESSION_ID") };
 
-        // CLAUDE_CODE_SESSION_ID at priority 2 also beats CODEX_SESSION_ID at
-        // priority 3. (Earlier adapters get to claim the host they were
-        // designed for; Codex slots in after Claude Code.)
+        // CLAUDE_CODE_SESSION_ID also beats both Codex names. Earlier host
+        // adapters keep their established precedence.
         unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "claude-wins-over-codex") };
         let r_claude_wins = resolve_session_key();
         assert!(
@@ -2155,15 +2176,16 @@ mod tests {
         );
         unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
 
-        // (c) Unexpanded ${...} literal is rejected by the ${} guard.
-        //     If a host's config-forwarding ever ships a literal placeholder,
-        //     the guard rejects it (same as for every other adapter) so we
-        //     never hash the literal and collapse sessions.
-        unsafe { std::env::set_var("CODEX_SESSION_ID", "${SOME_PLACEHOLDER}") };
+        // (c) Unexpanded ${...} literal is rejected by the ${} guard. Clear
+        //     the compatibility name so this exercises CODEX_THREAD_ID.
+        unsafe {
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::set_var("CODEX_THREAD_ID", "${SOME_PLACEHOLDER}");
+        }
         let r_guard = resolve_session_key();
         assert!(
             !matches!(&r_guard, Some((k, _)) if k.contains("${")),
-            "unexpanded ${{...}} in CODEX_SESSION_ID must be rejected by the ${{}} guard; got {r_guard:?}"
+            "unexpanded ${{...}} in CODEX_THREAD_ID must be rejected by the ${{}} guard; got {r_guard:?}"
         );
 
         // Restore any env we displaced.
@@ -2172,6 +2194,7 @@ mod tests {
             std::env::remove_var("WIRE_SESSION_ID");
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -2182,6 +2205,9 @@ mod tests {
             }
             if let Some(v) = prev_codex {
                 std::env::set_var("CODEX_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex_thread {
+                std::env::set_var("CODEX_THREAD_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);

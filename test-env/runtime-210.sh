@@ -20,7 +20,7 @@ cargo build --release --quiet || { echo "build failed"; exit 1; }
 SBX="$(mktemp -d)"
 export XDG_STATE_HOME="$SBX/state" XDG_DATA_HOME="$SBX/share" XDG_CONFIG_HOME="$SBX/config"
 export WIRE_VERBOSE=1
-unset WIRE_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID \
+unset WIRE_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID \
       COPILOT_AGENT_SESSION_ID VSCODE_GIT_REPOSITORY_ROOT WIRE_HOME WIRE_HOME_FORCE
 
 # Bring an identity online (offline keygen) under the env's resolved home, then
