@@ -105,6 +105,12 @@ pub fn run() -> Result<()> {
     // WIRE_MCP_SKIP_AUTO_UP (tests + manual-identity operators).
     ensure_session_bootstrapped();
 
+    // A live MCP host is the authoritative activity signal for this identity.
+    // Publish the lease before daemon orchestration so the all-session
+    // supervisor can admit this home without treating private-key existence or
+    // daemon-generated sync timestamps as permanent liveness.
+    let session_lease = Arc::new(crate::session_lifecycle::LeaseGuard::acquire("mcp")?);
+
     // v0.15.x: minting an identity isn't enough — without a running sync loop
     // the session is "born deaf" (never pulls inbound, never pushes outbound),
     // the #1 MCP first-run failure. `ensure_session_bootstrapped` only creates
@@ -171,6 +177,7 @@ pub fn run() -> Result<()> {
     let subs_w = state.subscribed.clone();
     let tx_w = tx.clone();
     let shutdown_w = shutdown.clone();
+    let lease_w = session_lease.clone();
     let watcher_handle = std::thread::spawn(move || {
         let mut watcher = match crate::inbox_watch::InboxWatcher::from_head() {
             Ok(w) => w,
@@ -178,11 +185,20 @@ pub fn run() -> Result<()> {
         };
         let poll_interval = Duration::from_secs(2);
         let mut next_poll = Instant::now() + poll_interval;
+        let mut next_lease_heartbeat =
+            Instant::now() + crate::session_lifecycle::LEASE_HEARTBEAT_INTERVAL;
         loop {
             if shutdown_w.load(Ordering::SeqCst) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
+            if Instant::now() >= next_lease_heartbeat {
+                if let Err(e) = lease_w.heartbeat() {
+                    eprintln!("wire mcp: session lease heartbeat failed: {e:#}");
+                }
+                next_lease_heartbeat =
+                    Instant::now() + crate::session_lifecycle::LEASE_HEARTBEAT_INTERVAL;
+            }
             if Instant::now() < next_poll {
                 continue;
             }

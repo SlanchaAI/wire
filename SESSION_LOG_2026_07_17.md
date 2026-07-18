@@ -75,3 +75,16 @@ literal Codex override.
   implementation and verification plan.
 - `SESSION_LOG_2026_07_17.md` — durable evidence, decisions, commands, and final
   results.
+
+## Iteration 1 — lifecycle leases
+
+- RED: `cargo test session_lifecycle::tests --lib -- --test-threads=1` failed
+  with eight missing lifecycle symbols.
+- GREEN: five lease unit tests pass: persistence, expiry/dead owner, heartbeat
+  restart read, conservative pruning, and clean guard removal.
+- RED: `cargo test --test session_lifecycle -- --test-threads=1` failed because
+  MCP published no lease.
+- GREEN: MCP process integration passes with forced temporary home; lease exists
+  for process lifetime and disappears on clean stdin EOF.
+- MCP now writes the lease before daemon orchestration and renews it from the
+  existing watcher thread every 30 seconds. No raw session key is persisted.

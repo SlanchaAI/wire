@@ -55,6 +55,7 @@ pub mod same_machine;
 pub mod send;
 pub mod service;
 pub mod session;
+pub mod session_lifecycle;
 pub mod signing;
 pub mod sso_provider;
 pub mod tls;
