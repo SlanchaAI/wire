@@ -113,10 +113,11 @@ thread ID.
   signals. They remain inactive rather than becoming supervisor children.
 - Local relay TCP healthy; launchd daemon unit loaded; PATH/service binary
   consistent; no reported MCP version skew.
-- Doctor's aggregate `supervisor_fanout` check still counts old MCP-owned
-  workers and reports 53 live workers. The managed supervisor itself owns only
-  12 children. No broad process kill or extra service restart was used; old
-  MCP-owned workers age out with their Codex sessions.
+- Doctor's aggregate `supervisor_fanout` check reported 53 live workers while
+  process ancestry showed only 12 managed children. That discrepancy was not
+  old MCP-owned workers; the post-merge audit below traced it to stale daemon
+  pidfiles whose numeric PIDs had been reused by unrelated live processes.
+  No broad process kill or extra service restart was used.
 
 ## Missed runtime-test caller
 
@@ -126,6 +127,41 @@ and 10 failures with uninitialized identities. Changing that caller to
 `wire init --offline` produced 11 passes and 0 failures in the isolated Docker
 XDG root. This one-line follow-up and this final rollout record are carried on
 `fix/codex-thread-rollout-record` for a second protected merge.
+
+PR #369 merged that follow-up through 14 green protected checks as
+`80b271e90011a44eec3082fb9db1222acfebe91c`.
+
+## Post-merge doctor topology correction
+
+The final installed-binary audit found launchd and the local relay healthy but
+`wire doctor` emitted two false daemon failures:
+
+- `supervisor_fanout` counted 50 "live workers" from historical daemon
+  pidfiles by checking only whether each numeric PID existed. Exact command
+  roles and ancestry showed one launchd supervisor plus 11 child daemons; old
+  pidfile numbers had been reused by unrelated processes.
+- The current inherited-literal session had been retired by the bounded
+  supervisor, leaving its per-session pidfile stale. The legacy single-session
+  doctor path then labeled every healthy supervisor child an orphan, even
+  though all 11 children had the supervisor as parent and no unmanaged daemon
+  existed.
+
+GitNexus classified `check_daemon_health` and
+`check_daemon_pid_consistency` LOW risk (doctor-only diagnostics, no indexed
+upstream callers). `check_supervisor_fanout` was absent from the graph; direct
+source inspection found only `cmd_doctor` as caller, so risk remained confined
+to the diagnostic surface.
+
+TDD added four topology regressions: actual daemon-role counting, isolation
+from another WIRE_HOME, healthy-supervisor precedence over a retired session
+pidfile, and unmanaged-daemon failure. RED failed on missing helpers/signature;
+GREEN passed 27 doctor unit tests. Formatting, clippy, the 655-stale-home
+restart test, and a live candidate doctor run passed. Candidate doctor reported
+11 workers within cap 16 across 719 homes, supervisor + 11 children, no
+unmanaged daemons, consistent retired pidfile handling, and zero FAIL results.
+The canonical `test-env/run.sh` gate then passed end-to-end: 657 library tests,
+all serial Rust targets, release build, demos, and 11/11 integration scripts.
+No service mutation occurred during this audit.
 
 ## Artifacts
 

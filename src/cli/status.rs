@@ -1039,6 +1039,110 @@ fn supervisor_fanout_verdict(
     }
 }
 
+fn supervisor_worker_count(
+    supervisor_pid: Option<u32>,
+    daemon_pids: &[u32],
+    known_session_pids: &[u32],
+) -> usize {
+    let known: std::collections::HashSet<u32> = known_session_pids.iter().copied().collect();
+    daemon_pids
+        .iter()
+        .copied()
+        .filter(|pid| match supervisor_pid {
+            Some(supervisor) => *pid != supervisor,
+            None => known.contains(pid),
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn supervisor_daemon_health_verdict(
+    supervisor_pid: Option<u32>,
+    supervisor_alive: bool,
+    daemon_pids: &[u32],
+    unmanaged_pids: &[u32],
+) -> Option<DoctorCheck> {
+    let supervisor_pid =
+        supervisor_pid.filter(|pid| supervisor_alive && daemon_pids.contains(pid))?;
+    let workers = supervisor_worker_count(Some(supervisor_pid), daemon_pids, &[]);
+    if !unmanaged_pids.is_empty() {
+        let managed_workers = workers.saturating_sub(unmanaged_pids.len());
+        return Some(DoctorCheck::fail(
+            "daemon",
+            format!(
+                "supervisor (pid {supervisor_pid}) + {managed_workers} session child daemon(s), but {} unmanaged daemon(s) remain: {}",
+                unmanaged_pids.len(),
+                unmanaged_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "inspect `wire supervisor` and process ancestry; recover through the existing service manager; do not wildcard-kill processes",
+        ));
+    }
+    Some(DoctorCheck::pass(
+        "daemon",
+        format!(
+            "supervisor (pid {supervisor_pid}) + {workers} session child daemon(s); no unmanaged daemons"
+        ),
+    ))
+}
+
+fn supervisor_pid_consistency_verdict(
+    supervisor_pid: Option<u32>,
+    supervisor_alive: bool,
+    daemon_pids: &[u32],
+    unmanaged_pids: &[u32],
+) -> Option<DoctorCheck> {
+    let health = supervisor_daemon_health_verdict(
+        supervisor_pid,
+        supervisor_alive,
+        daemon_pids,
+        unmanaged_pids,
+    )?;
+    (health.status == "PASS").then(|| {
+        DoctorCheck::pass(
+            "daemon_pid_consistency",
+            "supervisor owns session worker lifecycle; retired session pidfiles do not imply an orphan",
+        )
+    })
+}
+
+fn supervisor_runtime_topology() -> (Option<u32>, bool, Vec<u32>, Vec<u32>, usize) {
+    let daemon_pids = actual_wire_role_pids("daemon");
+    let supervisor_pid = crate::session::sessions_root()
+        .ok()
+        .map(|root| root.join("supervisor.pid"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|body| body.trim().parse::<u32>().ok());
+    let supervisor_alive = supervisor_pid.is_some_and(|pid| daemon_pids.contains(&pid));
+    let known_session_pids: Vec<u32> = crate::session::list_sessions()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|session| crate::session::session_daemon_pid(&session.home_dir))
+        .collect();
+    let known_session_pid_set: std::collections::HashSet<u32> =
+        known_session_pids.iter().copied().collect();
+    let unmanaged_pids = daemon_pids
+        .iter()
+        .copied()
+        .filter(|pid| Some(*pid) != supervisor_pid && !known_session_pid_set.contains(pid))
+        .collect();
+    let workers = supervisor_worker_count(
+        supervisor_pid.filter(|_| supervisor_alive),
+        &daemon_pids,
+        &known_session_pids,
+    );
+    (
+        supervisor_pid,
+        supervisor_alive,
+        daemon_pids,
+        unmanaged_pids,
+        workers,
+    )
+}
+
 fn session_override_collision_verdict(processes: usize, distinct_homes: usize) -> DoctorCheck {
     if processes > 1 && distinct_homes < processes {
         DoctorCheck::warn(
@@ -1116,11 +1220,7 @@ fn local_relay_verdict(installed: bool, reachable: bool) -> DoctorCheck {
 
 fn check_supervisor_fanout() -> DoctorCheck {
     let sessions = crate::session::list_sessions().unwrap_or_default();
-    let workers = sessions
-        .iter()
-        .filter_map(|session| crate::session::session_daemon_pid(&session.home_dir))
-        .filter(|pid| crate::platform::process_alive(*pid))
-        .count();
+    let (_, _, _, _, workers) = supervisor_runtime_topology();
     let inactive = sessions
         .iter()
         .filter(|session| {
@@ -1407,6 +1507,17 @@ fn check_sync_freshness() -> DoctorCheck {
 /// `wire doctor` must catch THIS class: multiple daemons running, OR
 /// pid-file claims daemon down while a process is actually up.
 fn check_daemon_health() -> DoctorCheck {
+    let (supervisor_pid, supervisor_alive, daemon_pids, unmanaged_pids, _) =
+        supervisor_runtime_topology();
+    if let Some(verdict) = supervisor_daemon_health_verdict(
+        supervisor_pid,
+        supervisor_alive,
+        &daemon_pids,
+        &unmanaged_pids,
+    ) {
+        return verdict;
+    }
+
     // v0.5.13 (issue #2 bug A): doctor PASSed on orphan-only state while
     // `wire status` reported DOWN, disagreeing for 25 min. v0.5.19 (#2
     // hardening): every surface routes through ensure_up::daemon_liveness
@@ -1523,6 +1634,17 @@ fn check_daemon_health() -> DoctorCheck {
 /// content, not liveness), letting `wire status: DOWN` and
 /// `wire doctor: PASS` disagree for 25 min in incident #2.
 fn check_daemon_pid_consistency() -> DoctorCheck {
+    let (supervisor_pid, supervisor_alive, daemon_pids, unmanaged_pids, _) =
+        supervisor_runtime_topology();
+    if let Some(verdict) = supervisor_pid_consistency_verdict(
+        supervisor_pid,
+        supervisor_alive,
+        &daemon_pids,
+        &unmanaged_pids,
+    ) {
+        return verdict;
+    }
+
     let snap = crate::ensure_up::daemon_liveness();
     match &snap.record {
         crate::ensure_up::PidRecord::Missing => DoctorCheck::pass(
@@ -2148,6 +2270,43 @@ mod doctor_tests {
         assert_eq!(c.status, "FAIL");
         assert_eq!(c.classification, "wire_defect");
         assert!(c.detail.contains("566") && c.detail.contains("16"));
+    }
+
+    #[test]
+    fn supervisor_worker_count_uses_actual_daemon_roles_not_stale_pidfiles() {
+        assert_eq!(
+            supervisor_worker_count(Some(10), &[10, 11, 12], &[11, 12]),
+            2
+        );
+        assert_eq!(supervisor_worker_count(None, &[11, 12], &[11]), 1);
+    }
+
+    #[test]
+    fn doctor_prefers_healthy_supervisor_topology_over_stale_session_pidfile() {
+        let c = supervisor_daemon_health_verdict(Some(10), true, &[10, 11, 12], &[])
+            .expect("healthy supervisor should own the daemon verdict");
+        assert_eq!(c.status, "PASS");
+        assert!(c.detail.contains("2 session child"));
+    }
+
+    #[test]
+    fn supervisor_topology_surfaces_unmanaged_daemon() {
+        let c = supervisor_daemon_health_verdict(Some(10), true, &[10, 11, 12], &[12])
+            .expect("healthy supervisor should own the daemon verdict");
+        assert_eq!(c.status, "FAIL");
+        assert!(c.detail.contains("1 session child"));
+        assert!(c.detail.contains("unmanaged"));
+    }
+
+    #[test]
+    fn retired_session_pidfile_is_consistent_under_healthy_supervisor() {
+        let c = supervisor_pid_consistency_verdict(Some(10), true, &[10, 11, 12], &[])
+            .expect("healthy supervisor should own pid consistency");
+        assert_eq!(c.status, "PASS");
+        assert!(
+            c.detail
+                .contains("supervisor owns session worker lifecycle")
+        );
     }
 
     #[test]
