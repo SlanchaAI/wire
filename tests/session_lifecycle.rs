@@ -19,6 +19,7 @@ fn mcp_process_owns_lease_for_its_lifetime() {
         .env_remove("WIRE_SESSION_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
