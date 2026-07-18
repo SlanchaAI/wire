@@ -1733,6 +1733,7 @@ fn tool_dial(args: &Value) -> Result<Value, String> {
                 "paired_with": drop.paired_with_did,
                 "event_id": drop.event_id,
                 "delivered_via": drop.delivered_via,
+                "tier": if drop.bilateral_verified { "VERIFIED" } else { "PENDING_ACK" },
             }))
         }
         // Unresolvable: surface the resolver's own did-you-mean message

@@ -88,3 +88,68 @@ literal Codex override.
   for process lifetime and disappears on clean stdin EOF.
 - MCP now writes the lease before daemon orchestration and renews it from the
   existing watcher thread every 30 seconds. No raw session key is persisted.
+
+## Iteration 2 — bounded supervisor
+
+- RED: planner tests failed before `plan_supervisor_sessions` existed.
+- GREEN: 1-, 10-, and 655-home fixtures pass. A 655-home fixture selects at
+  most 16 workers; 650 stale homes remain inactive; retirement wins over a
+  live lease; planning is stable across restart.
+- Deleted private-key and daemon-sync-time eligibility. Registry binding, live
+  lease, or pending outbox now establishes eligibility.
+- MCP processes publish leases. Daemon workers deliberately do not: worker-
+  generated activity would recreate the self-perpetuating eligibility bug.
+  MCP skips direct daemon startup when a live all-session supervisor owns
+  lifecycle.
+- Supervisor reports selected/queued/inactive/retired counts, uses bounded
+  exponential crash backoff, and validates exact JSON pidfile-owned workers
+  before targeted SIGTERM. Logs distinguish current-version and skewed workers.
+  No process-family signal is used.
+
+## Iteration 3 — durable service options
+
+- RED/GREEN parser tests cover existing launchd plist, systemd unit, and Task
+  Scheduler XML plus first-install defaults and zero rejection.
+- `wire service install --interval N --max-workers N` now configures the daemon
+  service. Omitted flags preserve installed values; only first install uses
+  5 seconds and 16 workers. Every platform renders both flags.
+- Local-relay service arguments remain unchanged. No service command ran on the
+  live machine.
+
+## Iteration 4 — read-only doctor
+
+- Added classified verdicts: `wire_defect`, `operator_config`, and
+  `runtime_health`.
+- Added supervisor fan-out/stale-home, fixed launcher override, PATH/service
+  executable shadow, stale MCP version, and local-relay health checks.
+- Production doctor no longer calls the endpoint mutation helper; endpoint
+  repair is reported, never applied.
+- Read-only branch doctor against the live machine reported: 563 live session
+  workers over cap 16 across 681 homes; 681 homes with no lease; one fixed
+  Codex `WIRE_SESSION_ID` launcher override while 43 Wire MCP processes run;
+  PATH/service executable mismatch relative to the worktree build; 39 live MCP
+  pidfiles with no current skew; local relay absent and connection refused.
+  It made no service or home changes.
+
+## Iteration 5 — local relay preflight and bilateral convergence
+
+- RED: direct local-sister dial returned `drop_sent`; relay-down dial mutated
+  initiator state before connection refusal; send returned a generic transport
+  error.
+- GREEN: relay health is checked before trust/relay mutation. Failure says no
+  pairing state changed and points to local-relay service status.
+- A local-sister dial now performs a guarded reverse one-way dial, pulls both
+  pair events/acks synchronously in isolated forced homes, and verifies
+  `VERIFIED` on both sides before returning `status: verified`.
+- Local-scope send failures identify the local relay and state that send state
+  did not change.
+- Focused end-to-end tests pass for bilateral convergence without manual pull,
+  direct delivery after pairing, unavailable relay with no half-pair state,
+  three-session local-only mesh, and pair-all-local idempotence.
+
+## Isolated runtime measurement
+
+`cargo test --test supervisor_bounded -- --test-threads=1 --nocapture` created
+655 initialized but stale homes and started the real all-session supervisor
+twice with a cap of four. Restart 0: 0 children, 12,336 KiB RSS. Restart 1:
+0 children, 12,608 KiB RSS. The live installation remained unchanged.
