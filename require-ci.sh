@@ -11,13 +11,8 @@ gh api -X PUT repos/SlanchaAi/wire/branches/main/protection --input - <<'JSON'
       {"context": "fmt"},
       {"context": "clippy"},
       {"context": "docs-lint"},
-      {"context": "demo-command"},
-      {"context": "demo-invite"},
-      {"context": "demo-hotline"},
-      {"context": "install-smoke"},
-      {"context": "install-smoke-windows"},
-      {"context": "install-script-smoke"},
-      {"context": "integration-tests"}
+      {"context": "linux-e2e"},
+      {"context": "install-smoke-windows"}
     ]
   },
   "enforce_admins": true,
