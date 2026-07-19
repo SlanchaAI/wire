@@ -8,7 +8,8 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded PRs, but let main warmers finish and save their caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Pull requests restore the shared default-branch caches but never create
@@ -22,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: true
       - run: cargo build --all-targets
       - run: cargo build --release --bin wire
 
@@ -35,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-windows
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: true
       - run: cargo build --release --bin wire
 
   test:
@@ -47,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: false
       - run: cargo build --all-targets
       # Force single-threaded test execution to keep the heavy real-process
       # e2e binaries from self-contending on the hosted runner.
@@ -74,7 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: false
       - run: cargo clippy --all-targets -- -D warnings
 
   docs-lint:
@@ -127,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: false
       - run: sudo apt-get update && sudo apt-get install -y bc jq
       - run: cargo build --release --bin wire
 
@@ -215,7 +216,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-windows
-          save-if: ${{ github.event_name == 'push' }}
+          save-if: false
       - run: cargo build --release --bin wire
       - name: fresh-user + nuke smoke (PowerShell)
         shell: pwsh
