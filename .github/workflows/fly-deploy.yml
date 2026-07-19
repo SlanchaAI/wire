@@ -5,6 +5,15 @@ on:
   push:
     branches:
       - main
+    # The production Dockerfile does not consume these paths.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'skills/**'
+      - 'hooks/**'
+      - 'examples/**'
+      - 'scoop/**'
+      - '.gemini-plugin/**'
 jobs:
   deploy:
     name: Deploy app
