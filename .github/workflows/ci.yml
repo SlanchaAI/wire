@@ -6,27 +6,56 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded PRs, but let main warmers finish and save their caches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
+  # Pull requests restore the shared default-branch caches but never create
+  # merge-ref copies. Main builds once per platform to keep those caches warm.
+  warm-cache-linux:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+          save-if: true
+      - run: cargo build --all-targets
+      - run: cargo build --release --bin wire
+
+  warm-cache-windows:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+          save-if: true
+      - run: cargo build --release --bin wire
+
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+          save-if: false
       - run: cargo build --all-targets
       # Force single-threaded test execution to keep the heavy real-process
-      # e2e binaries (e.g. e2e_detached_pair, with real daemons + a SAS
-      # handshake under a tight deadline) from self-contending under default
-      # parallelism on the 2-core ubuntu-latest runner. Lib + non-heavy e2e
-      # cost is negligible serialized; heavy e2e is where the wins are. See
-      # feedback/heavy-e2e-subprocess-contention. (The UDS round-trip
-      # Broken-pipe/os-error-32 flake this also used to mask was root-caused +
-      # fixed in #241 — the canned test server's single-read racing
-      # uds_request's two-write — so serialization now stands on heavy-e2e
-      # contention alone, not a live flake.)
+      # e2e binaries from self-contending on the hosted runner.
       - run: cargo test --all-targets -- --test-threads=1
 
   fmt:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -36,6 +65,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -43,108 +73,32 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+          save-if: false
       - run: cargo clippy --all-targets -- -D warnings
 
-  demo-invite:
-    # Runs demo-invite.sh end-to-end: local relay + paul + willard + one-paste
-    # invite-URL pair + bidirectional signed send/recv. Catches regressions in
-    # the v0.4.0 pair_drop hook, daemon-pull cursor persist, and CLI wiring.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: cargo build --release --bin wire
-      - run: WIRE=./target/release/wire bash demo-invite.sh
-
-  demo-command:
-    # Runs the shipped `wire demo` verb end-to-end: it self-execs to boot an
-    # ephemeral local relay, mint two identities, pair them, and verify a
-    # signed round-trip — then tears it all down. Guards the one-command
-    # try-before-you-install path (and its self-exec orchestration).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin wire
-      - run: ./target/release/wire demo --json | tee /dev/stderr | grep -q '"ok":true'
-
-  hello-world:
-    # The canonical FIRST-CONNECTION round-trip gate (ROAD_TO_1.0 §3 lifecycle
-    # hardening). Reproduces the README "60-second local demo" exactly — local
-    # relay + two independent `wire up` agents + dial-by-persona + receive +
-    # autonomous reply — across several fresh-box iterations to catch the
-    # intermittent daemon-survival / first-connection regressions a single-shot
-    # `wire demo` or install-smoke wouldn't. This is the harness that caught the
-    # #263 daemon-self-abort + one-directional-pin bugs; it must stay green.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y bc
-      - run: cargo build --release --bin wire
-      - run: WIRE_BIN=./target/release/wire bash scripts/hello-world-validate.sh 5
-
-  demo-hotline:
-    # Runs demo-hotline.sh end-to-end: local relay + 5 agents with vibes +
-    # full mesh via `wire add` + signed ring-send. Validates the v0.5
-    # handle directory, .well-known/wire/agent resolver, pair_drop +
-    # pair_drop_ack flow, profile fields, and 5-way mesh under one daemon.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: cargo build --release --bin wire
-      - run: WIRE=./target/release/wire bash demo-hotline.sh
-
-  integration-tests:
-    # Real end-to-end CLI tests (tests/it/): each boots actual relay processes
-    # and drives the shipped binary like a user/script would — zero-paste
-    # pairing + bidirectional signed messages, the on-box sister mesh,
-    # `wire up` onboarding (+ --offline), nuke/recovery, and group join-by-code
-    # with cross-member verified read. Covers the CLI seams `cargo test`'s
-    # library-level tests don't (arg parsing, process lifecycle, multi-agent
-    # connections). See tests/it/README.md.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: cargo build --release --bin wire
-      - run: WIRE=./target/release/wire tests/it/run-all.sh
-
   docs-lint:
-    # Catch deprecated command phrases drifting back into docs. Per the
-    # swift-harbor / dthoma1 #145 audit: README + AGENTS + INSTALL had
-    # several stale shapes (`wire add bob@`, `wire init <nick>`, `wire
-    # daemon start`, `wire.slancha.ai`, `wire up <nick>@<relay>`) that
-    # contradicted the canonical v0.12+ surface. Lint blocks regression.
-    #
-    # Legacy sections explicitly named "Legacy" or "Legacy flows" are
-    # allowed to mention deprecated verbs — the lint scopes its grep
-    # exclusions to those headers (handled inline via `grep -v`).
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: deprecated phrases (canonical surface drift)
         run: |
           set -e
-          FILES="README.md AGENTS.md INSTALL.md docs/integrations/*.md docs/AGENT_INTEGRATION.md"
+          FILES=(README.md AGENTS.md INSTALL.md docs/AGENT_INTEGRATION.md docs/integrations/*.md)
+          for file in "${FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::missing docs-lint input: $file"
+              exit 1
+            fi
+          done
           fail=0
 
           check() {
             local pattern="$1"
             local description="$2"
-            # Exclude lines inside Legacy sections (best-effort: grep -v on
-            # the line itself contains 'Legacy' marker; deeper context
-            # exclusion would need a real parser).
-            hits=$(grep -nE "$pattern" $FILES 2>/dev/null \
+            hits=$(grep -nE "$pattern" "${FILES[@]}" \
               | grep -v -iE '(legacy|deprecated|removed|v1\.0 removes)' \
               || true)
             if [ -n "$hits" ]; then
@@ -154,11 +108,10 @@ jobs:
             fi
           }
 
-          # The shapes swift-harbor's audit (#145) called out:
-          check 'wire add [a-z][a-z-]*@' 'wire add <peer>@<relay> (use `wire dial`)'
-          check 'wire init <nick>' 'wire init <nick> (use `wire up`)'
-          check 'wire daemon start' 'wire daemon start (no subcommand; use `wire daemon`)'
-          check 'wire up <nick>@' 'wire up <nick>@<relay> (handle is DID-derived; use `wire up @<relay>`)'
+          check 'wire add [a-z][a-z-]*@' 'wire add <peer>@<relay> (use wire dial)'
+          check 'wire init <nick>' 'wire init <nick> (use wire up)'
+          check 'wire daemon start' 'wire daemon start (no subcommand; use wire daemon)'
+          check 'wire up <nick>@' 'wire up <nick>@<relay> (handle is DID-derived; use wire up @<relay>)'
           check 'wire\.slancha\.ai' 'wire.slancha.ai (use wireup.net)'
           check 'relay\.slancha\.ai' 'relay.slancha.ai (use wireup.net)'
 
@@ -170,69 +123,112 @@ jobs:
           fi
           echo "docs-lint: clean."
 
-  install-smoke:
-    # Fresh-user first-run path. Builds the binary THIS PR produces, puts it
-    # on PATH the way an install leaves it, and — from a clean cwd with an
-    # empty WIRE_HOME — runs the offline out-of-the-box sequence. Catches
-    # changes that compile + pass tests but break the new-user experience
-    # (first-run offline identity, --json shape, basic subcommands). Also
-    # This is the "test-env in CI" smoke; the demos cover deeper e2e flows.
+  linux-e2e:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      WIRE_HOME_FORCE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y jq
+        with:
+          shared-key: ci-linux
+          save-if: false
+      - run: sudo apt-get update && sudo apt-get install -y bc jq
       - run: cargo build --release --bin wire
-      - name: fresh-user smoke (offline, clean WIRE_HOME)
+
+      - name: invite round-trip
+        run: WIRE=./target/release/wire bash demo-invite.sh
+
+      - name: one-command demo
+        run: ./target/release/wire demo --json | tee /dev/stderr | grep -q '"ok":true'
+
+      - name: first-connection round-trips
+        run: WIRE_BIN=./target/release/wire bash scripts/hello-world-validate.sh 5
+
+      - name: five-agent mesh
+        run: WIRE=./target/release/wire bash demo-hotline.sh
+
+      - name: CLI integration suite
+        run: WIRE=./target/release/wire tests/it/run-all.sh
+
+      - name: fresh-user and nuke smoke
         run: |
           set -euo pipefail
           sudo install -m 0755 target/release/wire /usr/local/bin/wire
-          export WIRE_HOME="$(mktemp -d)/home" WIRE_QUIET_AUTOSESSION=1
-          cd "$(mktemp -d)"   # clean cwd — no repo, no existing state
+          WIRE_HOME="$(mktemp -d)/home"
+          export WIRE_HOME
+          export WIRE_QUIET_AUTOSESSION=1
+          cd "$(mktemp -d)"
           wire --version
           wire --help >/dev/null
-          wire whoami --json | jq -e '.initialized == false'    # pre-init
-          # `wire up --no-local` creates the local identity but also tries to
-          # claim its DID-derived handle on the shared relay — that claim can
-          # 409 if the random persona is already taken (non-fatal). The real
-          # check is the local identity, so tolerate a nonzero exit and assert
-          # via whoami.
+          wire whoami --json | jq -e '.initialized == false'
           wire up --no-local || true
           wire whoami --json | jq -e '.did | startswith("did:wire:")'
           wire here >/dev/null
-          echo "install-smoke: fresh-user offline path OK"
-      - name: nuke smoke (dry-run changes nothing; --force resets; re-up works)
+
+          WIRE_HOME="$(mktemp -d)/home"
+          export WIRE_HOME
+          wire up --no-local || true
+          wire whoami --json | jq -e '.did | startswith("did:wire:")'
+          wire nuke --dry-run
+          wire whoami --json | jq -e '.did | startswith("did:wire:")'
+          wire nuke --force --json | jq -e 'has("removed_paths")'
+          wire whoami --json | jq -e '.initialized == false'
+          wire up --no-local || true
+          wire whoami --json | jq -e '.did | startswith("did:wire:")'
+          echo "install-smoke: fresh-user + nuke OK"
+
+      - name: install.sh from a clean machine, then fresh-user onboarding
         run: |
           set -euo pipefail
-          export WIRE_HOME="$(mktemp -d)/home" WIRE_QUIET_AUTOSESSION=1
-          wire up --no-local || true
-          wire whoami --json | jq -e '.did | startswith("did:wire:")'   # identity created
-          wire nuke --dry-run                              # lists, must change nothing
-          wire whoami --json | jq -e '.did | startswith("did:wire:")'   # dry-run kept it
-          wire nuke --force --json | jq -e 'has("removed_paths")'
-          wire whoami --json | jq -e '.initialized == false'            # state wiped
-          wire up --no-local || true                       # fresh again
-          wire whoami --json | jq -e '.did | startswith("did:wire:")'
-          echo "install-smoke: nuke + re-up OK"
+          DIST="$(mktemp -d)"
+          case "$(uname -m)" in
+            x86_64|amd64)  triple="x86_64-unknown-linux-musl" ;;
+            aarch64|arm64) triple="aarch64-unknown-linux-musl" ;;
+            *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+          esac
+          cp target/release/wire "$DIST/wire-$triple"
+          ( cd "$DIST" && sha256sum "wire-$triple" > "wire-$triple.sha256" )
+          ( cd "$DIST" && exec python3 -m http.server 8099 >/dev/null 2>&1 ) &
+          SRV=$!; trap 'kill "$SRV" 2>/dev/null || true' EXIT
+          for _ in {1..20}; do
+            curl -fsS "http://127.0.0.1:8099/wire-$triple.sha256" -o /dev/null && break
+            sleep 0.5
+          done
+
+          PFX="$(mktemp -d)/bin"
+          WIRE_DIST_URL="http://127.0.0.1:8099" sh install.sh --prefix "$PFX"
+          test -x "$PFX/wire"
+          "$PFX/wire" --version
+          WIRE_HOME="$(mktemp -d)/home"
+          export WIRE_HOME
+          export WIRE_QUIET_AUTOSESSION=1
+          cd "$(mktemp -d)"
+          "$PFX/wire" whoami --json | jq -e '.initialized == false'
+          "$PFX/wire" up --offline
+          "$PFX/wire" whoami --json | jq -e '.did | startswith("did:wire:")'
+          echo "install-script-smoke: install.sh + fresh onboarding OK"
 
   install-smoke-windows:
-    # Windows leg of the cross-platform gate: build wire.exe and run the
-    # fresh-user + nuke smoke in PowerShell from a clean WIRE_HOME. Windows
-    # can't be exercised on the maintainer's mac/linux hosts, so this CI
-    # job is the primary Windows signal (plus an operator confirm on a real
-    # box before merge).
+    if: github.event_name == 'pull_request'
     runs-on: windows-latest
+    env:
+      WIRE_HOME_FORCE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+          save-if: false
       - run: cargo build --release --bin wire
       - name: fresh-user + nuke smoke (PowerShell)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true   # native non-zero exit → throw
+          $PSNativeCommandUseErrorActionPreference = $true
           $wire = ".\target\release\wire.exe"
           $env:WIRE_HOME = Join-Path $env:RUNNER_TEMP ("wh-" + [guid]::NewGuid().ToString("N"))
           $env:WIRE_QUIET_AUTOSESSION = "1"
@@ -240,10 +236,6 @@ jobs:
           & $wire --help | Out-Null
           $pre = (& $wire whoami --json | ConvertFrom-Json)
           if ($pre.initialized -ne $false) { throw "expected initialized:false pre-init" }
-          # `wire up --no-local` creates the local identity but also tries to
-          # claim its handle on the shared relay; that claim can 409 (handle
-          # already taken) which is non-fatal. Tolerate a nonzero exit and
-          # assert the real outcome (local DID) via whoami.
           try { & $wire up --no-local } catch { Write-Host "wire up claim non-fatal: $_" }
           $post = (& $wire whoami --json | ConvertFrom-Json)
           if (-not $post.did.StartsWith("did:wire:")) { throw "expected a did:wire: DID" }
@@ -258,60 +250,3 @@ jobs:
           $fresh = (& $wire whoami --json | ConvertFrom-Json)
           if (-not $fresh.did.StartsWith("did:wire:")) { throw "re-up should recreate identity" }
           Write-Host "install-smoke-windows: fresh-user + nuke OK"
-
-  install-script-smoke:
-    # The REAL installer, end-to-end. `install-smoke` copies the binary
-    # straight onto PATH and never touches install.sh — so the path a user
-    # actually runs (`curl … | sh`: triple detection → download → SHA-256
-    # verify → --prefix install → PATH/next-steps) is untested. This serves a
-    # locally-built binary as a release asset over http and runs install.sh
-    # against it (WIRE_DIST_URL override — no real GitHub Release needed),
-    # then drives the fresh-user onboarding through the installed binary.
-    # Catches installer bugs (wrong triple/asset name, broken verify, bad
-    # install dir) that compile + pass tests but break first-touch install.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: cargo build --release --bin wire
-      - name: install.sh from a clean machine, then fresh-user onboarding
-        # Serve + install + assert in ONE step so the http server's lifetime is
-        # controlled (a background server from an earlier step isn't guaranteed
-        # to survive into the next).
-        run: |
-          set -euo pipefail
-          DIST="$(mktemp -d)"
-          # Resolve the SAME triple install.sh will request on this runner, so
-          # the served asset name matches (mirrors install.sh's Linux branch).
-          case "$(uname -m)" in
-            x86_64|amd64)  triple="x86_64-unknown-linux-musl" ;;
-            aarch64|arm64) triple="aarch64-unknown-linux-musl" ;;
-            *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
-          esac
-          cp target/release/wire "$DIST/wire-$triple"
-          ( cd "$DIST" && sha256sum "wire-$triple" > "wire-$triple.sha256" )
-          # Serve over http so install.sh's curl exercises the real download +
-          # SHA-256-sibling verify path (not a file:// shortcut, which would let
-          # install.sh silently cargo-fall-back to the crates.io release).
-          # Background the subshell itself (not `& )` inside it) so $! captures
-          # the server PID — `& )` backgrounds within the subshell and leaves $!
-          # unset, which is fatal under `set -u`.
-          ( cd "$DIST" && exec python3 -m http.server 8099 >/dev/null 2>&1 ) &
-          SRV=$!; trap 'kill "$SRV" 2>/dev/null || true' EXIT
-          for i in $(seq 1 20); do curl -fsS "http://127.0.0.1:8099/wire-$triple.sha256" -o /dev/null && break; sleep 0.5; done
-
-          PFX="$(mktemp -d)/bin"
-          WIRE_DIST_URL="http://127.0.0.1:8099" sh install.sh --prefix "$PFX"
-          test -x "$PFX/wire"                       # landed where --prefix said
-          "$PFX/wire" --version
-          export WIRE_HOME="$(mktemp -d)/home" WIRE_QUIET_AUTOSESSION=1
-          cd "$(mktemp -d)"                         # clean cwd, no repo
-          "$PFX/wire" whoami --json | jq -e '.initialized == false'   # pre-init
-          # up --offline is PR-only — if install.sh had cargo-fallen-back to the
-          # crates.io release, this flag wouldn't exist, so it also proves the
-          # SERVED binary was the one installed.
-          "$PFX/wire" up --offline
-          "$PFX/wire" whoami --json | jq -e '.did | startswith("did:wire:")'
-          echo "install-script-smoke: install.sh + fresh onboarding OK"

@@ -53,6 +53,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # Tag-scoped caches cannot warm later branches; restore only.
+          save-if: false
 
       - name: Install cross (for non-host Linux builds)
         if: matrix.cross == true
@@ -83,6 +85,8 @@ jobs:
         with:
           name: wire-${{ matrix.target }}
           path: dist/*
+          # The durable copy lives on the GitHub Release below.
+          retention-days: 1
 
   release:
     name: github release
@@ -114,6 +118,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Publishing runs after the build matrix and has no reusable tag scope.
+          save-if: false
 
       # v0.6.8: this is the load-bearing fix. Pre-v0.6.8 release.yml
       # had no `cargo publish` step, so every tagged release built

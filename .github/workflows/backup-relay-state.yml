@@ -2,16 +2,17 @@ name: backup wireup-relay /data
 # Nightly snapshot of the wireup-relay Fly volume mounted at /data.
 # - tars /data on the machine via `flyctl ssh console -C tar ...`
 # - downloads the tar into the runner
-# - uploads as a GitHub Actions artifact (90-day retention, free)
+# - uploads as a GitHub Actions artifact (90-day retention)
 #
 # Restore path:
 #   gh run download <run-id> -n wireup-relay-data
 #   flyctl ssh sftp shell -a wireup-relay <<< 'put data.tar.gz /data/'
 #   flyctl ssh console -a wireup-relay -C 'tar xzf /data/data.tar.gz -C /data/'
 #
-# Why not R2/S3: those need a new account + creds. GHA artifacts cost $0,
-# survive 90 days, and don't add operational surface. Switch to R2 when
-# the relay holds anything that matters past 90 days.
+# Why not R2/S3: those need a new account + creds. GHA artifacts count toward
+# pooled Actions storage, although this public repo currently receives a full
+# billing discount. They survive 90 days without adding operational surface.
+# Switch to R2 when the relay holds anything that matters past 90 days.
 
 on:
   schedule:

@@ -200,3 +200,103 @@ Its source file `~/Source/dotfiles-claude/codex/AGENTS.preamble.md` still says a
 fixed Wire session override is current. The owner of that worktree should
 replace that statement with: Codex exposes `CODEX_THREAD_ID`; Wire v0.17.0+
 uses it automatically; do not set one global `WIRE_SESSION_ID`.
+
+## GitHub Actions usage reduction
+
+### Diagnosis
+
+GitHub's organization billing API showed high gross-equivalent Actions usage
+but zero net charges for Wire: $44.37 gross / $0 net in May, $66.34 / $0 in
+June, and $8.20 / $0 through July 18. The public repository's standard runner
+usage and storage were fully discounted.
+
+The volume was real:
+
+- May: 699 workflow runs, including 404 CI runs, 177 Fly deploys, and 99
+  release runs. June: 671 runs, including 460 CI and 178 Fly deploys.
+- Current CI launched twelve jobs per run and built the same Linux release
+  binary independently in seven jobs. Twenty-five July CI runs created 300
+  jobs; pull-request checks repeated after every merge on `main`.
+- Fifty-five job/ref-specific Rust caches occupied 11.76 GB.
+- GitHub retained 684 Actions artifacts / 2.30 GB. Six hundred eighteen were
+  six-platform temporary handoffs from 101 releases, duplicating durable
+  GitHub Release assets. Nightly relay backups accounted for only 142 MB.
+
+Selected design and implementation plan:
+
+- `docs/superpowers/specs/2026-07-18-github-actions-cost-reduction-design.md`
+- `docs/superpowers/plans/2026-07-18-github-actions-cost-reduction.md`
+
+The pre-change structural assertion failed as expected with
+`missing linux-e2e`, proving the approved consolidated job and one-day release
+handoff policy were absent before implementation.
+
+### Decisions and changes
+
+- Pull requests now run six protected checks: `test`, `fmt`, `clippy`,
+  `docs-lint`, `linux-e2e`, and `install-smoke-windows`. Main pushes run only
+  Linux and Windows cache warmers.
+- The Linux end-to-end job builds the release binary once, then runs the invite,
+  one-command demo, five-iteration hello-world, five-agent mesh, CLI integration,
+  fresh-user/nuke, and installer callers serially. Linux and Windows smoke jobs
+  set `WIRE_HOME_FORCE=1` at job scope.
+- Rust caches use stable platform shared keys. Pull-request jobs restore but do
+  not save; main warmers save and cannot be cancelled before their post-job
+  cache upload. Superseded pull-request runs still cancel by ref.
+- Temporary six-platform release handoffs now expire after one day; tag and
+  publish jobs restore but do not save Rust caches. Durable release assets are
+  unchanged.
+- Fly deploy skips paths the production Dockerfile does not consume. Nightly
+  backups retain 90 days; their storage comment now describes the public-repo
+  discount precisely.
+- `require-ci.sh` contains the six replacement contexts. It was executed only
+  after pull request #372 proved all six new check names green. Post-update
+  verification showed strict checks and admin enforcement still enabled, force
+  pushes and deletions still disabled, and the pull request clean/mergeable.
+
+At July's observed mix of 15 pull-request and 10 main CI runs, the new topology
+would launch 110 jobs instead of 300 (63% fewer). Release-binary build
+invocations fall from seven per CI run (175 at that mix) to one per run (25,
+86% fewer). These are topology projections; actual post-merge usage still needs
+measurement from GitHub.
+
+### Verification and review
+
+- `actionlint .github/workflows/*.yml`: pass.
+- Structural policy assertion: pass with eight jobs, six protected pull-request
+  checks, one Linux release build, forced homes, one-day handoffs, expected Fly
+  exclusions, and exact protection contexts.
+- Focused review regressions ran RED then GREEN for pull-request-only
+  cancellation and missing docs-lint inputs. The current docs-lint body also
+  ran successfully against the repository.
+- `test-env/run.sh`: pass. This covered formatting, clippy, 658 passing library
+  tests (one ignored), 72 CLI tests, serial end-to-end suites, release build,
+  demos, and all 11 CLI integration scripts. Tests ran inside Docker, not the
+  live Wire home.
+- Cross-provider review ran three bounded cycles. Accepted findings prevented
+  main cache-warmers from being cancelled and made missing docs inputs fail
+  closed. Final review returned no blocker or major findings. Remaining minors
+  describe preserved demo-pipeline behavior; script inspection confirmed each
+  demo/integration caller uses isolated state.
+- Pull request #372's first GitHub run passed all six replacement checks:
+  docs-lint 3s, fmt 14s, clippy 45s, test 2m37s, Linux end-to-end 2m54s, and
+  cold-cache Windows smoke 5m30s. Both main-only warmers skipped as designed.
+- GitNexus compare against `origin/main`: low risk, zero affected runtime
+  processes. `git diff --check`: pass.
+
+Live launchd services, Wire homes, existing caches, existing artifacts, Fly
+state, releases, and deployments were not changed. Branch protection changed
+only its required-context list after the new contexts passed.
+
+### Artifacts
+
+- `.github/workflows/ci.yml` — bounded PR checks and main cache warmers.
+- `.github/workflows/release.yml` — one-day temporary handoffs and restore-only
+  release caches.
+- `.github/workflows/fly-deploy.yml` — non-image path exclusions.
+- `.github/workflows/backup-relay-state.yml` — accurate storage-cost note.
+- `require-ci.sh` — post-validation protection migration caller.
+- `docs/superpowers/specs/2026-07-18-github-actions-cost-reduction-design.md` —
+  approved design.
+- `docs/superpowers/plans/2026-07-18-github-actions-cost-reduction.md` — execution
+  and verification plan.
