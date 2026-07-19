@@ -249,9 +249,10 @@ handoff policy were absent before implementation.
 - Fly deploy skips paths the production Dockerfile does not consume. Nightly
   backups retain 90 days; their storage comment now describes the public-repo
   discount precisely.
-- `require-ci.sh` contains the six replacement contexts but was not executed.
-  Branch protection must stay unchanged until a pull request proves the new
-  check names green.
+- `require-ci.sh` contains the six replacement contexts. It was executed only
+  after pull request #372 proved all six new check names green. Post-update
+  verification showed strict checks and admin enforcement still enabled, force
+  pushes and deletions still disabled, and the pull request clean/mergeable.
 
 At July's observed mix of 15 pull-request and 10 main CI runs, the new topology
 would launch 110 jobs instead of 300 (63% fewer). Release-binary build
@@ -277,11 +278,15 @@ measurement from GitHub.
   closed. Final review returned no blocker or major findings. Remaining minors
   describe preserved demo-pipeline behavior; script inspection confirmed each
   demo/integration caller uses isolated state.
+- Pull request #372's first GitHub run passed all six replacement checks:
+  docs-lint 3s, fmt 14s, clippy 45s, test 2m37s, Linux end-to-end 2m54s, and
+  cold-cache Windows smoke 5m30s. Both main-only warmers skipped as designed.
 - GitNexus compare against `origin/main`: low risk, zero affected runtime
   processes. `git diff --check`: pass.
 
-Live launchd services, Wire homes, branch protection, existing caches, existing
-artifacts, Fly state, releases, and deployments were not changed.
+Live launchd services, Wire homes, existing caches, existing artifacts, Fly
+state, releases, and deployments were not changed. Branch protection changed
+only its required-context list after the new contexts passed.
 
 ### Artifacts
 
