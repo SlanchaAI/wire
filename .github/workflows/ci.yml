@@ -86,13 +86,19 @@ jobs:
       - name: deprecated phrases (canonical surface drift)
         run: |
           set -e
-          FILES=(README.md AGENTS.md INSTALL.md docs/integrations/*.md docs/AGENT_INTEGRATION.md)
+          FILES=(README.md AGENTS.md INSTALL.md docs/AGENT_INTEGRATION.md docs/integrations/*.md)
+          for file in "${FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::missing docs-lint input: $file"
+              exit 1
+            fi
+          done
           fail=0
 
           check() {
             local pattern="$1"
             local description="$2"
-            hits=$(grep -nE "$pattern" "${FILES[@]}" 2>/dev/null \
+            hits=$(grep -nE "$pattern" "${FILES[@]}" \
               | grep -v -iE '(legacy|deprecated|removed|v1\.0 removes)' \
               || true)
             if [ -n "$hits" ]; then
