@@ -1369,6 +1369,26 @@ fn group_list_empty_reports_no_groups() {
     // First tests/cli.rs coverage for the group family: empty-state list,
     // both human and --json shapes (e2e_group.rs covers the live flows).
     let home = fresh_home();
+    let out = run(&home, &["group", "list"]);
+    assert!(
+        out.status.success(),
+        "uninitialized group list failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no groups yet"),
+        "unexpected uninitialized output: {stdout}"
+    );
+
+    let out = run(&home, &["group", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "uninitialized group list --json failed: {out:?}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(v["groups"], serde_json::json!([]));
+
     let _ = run(&home, &["init", "--offline"]);
     let out = run(&home, &["group", "list"]);
     assert!(out.status.success(), "group list failed: {out:?}");

@@ -340,8 +340,104 @@ async fn group_bidirectional_room_with_introduce_pin() {
         assert_eq!(pull["rejected"].as_array().unwrap().len(), 0);
     }
 
-    // ---- 7. members post to the shared room (ingest materializes the roster
-    //         + introduce-pins the other members on the creator's vouch) ----
+    // ---- 7. listing materializes the verified direct invite. Members should
+    // not need a separate join code after the creator adds them. ----
+    for m in [&bob, &carol] {
+        let member_list: Value =
+            serde_json::from_slice(&wire(m, &["group", "list", "--json"]).stdout).unwrap();
+        let groups = member_list["groups"].as_array().unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "member should list the direct invite: {member_list}"
+        );
+        assert_eq!(groups[0]["id"].as_str(), Some(gid.as_str()));
+        assert_eq!(
+            groups[0]["members"].as_array().unwrap().len(),
+            3,
+            "member should materialize the full roster from the invite"
+        );
+    }
+
+    // A verified creator's signed roster must still target and name the
+    // recipient. Neither a wrong-recipient invite nor a roster that omits eve
+    // may grant verified outsider eve the room credential.
+    let eve = fresh_dir("eve");
+    assert!(
+        wire(&eve, &["init", "--relay", &relay_url])
+            .status
+            .success()
+    );
+    drive_pairing(&alice, &eve, &relay_url);
+    let alice_h = read_handle(&alice);
+    let eve_card: Value =
+        serde_json::from_slice(&std::fs::read(eve.join("config/wire/agent-card.json")).unwrap())
+            .unwrap();
+    let eve_h = eve_card["handle"].as_str().unwrap();
+    let eve_did = eve_card["did"].as_str().unwrap();
+    let alice_card: Value =
+        serde_json::from_slice(&std::fs::read(alice.join("config/wire/agent-card.json")).unwrap())
+            .unwrap();
+    let alice_did = alice_card["did"].as_str().unwrap();
+    let alice_pk = wire::signing::b64decode(
+        alice_card["verify_keys"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["key"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let alice_seed = std::fs::read(alice.join("config/wire/private.key")).unwrap();
+    let group_path = alice.join(format!("config/wire/groups/{gid}.json"));
+    let group: wire::group::Group =
+        serde_json::from_slice(&std::fs::read(group_path).unwrap()).unwrap();
+    let mut roster_including_eve = group.clone();
+    roster_including_eve
+        .add_member(
+            eve_h.to_string(),
+            eve_did.to_string(),
+            wire::group::GroupTier::Member,
+        )
+        .unwrap();
+    roster_including_eve.sign(&alice_seed).unwrap();
+    let sign_invite = |to: String, roster: &wire::group::Group| {
+        wire::signing::sign_message_v31(
+            &serde_json::json!({
+                "schema_version": wire::signing::EVENT_SCHEMA_VERSION,
+                "timestamp": "2026-07-19T00:00:00Z",
+                "from": alice_did,
+                "to": to,
+                "type": "group_invite",
+                "kind": 1000,
+                "body": roster,
+            }),
+            &alice_seed,
+            &alice_pk,
+            &alice_h,
+        )
+        .unwrap()
+    };
+    let eve_inbox = eve.join("state/wire/inbox");
+    std::fs::create_dir_all(&eve_inbox).unwrap();
+    let wrong_recipient = sign_invite(format!("did:wire:{bob_h}"), &roster_including_eve);
+    let excluded_recipient = sign_invite(format!("did:wire:{eve_h}"), &group);
+    std::fs::write(
+        eve_inbox.join(format!("{alice_h}.jsonl")),
+        format!("{wrong_recipient}\n{excluded_recipient}\n"),
+    )
+    .unwrap();
+    let eve_list: Value =
+        serde_json::from_slice(&wire(&eve, &["group", "list", "--json"]).stdout).unwrap();
+    assert_eq!(
+        eve_list["groups"],
+        serde_json::json!([]),
+        "a verified outsider must not materialize a direct invite: {eve_list}"
+    );
+
+    // ---- 8. members post to the shared room using the materialized roster. ----
     assert!(
         wire(&bob, &["group", "send", &gid, "hi from bob"])
             .status
@@ -369,7 +465,7 @@ async fn group_bidirectional_room_with_introduce_pin() {
             .success()
     );
 
-    // ---- 8. everyone tails the same room and sees ALL messages, verified ----
+    // ---- 9. everyone tails the same room and sees ALL messages, verified ----
     // The cross-member reads are the bidirectional proof: bob reads carol's
     // message (and vice-versa) verified=true via the introduce-pinned key —
     // neither ever paired with the other.
