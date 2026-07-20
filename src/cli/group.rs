@@ -150,7 +150,8 @@ fn ingest_group_invites() -> Result<()> {
     if !inbox.exists() {
         return Ok(());
     }
-    let (self_did, ..) = group_self()?;
+    let (self_did, self_handle, ..) = group_self()?;
+    let expected_recipient = format!("did:wire:{self_handle}");
     let trust_now = config::read_trust().unwrap_or_else(|_| json!({"agents": {}}));
     // group_id -> highest-epoch verified roster seen in the inbox.
     let mut best: std::collections::HashMap<String, crate::group::Group> =
@@ -167,6 +168,9 @@ fn ingest_group_invites() -> Result<()> {
                 Err(_) => continue,
             };
             if event.get("type").and_then(Value::as_str) != Some("group_invite") {
+                continue;
+            }
+            if event.get("to").and_then(Value::as_str) != Some(expected_recipient.as_str()) {
                 continue;
             }
             // Event-level: the invite must be from a pinned peer (the creator)
@@ -205,6 +209,12 @@ fn ingest_group_invites() -> Result<()> {
                 continue;
             };
             if !group.verify(&creator_key) {
+                continue;
+            }
+            // A valid creator signature alone is insufficient: the invite must
+            // both target this identity and name it in the roster before we
+            // persist its read/write room credential.
+            if !group.contains_did(&self_did) {
                 continue;
             }
             match best.get(&group.id) {
@@ -765,6 +775,12 @@ pub(crate) fn cmd_group_join(code: &str, as_json: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_group_list(as_json: bool) -> Result<()> {
+    // A direct add delivers a signed roster through the regular inbox. Ingest
+    // it before listing so the recipient can discover and use the room without
+    // asking the creator for a separate join code.
+    if config::is_initialized()? {
+        ingest_group_invites()?;
+    }
     let groups = crate::group::list_groups()?;
     if as_json {
         let arr: Vec<Value> = groups
