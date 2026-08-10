@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-pub const LIVE_SESSION_SCHEMA: &str = "wire-live-sessions-v1";
+pub const LIVE_SESSION_SCHEMA: &str = "wire-live-sessions-v2";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LiveSession {
@@ -15,8 +15,11 @@ pub struct LiveSession {
     pub did: String,
     pub emoji: String,
     pub primary_hex: String,
-    pub agent_host: String,
-    pub project_dir: Option<String>,
+    pub pid: u32,
+    pub machine: crate::session_metadata::MachineDescriptor,
+    pub harness: crate::session_metadata::HarnessDescriptor,
+    pub identity: crate::session_metadata::IdentityDescriptor,
+    pub project: crate::session_metadata::ProjectDescriptor,
     pub started_at: Option<String>,
     pub age_seconds: Option<u64>,
     pub direct_link_count: usize,
@@ -343,11 +346,11 @@ fn collect_live_from(
     now: OffsetDateTime,
     is_alive: impl Fn(u32) -> bool + Copy,
 ) -> anyhow::Result<LiveSessionReport> {
-    let mut live = Vec::new();
+    let mut candidates = Vec::new();
     for session in sessions {
-        let (Some(did), Some(handle)) = (session.did.as_deref(), session.handle.as_deref()) else {
+        if session.did.is_none() || session.handle.is_none() {
             continue;
-        };
+        }
         if crate::retire::is_retired(&session.home_dir) {
             continue;
         }
@@ -359,6 +362,18 @@ fn collect_live_from(
         else {
             continue;
         };
+        candidates.push((session, lease.clone()));
+    }
+    let snapshot = crate::session_metadata::process_snapshot(
+        &candidates
+            .iter()
+            .map(|(_, lease)| lease.pid)
+            .collect::<Vec<_>>(),
+    );
+    let mut live = Vec::new();
+    for (session, lease) in candidates {
+        let did = session.did.as_deref().expect("candidate DID");
+        let handle = session.handle.as_deref().expect("candidate handle");
         let character = session
             .character
             .clone()
@@ -379,14 +394,49 @@ fn collect_live_from(
         } else {
             "healthy"
         };
+        let harness = lease
+            .harness
+            .clone()
+            .filter(|value| {
+                value.confidence != crate::session_metadata::MetadataConfidence::Unknown
+            })
+            .unwrap_or_else(|| {
+                crate::session_metadata::harness_from_snapshot(
+                    &snapshot,
+                    lease.pid,
+                    &lease.session_source,
+                )
+            });
+        let project = lease
+            .project
+            .clone()
+            .filter(|value| {
+                value.confidence != crate::session_metadata::MetadataConfidence::Unknown
+            })
+            .unwrap_or_else(|| {
+                lease
+                    .cwd
+                    .as_deref()
+                    .or(session.cwd.as_deref())
+                    .map(Path::new)
+                    .map(crate::session_metadata::describe_project)
+                    .unwrap_or_else(|| {
+                        crate::session_metadata::project_from_snapshot(&snapshot, lease.pid, None)
+                    })
+            });
         live.push(LiveSession {
             id: session.name.clone(),
             handle: handle.to_string(),
             did: did.to_string(),
             emoji: character.emoji,
             primary_hex: character.palette.primary_hex,
-            agent_host: lease.session_source.clone(),
-            project_dir: lease.cwd.clone().or_else(|| session.cwd.clone()),
+            pid: lease.pid,
+            machine: lease.machine.clone().unwrap_or_else(|| {
+                crate::session_metadata::machine_descriptor(&lease.wire_version)
+            }),
+            harness,
+            identity: crate::session_metadata::identity_descriptor(&lease.session_source),
+            project,
             started_at: lease.started_at.clone(),
             age_seconds,
             direct_link_count: peers.len(),
@@ -417,8 +467,17 @@ mod tests {
             did: format!("did:wire:{id}-11111111"),
             emoji: "🦎".to_string(),
             primary_hex: "#45e456".to_string(),
-            agent_host: "codex-cli".to_string(),
-            project_dir: None,
+            pid: 42,
+            machine: crate::session_metadata::machine_descriptor("0.17.0"),
+            harness: crate::session_metadata::HarnessDescriptor {
+                kind: "codex-cli".to_string(),
+                label: "Codex CLI".to_string(),
+                mode: Some("interactive".to_string()),
+                confidence: crate::session_metadata::MetadataConfidence::Explicit,
+                evidence: "test-fixture".to_string(),
+            },
+            identity: crate::session_metadata::identity_descriptor("codex-cli"),
+            project: crate::session_metadata::ProjectDescriptor::unknown(None),
             started_at: None,
             age_seconds: None,
             direct_link_count: 0,
@@ -484,14 +543,18 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.schema, "wire-live-sessions-v1");
+        assert_eq!(report.schema, "wire-live-sessions-v2");
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].id, "session-11111111");
-        assert_eq!(report.sessions[0].agent_host, "codex-cli");
+        assert_eq!(report.sessions[0].harness.kind, "codex-cli");
+        assert_eq!(report.sessions[0].identity.source, "codex-cli");
+        assert_eq!(report.sessions[0].identity.class, "session-keyed");
         assert_eq!(
-            report.sessions[0].project_dir.as_deref(),
+            report.sessions[0].project.cwd.as_deref(),
             Some("/work/wire")
         );
+        assert_eq!(report.sessions[0].machine.wire_version, "0.17.0");
+        assert_eq!(report.sessions[0].pid, 101);
         assert_eq!(
             report.sessions[0].started_at.as_deref(),
             Some("2023-11-14T22:13:20Z")
@@ -501,6 +564,7 @@ mod tests {
         assert!(!json.contains("AGENT_SESSION_ID"));
         assert!(!json.contains("slot_token"));
         assert!(!json.contains("private.key"));
+        assert!(!json.contains("command_line"));
     }
 
     #[test]

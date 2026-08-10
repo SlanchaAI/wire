@@ -544,6 +544,22 @@ pub(crate) fn infer_harness(
     session_source: &str,
     ancestry: &[ProcessObservation],
 ) -> HarnessDescriptor {
+    let explicit = match session_source {
+        "claude-code" => Some(("claude-code", "Claude Code")),
+        "goose" => Some(("goose", "Goose")),
+        "copilot-cli" => Some(("copilot-cli", "GitHub Copilot CLI")),
+        "vscode-workspace" => Some(("vscode", "VS Code")),
+        _ => None,
+    };
+    if let Some((kind, label)) = explicit {
+        return harness(
+            kind,
+            label,
+            Some("mcp-host"),
+            MetadataConfidence::Explicit,
+            "lease-source",
+        );
+    }
     for process in ancestry {
         let executable = std::path::Path::new(&process.executable)
             .file_name()
@@ -615,37 +631,9 @@ pub(crate) fn infer_harness(
     }
 
     match session_source {
-        "claude-code" => harness(
-            "claude-code",
-            "Claude Code",
-            Some("mcp-host"),
-            MetadataConfidence::Explicit,
-            "lease-source",
-        ),
         "codex-cli" => harness(
             "codex-cli",
             "Codex CLI",
-            Some("mcp-host"),
-            MetadataConfidence::Explicit,
-            "lease-source",
-        ),
-        "goose" => harness(
-            "goose",
-            "Goose",
-            Some("mcp-host"),
-            MetadataConfidence::Explicit,
-            "lease-source",
-        ),
-        "copilot-cli" => harness(
-            "copilot-cli",
-            "GitHub Copilot CLI",
-            Some("mcp-host"),
-            MetadataConfidence::Explicit,
-            "lease-source",
-        ),
-        "vscode-workspace" => harness(
-            "vscode",
-            "VS Code",
             Some("mcp-host"),
             MetadataConfidence::Explicit,
             "lease-source",

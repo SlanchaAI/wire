@@ -131,12 +131,38 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         .await
         .unwrap();
     let sessions = report["sessions"].as_array().unwrap();
+    assert_eq!(report["schema"], "wire-live-sessions-v2");
     assert_eq!(sessions.len(), 3, "live inventory: {report}");
     assert!(
         sessions
             .iter()
-            .any(|session| session["agent_host"] == "goose")
+            .any(|session| session["harness"]["kind"] == "goose")
     );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["machine"]["hostname"].is_string())
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["identity"]["source"].is_string())
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["project"]["cwd"] == "/work/operator-proof")
+    );
+    let serialized = report.to_string();
+    for secret_field in [
+        "thread_id",
+        "session_key",
+        "command_line",
+        "slot_token",
+        "private_key",
+    ] {
+        assert!(!serialized.contains(secret_field));
+    }
     let ids: Vec<String> = sessions
         .iter()
         .map(|session| session["id"].as_str().unwrap().to_string())
