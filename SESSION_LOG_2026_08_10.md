@@ -117,4 +117,5 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - `tests/operator_dashboard_polling.test.mjs` — browser polling single-flight regression.
 - `docs/superpowers/specs/2026-08-10-operator-dashboard-design.md` — approved product and architecture boundary.
 - `docs/superpowers/specs/2026-08-10-fleet-session-provenance-design.md` — approved local metadata and future fleet boundary.
+- `docs/superpowers/specs/2026-08-10-operator-topology-map-design.md` — approved clustered map, topology contract, and select-then-link boundary.
 - `docs/superpowers/plans/2026-08-10-fleet-session-provenance.md` — linted execution plan.
