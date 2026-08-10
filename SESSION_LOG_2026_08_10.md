@@ -88,6 +88,15 @@ A browser race probe accidentally ran an older debug binary and linked `agate-st
 
 After the first installed launch, refreshing the clean URL lost the in-memory launch token and left the inventory request unauthorized. The browser now stores the token in per-tab `sessionStorage` before removing it from the visible URL. Installed Playwright proof showed 34 rows before and after reload, no notice, and zero console errors.
 
+## Operator daemon ownership repair
+
+- Observed defect: the machine-wide supervisor retired `rusted-butte` PID `98594`, although `wire up` had started that daemon explicitly. The live-only board then correctly removed the stopped session.
+- Root cause: inactive-worker cleanup identified ownership from a shared pidfile and generic `wire daemon` command line; both supervisor children and operator-started daemons have those properties.
+- Fix: supervisor-spawned workers carry `WIRE_SUPERVISOR_MANAGED=1` into a backward-compatible pidfile marker. Cleanup requires that explicit marker; operator-started daemons and older pidfiles omit it. The durable marker survives supervisor restarts.
+- RED/GREEN: a real orphaned process with an operator-shaped daemon pidfile was killed before the fix and preserved after it; a complementary child-process test proves explicitly supervisor-owned cleanup remains active. Pidfile tests cover owner publication and legacy records without the field.
+- Installed caller proof: launchd supervisor PID `20898` spawned workers including `agate-starshine` PID `25241`; their pidfiles contain `supervisor_managed: true`. Operator-started `rusted-butte` PID `32746` omits the marker and remained healthy through repeated supervisor polls.
+- Chrome proof: refreshed the existing dashboard tab, found exactly one `rusted-butte` row, and left it visibly centered with `Wire daemon`, project `wire`, and `HEALTHY` status.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.

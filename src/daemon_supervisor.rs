@@ -117,10 +117,9 @@ fn classify_session_worker(
     })
 }
 
-/// Stop one pidfile-owned worker for a session that lifecycle planning did
-/// not select. Validation is deliberately narrow: JSON pidfile, live PID,
-/// daemon command line, and never the all-session supervisor. No process
-/// family signal and no home mutation.
+/// Stop one supervisor-owned worker for a session that lifecycle planning did
+/// not select. A standalone daemon started by `wire up` may share the same
+/// pidfile and command line, so the pidfile's explicit owner is the boundary.
 fn retire_inactive_worker(session: &crate::session::SessionInfo) {
     let pidfile = session
         .home_dir
@@ -133,6 +132,9 @@ fn retire_inactive_worker(session: &crate::session::SessionInfo) {
     let Ok(record) = serde_json::from_str::<crate::ensure_up::DaemonPid>(&body) else {
         return;
     };
+    if !record.supervisor_managed {
+        return;
+    }
     let alive = crate::platform::process_alive(record.pid);
     let cmdline = crate::platform::pid_cmdline(record.pid);
     let Some(version) = classify_session_worker(&record, alive, cmdline.as_deref()) else {
@@ -671,6 +673,7 @@ fn spawn_child_for_session(
         cmd.env_remove(&k);
     }
     cmd.env("WIRE_HOME", home_dir);
+    cmd.env("WIRE_SUPERVISOR_MANAGED", "1");
     // Children inherit stdout/stderr → land in the launchd log file
     // (StandardOutPath in the plist). Operators see "supervisor:
     // spawned ..." lines interleaved with each session's daemon log.
@@ -1125,6 +1128,7 @@ mod tests {
             started_at: "2026-07-17T00:00:00Z".to_string(),
             did: None,
             relay_url: None,
+            supervisor_managed: false,
         };
         assert_eq!(
             classify_session_worker(&record, true, Some("/opt/wire daemon --interval 5")),
@@ -1141,6 +1145,92 @@ mod tests {
             "never classify the supervisor itself as a session worker"
         );
         assert_eq!(classify_session_worker(&record, false, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_does_not_retire_operator_started_daemon() {
+        let tmp = tempdir().unwrap();
+        let state = tmp.path().join("state/wire");
+        std::fs::create_dir_all(&state).unwrap();
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sh -c 'while :; do sleep 1; done' wire daemon >/dev/null 2>&1 & echo $!",
+            ])
+            .output()
+            .unwrap();
+        let pid = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let record = crate::ensure_up::DaemonPid {
+            schema: crate::ensure_up::DAEMON_PID_SCHEMA.to_string(),
+            pid,
+            bin_path: "/opt/wire".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: "2026-08-10T00:00:00Z".to_string(),
+            did: None,
+            relay_url: None,
+            supervisor_managed: false,
+        };
+        std::fs::write(
+            state.join("daemon.pid"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut session = initialized_session("operator-started", false);
+        session.home_dir = tmp.path().to_path_buf();
+
+        retire_inactive_worker(&session);
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = crate::platform::process_alive(pid);
+        let _ = crate::platform::kill_process(pid, false);
+
+        assert!(
+            alive,
+            "all-session supervisor killed an operator-started daemon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_retires_its_own_inactive_daemon() {
+        let tmp = tempdir().unwrap();
+        let state = tmp.path().join("state/wire");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", "wire", "daemon"])
+            .spawn()
+            .unwrap();
+        let record = crate::ensure_up::DaemonPid {
+            schema: crate::ensure_up::DAEMON_PID_SCHEMA.to_string(),
+            pid: child.id(),
+            bin_path: "/opt/wire".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: "2026-08-10T00:00:00Z".to_string(),
+            did: None,
+            relay_url: None,
+            supervisor_managed: true,
+        };
+        std::fs::write(
+            state.join("daemon.pid"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut session = initialized_session("supervisor-owned", false);
+        session.home_dir = tmp.path().to_path_buf();
+
+        retire_inactive_worker(&session);
+        std::thread::sleep(Duration::from_millis(100));
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        assert!(status.is_some(), "supervisor left its inactive child alive");
     }
 
     #[test]
