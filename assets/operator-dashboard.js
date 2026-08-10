@@ -7,7 +7,7 @@
   const token = queryToken || window.sessionStorage.getItem("wire-launch-token") || "";
   window.history.replaceState({}, "", window.location.pathname);
 
-  const state = { sessions: [], selected: new Set(), confirmedPair: [], busy: false };
+  const state = { sessions: [], selected: new Set(), expanded: new Set(), confirmedPair: [], busy: false };
   const rows = document.querySelector("#session-rows");
   const tableWrap = document.querySelector("#table-wrap");
   const loading = document.querySelector("#loading");
@@ -27,15 +27,7 @@
   const groupName = document.querySelector("#group-name");
   const groupCreator = document.querySelector("#group-creator");
 
-  const hostLabel = (source) => ({
-    "codex-cli": "Codex thread",
-    "claude-code": "Claude thread",
-    "claude-code-pidfile": "Claude thread",
-    "goose": "Goose thread",
-    "copilot-cli": "Copilot thread",
-    "vscode-workspace": "VS Code workspace",
-    "override": "Pinned session"
-  }[source] || source || "Agent session");
+  const known = (value) => value === null || value === undefined || value === "" ? "Unknown" : String(value);
 
   const formatAge = (seconds) => {
     if (seconds === null || seconds === undefined) return "—";
@@ -72,9 +64,41 @@
     return element;
   };
 
+  const stack = (primary, secondary, className = "") => {
+    const wrapper = document.createElement("span");
+    wrapper.className = `cell-stack ${className}`.trim();
+    const main = document.createElement("strong");
+    main.textContent = known(primary);
+    const sub = document.createElement("small");
+    sub.textContent = known(secondary);
+    wrapper.append(main, sub);
+    return wrapper;
+  };
+
+  const detailItem = (label, value) => {
+    const wrapper = document.createElement("div");
+    const term = document.createElement("dt");
+    const description = document.createElement("dd");
+    term.textContent = label;
+    description.textContent = known(value);
+    wrapper.append(term, description);
+    return wrapper;
+  };
+
+  const detailSection = (title, items) => {
+    const section = document.createElement("section");
+    const heading = document.createElement("h3");
+    const list = document.createElement("dl");
+    heading.textContent = title;
+    for (const [label, value] of items) list.append(detailItem(label, value));
+    section.append(heading, list);
+    return section;
+  };
+
   const render = () => {
     const liveIds = new Set(state.sessions.map((session) => session.id));
     state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
+    state.expanded = new Set([...state.expanded].filter((id) => liveIds.has(id)));
     const fragment = document.createDocumentFragment();
 
     for (const session of state.sessions) {
@@ -101,16 +125,25 @@
       emoji.textContent = session.emoji;
       const handle = document.createElement("span");
       handle.textContent = session.handle;
-      name.append(emoji, handle);
+      const identity = document.createElement("span");
+      identity.className = "session-identity";
+      identity.append(handle);
+      const uptime = document.createElement("small");
+      uptime.textContent = `${formatAge(session.age_seconds)} · PID ${session.pid}`;
+      identity.append(uptime);
+      name.append(emoji, identity);
       nameCell.append(name);
 
-      const host = cell("Agent", "utility");
-      host.textContent = hostLabel(session.agent_host);
+      const host = cell("Harness", "utility");
+      host.append(stack(session.harness?.label, session.harness?.confidence));
       const project = cell("Project", "project");
-      project.textContent = session.project_dir || "—";
-      project.title = session.project_dir || "";
-      const age = cell("Uptime", "utility");
-      age.textContent = formatAge(session.age_seconds);
+      project.append(stack(session.project?.name, session.project?.branch || session.project?.relative_cwd));
+      project.title = known(session.project?.cwd);
+      const machine = cell("Machine", "utility");
+      machine.append(stack(session.machine?.hostname, `${known(session.machine?.os)} / ${known(session.machine?.arch)}`));
+      const identityCell = cell("Identity", "utility");
+      const identityLabel = session.identity?.warning ? "Needs session key" : session.identity?.class;
+      identityCell.append(stack(identityLabel, session.identity?.source, session.identity?.warning ? "identity-warning" : ""));
       const links = cell("Links", "link-count");
       links.textContent = String(session.direct_link_count);
       const health = cell("Signal");
@@ -119,8 +152,69 @@
       signal.textContent = session.health.replaceAll("-", " ");
       health.append(signal);
 
-      row.append(selectCell, nameCell, host, project, age, links, health);
+      const detailsCell = cell("Details");
+      const detailsButton = document.createElement("button");
+      const expanded = state.expanded.has(session.id);
+      const detailId = `details-${session.id}`;
+      detailsButton.type = "button";
+      detailsButton.className = "details-button";
+      detailsButton.textContent = expanded ? "Hide" : "Inspect";
+      detailsButton.setAttribute("aria-expanded", String(expanded));
+      detailsButton.setAttribute("aria-controls", detailId);
+      detailsButton.addEventListener("click", () => {
+        if (state.expanded.has(session.id)) state.expanded.delete(session.id);
+        else state.expanded.add(session.id);
+        render();
+      });
+      detailsCell.append(detailsButton);
+
+      row.append(selectCell, nameCell, host, project, machine, identityCell, links, health, detailsCell);
       fragment.append(row);
+
+      const detailRow = document.createElement("tr");
+      detailRow.id = detailId;
+      detailRow.className = "detail-row";
+      detailRow.hidden = !expanded;
+      const detailCell = document.createElement("td");
+      detailCell.colSpan = 9;
+      const grid = document.createElement("div");
+      grid.className = "detail-grid";
+      grid.append(
+        detailSection("Identity", [
+          ["DID", session.did],
+          ["Source", session.identity?.source],
+          ["Class", session.identity?.class],
+          ["Warning", session.identity?.warning]
+        ]),
+        detailSection("Harness", [
+          ["Kind", session.harness?.kind],
+          ["Launch mode", session.harness?.mode],
+          ["Confidence", session.harness?.confidence],
+          ["Evidence", session.harness?.evidence]
+        ]),
+        detailSection("Project", [
+          ["Repository", session.project?.name],
+          ["Root", session.project?.root],
+          ["Working directory", session.project?.cwd],
+          ["Relative directory", session.project?.relative_cwd],
+          ["Branch", session.project?.branch],
+          ["Revision", session.project?.revision],
+          ["Worktree", session.project?.worktree_name],
+          ["Worktree path", session.project?.worktree_path],
+          ["Remote", session.project?.remote],
+          ["Evidence", session.project?.evidence]
+        ]),
+        detailSection("Machine", [
+          ["Fingerprint", session.machine?.fingerprint],
+          ["Hostname", session.machine?.hostname],
+          ["Operating system", session.machine?.os],
+          ["Architecture", session.machine?.arch],
+          ["Wire version", session.machine?.wire_version]
+        ])
+      );
+      detailCell.append(grid);
+      detailRow.append(detailCell);
+      fragment.append(detailRow);
     }
     rows.replaceChildren(fragment);
     liveCount.textContent = String(state.sessions.length);

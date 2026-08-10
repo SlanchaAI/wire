@@ -192,10 +192,16 @@ h2 { font-size: clamp(1.65rem, 3vw, 2.3rem); letter-spacing: -0.025em; }
 .session-table tbody tr { background: rgba(255, 255, 255, 0.17); }
 .session-table tbody tr:nth-child(even) { background: rgba(91, 26, 46, 0.045); }
 .session-table tbody tr:has(input:checked) { background: rgba(143, 176, 74, 0.22); box-shadow: inset 5px 0 var(--dial-dark); }
+.session-table tbody tr.detail-row { background: #e2d4ba; box-shadow: inset 5px 0 var(--frame); }
+.session-table tbody tr.detail-row[hidden] { display: none; }
 
 .session-check { width: 19px; height: 19px; accent-color: var(--frame); }
 .session-name { display: flex; gap: 10px; align-items: center; min-width: 185px; font-weight: 800; }
 .session-emoji { display: grid; width: 34px; height: 34px; place-items: center; border: 2px solid currentColor; background: var(--paper); font-size: 1.1rem; }
+.session-identity, .cell-stack { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.session-identity small, .cell-stack small { color: var(--muted); font-family: var(--utility); font-size: 0.64rem; font-weight: 500; text-transform: none; }
+.cell-stack strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity-warning strong { color: var(--danger); }
 .utility { font-family: var(--utility); font-size: 0.77rem; }
 .project { max-width: 280px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .link-count { font-family: var(--utility); font-weight: 800; }
@@ -203,6 +209,14 @@ h2 { font-size: clamp(1.65rem, 3vw, 2.3rem); letter-spacing: -0.025em; }
 .signal::before { width: 9px; height: 9px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent); content: ""; }
 .signal--healthy { color: var(--dial-dark); }
 .signal--sync-stale, .signal--daemon-down { color: var(--danger); }
+.details-button { padding: 5px 8px; border: 1px solid var(--frame); color: var(--frame); background: transparent; font-family: var(--utility); font-size: 0.68rem; font-weight: 800; cursor: pointer; }
+.detail-row > td { padding: 20px 22px; }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px 30px; }
+.detail-grid h3 { margin: 0 0 9px; color: var(--frame); font-family: var(--utility); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.detail-grid dl { display: grid; gap: 6px; margin: 0; }
+.detail-grid dl > div { display: grid; grid-template-columns: minmax(100px, 0.35fr) minmax(0, 1fr); gap: 12px; }
+.detail-grid dt { color: var(--muted); font-family: var(--utility); font-size: 0.65rem; text-transform: uppercase; }
+.detail-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-family: var(--utility); font-size: 0.72rem; }
 
 .console-footer {
   display: flex;
@@ -242,6 +256,11 @@ h2 { font-size: clamp(1.65rem, 3vw, 2.3rem); letter-spacing: -0.025em; }
   .session-table td::before { color: var(--muted); font-family: var(--utility); font-size: 0.62rem; text-transform: uppercase; content: attr(data-label); }
   .session-table td:first-child { position: absolute; top: 16px; left: 14px; display: block; width: auto; }
   .session-table td:first-child::before { display: none; }
+  .session-table tr.detail-row { margin-top: -12px; padding: 0; }
+  .session-table tr.detail-row td { display: block; padding: 16px; }
+  .session-table tr.detail-row td::before { display: none; }
+  .detail-grid { grid-template-columns: 1fr; gap: 18px; }
+  .detail-grid dl > div { grid-template-columns: 100px minmax(0, 1fr); }
   .session-name { min-width: 0; }
   .project { max-width: none; }
   .console-footer { align-items: flex-start; flex-direction: column; padding-inline: 20px; }

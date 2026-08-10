@@ -333,6 +333,12 @@ mod tests {
         assert!(html.contains("Link selected"));
         assert!(html.contains("Create group"));
         assert!(html.contains("aria-labelledby=\"group-title\""));
+        for heading in ["Harness", "Project", "Machine", "Identity", "Details"] {
+            assert!(
+                html.contains(heading),
+                "missing dashboard heading {heading}"
+            );
+        }
 
         let script = client
             .get(format!("http://{address}/dashboard.js"))
@@ -346,6 +352,9 @@ mod tests {
         assert!(!script.contains("https://"));
         assert!(!script.contains("innerHTML"));
         assert!(script.contains("sessionStorage"));
+        assert!(script.contains("aria-expanded"));
+        assert!(script.contains("detail-row"));
+        assert!(script.contains("Unknown"));
         server.abort();
     }
 }
