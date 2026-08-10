@@ -839,12 +839,13 @@ pub fn detect_session_wire_home(cwd: &std::path::Path) -> Option<PathBuf> {
 ///      forward this older name.
 ///   4. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
 ///      per thread and inherited by tool subprocesses.
-///   5. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
+///   5. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
+///   6. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
 ///      `copilot`) adapter. Set by the Copilot CLI host for every
 ///      session; stable per conversation; UUID-shaped.
-///   6. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
+///   7. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
 ///      identity (stable per workspace).
-///   7. `None` — caller falls back to legacy cwd-detect (bare CLI /
+///   8. `None` — caller falls back to legacy cwd-detect (bare CLI /
 ///      pre-v0.13 hosts). Future host adapters slot in before this.
 ///
 /// Returns `(key, source-label)`.
@@ -854,13 +855,27 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
         ("CLAUDE_CODE_SESSION_ID", "claude-code"),
         ("CODEX_SESSION_ID", "codex-cli"),
         ("CODEX_THREAD_ID", "codex-cli"),
-        ("COPILOT_AGENT_SESSION_ID", "copilot-cli"),
-        ("VSCODE_GIT_REPOSITORY_ROOT", "vscode-workspace"),
     ] {
         if let Ok(v) = std::env::var(var)
             && valid_session_key(&v)
         {
             return Some((v.trim().to_string(), source));
+        }
+    }
+    if std::env::var("AGENT").ok().as_deref() == Some("goose")
+        && let Ok(value) = std::env::var("AGENT_SESSION_ID")
+        && valid_session_key(&value)
+    {
+        return Some((value.trim().to_string(), "goose"));
+    }
+    for (var, source) in [
+        ("COPILOT_AGENT_SESSION_ID", "copilot-cli"),
+        ("VSCODE_GIT_REPOSITORY_ROOT", "vscode-workspace"),
+    ] {
+        if let Ok(value) = std::env::var(var)
+            && valid_session_key(&value)
+        {
+            return Some((value.trim().to_string(), source));
         }
     }
     // Claude Code adapter (host-agnostic fallback). On some platforms the MCP
@@ -1551,7 +1566,7 @@ static SESSION_SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::
 /// The signal that won session/home resolution for this process. One of:
 /// `env:WIRE_HOME`, `env:WIRE_HOME_FORCE` (RFC-008 §C legacy-shape force),
 /// `override` (`WIRE_SESSION_ID`), `claude-code`, `claude-code-pidfile`,
-/// `codex-cli`, `copilot-cli`, `vscode-workspace`, `minted`,
+/// `codex-cli`, `goose`, `copilot-cli`, `vscode-workspace`, `minted`,
 /// `machine-default`, or `unknown` if adoption never ran.
 pub fn session_source() -> &'static str {
     SESSION_SOURCE.get().copied().unwrap_or("unknown")
@@ -1591,7 +1606,7 @@ pub fn warn_if_unexpected_session_source(role: &str) {
     let strict = std::env::var("WIRE_STRICT_SESSION").is_ok_and(|v| !v.is_empty() && v != "0");
     let message = format!(
         "wire {role}: session-source=`{source}` — the launcher did not pass a session-key \
-         (WIRE_HOME / WIRE_SESSION_ID / CLAUDE_CODE_SESSION_ID), so this process is running \
+         (WIRE_HOME / WIRE_SESSION_ID / host session id), so this process is running \
          against the {kind} identity. If a sibling agent is serving the real session-key \
          home, they will race the inbox cursor. Pass an explicit `WIRE_SESSION_ID=<key>` or \
          `WIRE_HOME=<path>` to fix.",
@@ -1868,6 +1883,8 @@ mod tests {
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
         let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
+        let prev_agent = std::env::var_os("AGENT");
+        let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -1876,6 +1893,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
@@ -1933,6 +1952,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -1946,6 +1967,12 @@ mod tests {
             }
             if let Some(v) = prev_codex_thread {
                 std::env::set_var("CODEX_THREAD_ID", v);
+            }
+            if let Some(v) = prev_agent {
+                std::env::set_var("AGENT", v);
+            }
+            if let Some(v) = prev_agent_session {
+                std::env::set_var("AGENT_SESSION_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
@@ -1984,6 +2011,8 @@ mod tests {
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
         let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
+        let prev_agent = std::env::var_os("AGENT");
+        let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -1992,6 +2021,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
@@ -2053,6 +2084,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -2066,6 +2099,12 @@ mod tests {
             }
             if let Some(v) = prev_codex_thread {
                 std::env::set_var("CODEX_THREAD_ID", v);
+            }
+            if let Some(v) = prev_agent {
+                std::env::set_var("AGENT", v);
+            }
+            if let Some(v) = prev_agent_session {
+                std::env::set_var("AGENT_SESSION_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
@@ -2100,6 +2139,8 @@ mod tests {
         let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
         let prev_codex = std::env::var_os("CODEX_SESSION_ID");
         let prev_codex_thread = std::env::var_os("CODEX_THREAD_ID");
+        let prev_agent = std::env::var_os("AGENT");
+        let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
         // SAFETY: ENV_LOCK is held, serializing all env access.
@@ -2108,6 +2149,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
         }
@@ -2195,6 +2238,8 @@ mod tests {
             std::env::remove_var("CLAUDE_CODE_SESSION_ID");
             std::env::remove_var("CODEX_SESSION_ID");
             std::env::remove_var("CODEX_THREAD_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
             if let Some(v) = prev_override {
@@ -2209,11 +2254,70 @@ mod tests {
             if let Some(v) = prev_codex_thread {
                 std::env::set_var("CODEX_THREAD_ID", v);
             }
+            if let Some(v) = prev_agent {
+                std::env::set_var("AGENT", v);
+            }
+            if let Some(v) = prev_agent_session {
+                std::env::set_var("AGENT_SESSION_ID", v);
+            }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_session_key_goose_adapter_is_guarded_and_ordered() {
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let names = [
+            "WIRE_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "AGENT",
+            "AGENT_SESSION_ID",
+            "COPILOT_AGENT_SESSION_ID",
+            "VSCODE_GIT_REPOSITORY_ROOT",
+        ];
+        let previous: Vec<_> = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        // SAFETY: ENV_LOCK serializes all environment access in these tests.
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("AGENT", "goose");
+            std::env::set_var("AGENT_SESSION_ID", "20260810_7");
+        }
+
+        assert_eq!(resolve_session_key(), Some(("20260810_7".into(), "goose")));
+
+        unsafe { std::env::set_var("COPILOT_AGENT_SESSION_ID", "copilot-later") };
+        assert_eq!(resolve_session_key(), Some(("20260810_7".into(), "goose")));
+        unsafe { std::env::remove_var("COPILOT_AGENT_SESSION_ID") };
+
+        unsafe { std::env::set_var("AGENT", "another-host") };
+        assert!(!matches!(resolve_session_key(), Some((key, _)) if key == "20260810_7"));
+
+        unsafe {
+            std::env::set_var("AGENT", "goose");
+            std::env::set_var("AGENT_SESSION_ID", "${UNEXPANDED}");
+        }
+        assert!(!matches!(resolve_session_key(), Some((key, _)) if key.contains("${")));
+
+        unsafe {
+            for (name, value) in previous {
+                std::env::remove_var(name);
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                }
             }
         }
     }
@@ -2921,6 +3025,7 @@ mod tests {
             "claude-code",
             "claude-code-pidfile",
             "codex-cli",
+            "goose",
             "copilot-cli",
             "vscode-workspace",
         ] {

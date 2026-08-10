@@ -19,6 +19,10 @@ pub struct LeaseRecord {
     pub wire_version: String,
     pub bin_path: String,
     pub session_source: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 pub fn lease_dir(home: &Path) -> PathBuf {
@@ -59,6 +63,7 @@ pub fn write_lease_at(
     wire_version: &str,
     bin_path: &Path,
     session_source: &str,
+    cwd: Option<&Path>,
 ) -> Result<PathBuf> {
     if role.is_empty()
         || !role
@@ -78,6 +83,8 @@ pub fn write_lease_at(
         wire_version: wire_version.to_string(),
         bin_path: bin_path.to_string_lossy().into_owned(),
         session_source: session_source.to_string(),
+        started_at: Some(format_time(now)?),
+        cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
     };
     persist_record(&path, &record)?;
     Ok(path)
@@ -151,6 +158,7 @@ impl LeaseGuard {
             .and_then(Path::parent)
             .ok_or_else(|| anyhow!("state directory has no session-home parent"))?;
         let bin = crate::platform::current_exe_resolved()?;
+        let cwd = std::env::current_dir().ok();
         Self::acquire_at(
             home,
             role,
@@ -160,6 +168,7 @@ impl LeaseGuard {
             env!("CARGO_PKG_VERSION"),
             &bin,
             crate::session::session_source(),
+            cwd.as_deref(),
         )
     }
 
@@ -177,6 +186,7 @@ impl LeaseGuard {
         wire_version: &str,
         bin_path: &Path,
         session_source: &str,
+        cwd: Option<&Path>,
     ) -> Result<Self> {
         let path = write_lease_at(
             home,
@@ -187,6 +197,7 @@ impl LeaseGuard {
             wire_version,
             bin_path,
             session_source,
+            cwd,
         )?;
         Ok(Self { path, ttl })
     }
@@ -225,6 +236,7 @@ mod tests {
             "0.17.0",
             Path::new("/opt/wire"),
             "override",
+            Some(Path::new("/work/wire")),
         )
         .unwrap()
     }
@@ -243,6 +255,31 @@ mod tests {
         assert_eq!(leases[0].role, "mcp");
         assert_eq!(leases[0].pid, 42);
         assert_eq!(leases[0].session_source, "override");
+        assert_eq!(
+            leases[0].started_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(leases[0].cwd.as_deref(), Some("/work/wire"));
+    }
+
+    #[test]
+    fn lease_without_inventory_metadata_remains_readable() {
+        let record: LeaseRecord = serde_json::from_str(
+            r#"{
+                "schema":"wire-session-lease-v1",
+                "role":"mcp",
+                "pid":42,
+                "heartbeat_at":"2023-11-14T22:13:20Z",
+                "expires_at":"2023-11-14T22:14:50Z",
+                "wire_version":"0.17.0",
+                "bin_path":"/opt/wire",
+                "session_source":"override"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(record.started_at, None);
+        assert_eq!(record.cwd, None);
     }
 
     #[test]
@@ -304,6 +341,7 @@ mod tests {
             "0.17.0",
             Path::new("/opt/wire"),
             "codex-cli",
+            Some(Path::new("/work/wire")),
         )
         .unwrap();
         let path = guard.path.clone();
