@@ -39,6 +39,50 @@ pub struct IdentityDescriptor {
     pub warning: Option<String>,
 }
 
+pub fn machine_descriptor(wire_version: &str) -> MachineDescriptor {
+    let fingerprint = crate::platform::machine_id_raw()
+        .zip(crate::platform::os_user_id_bytes())
+        .map(|(machine, user)| {
+            hex::encode(crate::same_machine::machine_fingerprint(&machine, &user))
+        });
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+    MachineDescriptor {
+        fingerprint,
+        hostname,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        wire_version: wire_version.to_string(),
+    }
+}
+
+pub fn identity_descriptor(source: &str) -> IdentityDescriptor {
+    let (class, warning) = match source {
+        "override" => ("explicit-override", None),
+        "claude-code" | "codex-cli" | "goose" | "copilot-cli" | "vscode-workspace" => {
+            ("session-keyed", None)
+        }
+        "cwd-registry" | "registry" => ("registry-fallback", None),
+        "machine-default" => (
+            "machine-default",
+            Some("Identity propagation missing: this agent uses the machine-default session."),
+        ),
+        "minted" => (
+            "machine-default",
+            Some("Identity propagation missing: this agent uses a minted fallback session."),
+        ),
+        _ => ("unknown", None),
+    };
+    IdentityDescriptor {
+        source: source.to_string(),
+        class: class.to_string(),
+        warning: warning.map(str::to_string),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProjectDescriptor {
     pub name: Option<String>,
@@ -207,6 +251,7 @@ pub(crate) struct ProcessSnapshot {
 }
 
 impl ProcessSnapshot {
+    #[cfg(test)]
     fn from_observations(observations: Vec<ProcessObservation>) -> Self {
         Self {
             observations: observations
@@ -272,6 +317,28 @@ pub(crate) fn process_snapshot(pids: &[u32]) -> ProcessSnapshot {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_or_refresh(pids, capture_process_snapshot)
+}
+
+pub(crate) fn harness_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    pid: u32,
+    session_source: &str,
+) -> HarnessDescriptor {
+    infer_harness(session_source, &snapshot.ancestry(pid))
+}
+
+pub(crate) fn project_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    pid: u32,
+    fallback_cwd: Option<&std::path::Path>,
+) -> ProjectDescriptor {
+    if let Some(cwd) = fallback_cwd {
+        describe_project(cwd)
+    } else if let Some(cwd) = snapshot.cwd(pid) {
+        describe_project(&cwd)
+    } else {
+        ProjectDescriptor::unknown(None)
+    }
 }
 
 #[cfg(target_os = "macos")]
