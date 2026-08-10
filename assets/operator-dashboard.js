@@ -2,7 +2,9 @@
   "use strict";
 
   const query = new URLSearchParams(window.location.search);
-  const token = query.get("token") || "";
+  const queryToken = query.get("token") || "";
+  if (queryToken) window.sessionStorage.setItem("wire-launch-token", queryToken);
+  const token = queryToken || window.sessionStorage.getItem("wire-launch-token") || "";
   window.history.replaceState({}, "", window.location.pathname);
 
   const state = { sessions: [], selected: new Set(), confirmedPair: [], busy: false };

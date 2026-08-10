@@ -57,6 +57,8 @@ Repair local Wire identity/daemon ambiguity and ship a one-machine operator dash
 
 A browser race probe accidentally ran an older debug binary and linked `agate-starshine` to the `bubbling-kelp` session at `.../9583f4349f98ddea`. The exact bilateral pins were removed immediately with `wire forget-peer` on both homes; verification showed only each session's self-attestation remained. No files were purged.
 
+After the first installed launch, refreshing the clean URL lost the in-memory launch token and left the inventory request unauthorized. The browser now stores the token in per-tab `sessionStorage` before removing it from the visible URL. Installed Playwright proof showed 34 rows before and after reload, no notice, and zero console errors.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.

@@ -345,6 +345,7 @@ mod tests {
         assert!(!script.contains("http://"));
         assert!(!script.contains("https://"));
         assert!(!script.contains("innerHTML"));
+        assert!(script.contains("sessionStorage"));
         server.abort();
     }
 }
