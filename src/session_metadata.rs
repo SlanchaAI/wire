@@ -353,6 +353,30 @@ pub(crate) fn project_from_snapshot(
 }
 
 #[cfg(target_os = "macos")]
+fn apply_macos_lsof_output(observations: &mut HashMap<u32, ProcessObservation>, body: &[u8]) {
+    let mut current_pid = None;
+    let mut current_descriptor = None;
+    for line in String::from_utf8_lossy(body).lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            current_pid = value.parse::<u32>().ok();
+            current_descriptor = None;
+        } else if let (Some(pid), Some(executable)) = (current_pid, line.strip_prefix('c'))
+            && let Some(observation) = observations.get_mut(&pid)
+        {
+            observation.executable = executable.to_string();
+        } else if let Some(value) = line.strip_prefix('f') {
+            current_descriptor = Some(value);
+        } else if let (Some(pid), Some(path), Some(descriptor)) =
+            (current_pid, line.strip_prefix('n'), current_descriptor)
+            && let Some(observation) = observations.get_mut(&pid)
+            && descriptor == "cwd"
+        {
+            observation.cwd = Some(PathBuf::from(path));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
     if pids.is_empty() {
         return Ok(ProcessSnapshot::default());
@@ -374,36 +398,17 @@ fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
         let (Ok(pid), Ok(parent_pid)) = (pid.parse::<u32>(), parent_pid.parse::<u32>()) else {
             continue;
         };
+        let arguments: Vec<String> = fields.map(str::to_string).collect();
         all.insert(
             pid,
             ProcessObservation {
                 pid,
                 parent_pid: (parent_pid != 0).then_some(parent_pid),
                 executable: executable.to_string(),
-                arguments: fields.map(str::to_string).collect(),
+                arguments,
                 cwd: None,
             },
         );
-    }
-
-    let pid_list = pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut lsof = Command::new("lsof");
-    lsof.args(["-a", "-d", "cwd", "-p", &pid_list, "-Fn"]);
-    if let Some(output) = crate::platform::run_with_timeout(lsof, Duration::from_secs(5)) {
-        let mut current_pid = None;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some(value) = line.strip_prefix('p') {
-                current_pid = value.parse::<u32>().ok();
-            } else if let (Some(pid), Some(path)) = (current_pid, line.strip_prefix('n'))
-                && let Some(observation) = all.get_mut(&pid)
-            {
-                observation.cwd = Some(PathBuf::from(path));
-            }
-        }
     }
 
     let mut selected = HashMap::new();
@@ -417,6 +422,19 @@ fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
             current = observation.parent_pid;
             selected.entry(process_pid).or_insert(observation);
         }
+    }
+
+    let mut selected_pids: Vec<u32> = selected.keys().copied().collect();
+    selected_pids.sort_unstable();
+    let pid_list = selected_pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut lsof = Command::new("lsof");
+    lsof.args(["-a", "-d", "cwd", "-p", &pid_list, "-Fpcfn"]);
+    if let Some(output) = crate::platform::run_with_timeout(lsof, Duration::from_secs(5)) {
+        apply_macos_lsof_output(&mut selected, &output.stdout);
     }
     Ok(ProcessSnapshot {
         observations: selected,
@@ -759,6 +777,51 @@ mod tests {
         assert_eq!(harness.kind, "unknown");
         assert_eq!(harness.confidence, MetadataConfidence::Unknown);
         assert_eq!(harness.evidence, "unavailable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_snapshot_uses_untruncated_executable_path() {
+        let mut observations = HashMap::from([(
+            42,
+            process(
+                42,
+                None,
+                "/private/var/fol",
+                &[
+                    "/Applications/Goose Desktop.app/Contents/MacOS/goose",
+                    "serve",
+                ],
+            ),
+        )]);
+        apply_macos_lsof_output(
+            &mut observations,
+            b"p42\ncgoose\nfcwd\nn/Users/operator/Project With Spaces\n",
+        );
+        let snapshot = ProcessSnapshot { observations };
+        let harness = harness_from_snapshot(&snapshot, 42, "machine-default");
+
+        assert_eq!(harness.kind, "goose");
+        assert_eq!(harness.confidence, MetadataConfidence::Inferred);
+        assert_eq!(
+            snapshot.cwd(42).as_deref(),
+            Some(std::path::Path::new("/Users/operator/Project With Spaces"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_snapshot_rejects_spoofed_executable_path() {
+        let mut observations = HashMap::from([(
+            42,
+            process(42, None, "/private/var/fol", &["/tmp/goose", "30"]),
+        )]);
+        apply_macos_lsof_output(&mut observations, b"p42\ncsleep\n");
+        let snapshot = ProcessSnapshot { observations };
+        let harness = harness_from_snapshot(&snapshot, 42, "machine-default");
+
+        assert_eq!(harness.kind, "unknown");
+        assert_eq!(harness.confidence, MetadataConfidence::Unknown);
     }
 
     fn write(path: &std::path::Path, body: &str) {
