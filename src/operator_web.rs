@@ -355,6 +355,7 @@ mod tests {
         assert!(script.contains("aria-expanded"));
         assert!(script.contains("detail-row"));
         assert!(script.contains("Unknown"));
+        assert!(script.contains("PID ${known(session.pid)}"));
         server.abort();
     }
 }

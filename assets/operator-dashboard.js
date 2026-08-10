@@ -129,7 +129,7 @@
       identity.className = "session-identity";
       identity.append(handle);
       const uptime = document.createElement("small");
-      uptime.textContent = `${formatAge(session.age_seconds)} · PID ${session.pid}`;
+      uptime.textContent = `${formatAge(session.age_seconds)} · PID ${known(session.pid)}`;
       identity.append(uptime);
       name.append(emoji, identity);
       nameCell.append(name);

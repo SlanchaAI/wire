@@ -135,11 +135,22 @@ fn origin_remote(config: &std::path::Path) -> Option<String> {
                 continue;
             };
             if key.trim() == "url" {
-                return Some(value.trim().to_string());
+                return Some(sanitize_remote(value.trim()));
             }
         }
     }
     None
+}
+
+fn sanitize_remote(remote: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(remote) else {
+        return remote.to_string();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+    url.to_string()
 }
 
 fn repository_name(remote: Option<&str>, root: &std::path::Path) -> Option<String> {
@@ -414,6 +425,14 @@ fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
 
 #[cfg(target_os = "linux")]
 fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
+    capture_linux_process_snapshot_at(std::path::Path::new("/proc"), pids)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn capture_linux_process_snapshot_at(
+    proc_root: &std::path::Path,
+    pids: &[u32],
+) -> Result<ProcessSnapshot, String> {
     let mut observations = HashMap::new();
     for root_pid in pids {
         let mut current = Some(*root_pid);
@@ -422,9 +441,10 @@ fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
             if observations.contains_key(&pid) {
                 break;
             }
-            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-            let status = std::fs::read_to_string(proc_dir.join("status"))
-                .map_err(|error| format!("reading process {pid}: {error}"))?;
+            let proc_dir = proc_root.join(pid.to_string());
+            let Ok(status) = std::fs::read_to_string(proc_dir.join("status")) else {
+                break;
+            };
             let parent_pid = status
                 .lines()
                 .find_map(|line| line.strip_prefix("PPid:"))
@@ -673,7 +693,7 @@ mod tests {
     fn harness_prefers_explicit_source() {
         let ancestry = vec![
             process(20, Some(10), "wire", &["mcp"]),
-            process(10, None, "python", &[]),
+            process(10, None, "codex", &["resume"]),
         ];
         let harness = infer_harness("goose", &ancestry);
 
@@ -778,6 +798,30 @@ mod tests {
     }
 
     #[test]
+    fn project_remote_strips_url_credentials() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("credentialed");
+        fs::create_dir_all(&root).unwrap();
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(
+            &root.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://operator:secret-token@github.com/SlanchaAI/wire.git\n",
+        );
+
+        let project = describe_project(&root);
+
+        assert_eq!(
+            project.remote.as_deref(),
+            Some("https://github.com/SlanchaAI/wire.git")
+        );
+        assert!(
+            !serde_json::to_string(&project)
+                .unwrap()
+                .contains("secret-token")
+        );
+    }
+
+    #[test]
     fn project_discovers_linked_worktree() {
         let temp = tempdir().unwrap();
         let common = temp.path().join("repo/.git");
@@ -870,5 +914,24 @@ mod tests {
         assert!(snapshot.ancestry(42).is_empty());
         assert_eq!(snapshot.cwd(42), None);
         assert_eq!(infer_harness("machine-default", &[]).kind, "unknown");
+    }
+
+    #[test]
+    fn linux_process_snapshot_keeps_other_rows_when_one_ancestor_disappears() {
+        let temp = tempdir().unwrap();
+        for (pid, parent) in [(10, 999), (20, 0)] {
+            let process = temp.path().join(pid.to_string());
+            fs::create_dir_all(&process).unwrap();
+            write(
+                &process.join("status"),
+                &format!("Name:\ttest\nPPid:\t{parent}\n"),
+            );
+            write(&process.join("cmdline"), "wire\0mcp\0");
+        }
+
+        let snapshot = capture_linux_process_snapshot_at(temp.path(), &[10, 20]).unwrap();
+
+        assert_eq!(snapshot.ancestry(10).len(), 1);
+        assert_eq!(snapshot.ancestry(20).len(), 1);
     }
 }
