@@ -37,6 +37,7 @@ pub mod nostr_key;
 pub mod nostr_relay;
 pub mod nostr_ws;
 pub mod nuke;
+pub mod operator;
 pub mod org_bind;
 pub mod org_membership;
 pub mod org_policy;
