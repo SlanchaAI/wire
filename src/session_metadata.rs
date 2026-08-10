@@ -1,4 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -193,6 +197,264 @@ pub(crate) struct ProcessObservation {
     pub executable: String,
     pub arguments: Vec<String>,
     pub cwd: Option<PathBuf>,
+}
+
+pub(crate) const MAX_ANCESTORS: usize = 8;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProcessSnapshot {
+    observations: HashMap<u32, ProcessObservation>,
+}
+
+impl ProcessSnapshot {
+    fn from_observations(observations: Vec<ProcessObservation>) -> Self {
+        Self {
+            observations: observations
+                .into_iter()
+                .map(|observation| (observation.pid, observation))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn ancestry(&self, pid: u32) -> Vec<ProcessObservation> {
+        let mut rows = Vec::new();
+        let mut current = Some(pid);
+        while let Some(pid) = current {
+            if rows.len() == MAX_ANCESTORS {
+                break;
+            }
+            let Some(observation) = self.observations.get(&pid) else {
+                break;
+            };
+            rows.push(observation.clone());
+            current = observation.parent_pid.filter(|parent| *parent != pid);
+        }
+        rows
+    }
+
+    pub(crate) fn cwd(&self, pid: u32) -> Option<PathBuf> {
+        self.observations
+            .get(&pid)
+            .and_then(|observation| observation.cwd.clone())
+    }
+}
+
+#[derive(Default)]
+struct ProcessSnapshotCache {
+    pids: Vec<u32>,
+    snapshot: ProcessSnapshot,
+    initialized: bool,
+}
+
+impl ProcessSnapshotCache {
+    fn get_or_refresh(
+        &mut self,
+        pids: &[u32],
+        mut probe: impl FnMut(&[u32]) -> Result<ProcessSnapshot, String>,
+    ) -> ProcessSnapshot {
+        let mut key = pids.to_vec();
+        key.sort_unstable();
+        key.dedup();
+        if !self.initialized || self.pids != key {
+            self.snapshot = probe(&key).unwrap_or_default();
+            self.pids = key;
+            self.initialized = true;
+        }
+        self.snapshot.clone()
+    }
+}
+
+static PROCESS_SNAPSHOT_CACHE: OnceLock<Mutex<ProcessSnapshotCache>> = OnceLock::new();
+
+pub(crate) fn process_snapshot(pids: &[u32]) -> ProcessSnapshot {
+    PROCESS_SNAPSHOT_CACHE
+        .get_or_init(|| Mutex::new(ProcessSnapshotCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_refresh(pids, capture_process_snapshot)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
+    if pids.is_empty() {
+        return Ok(ProcessSnapshot::default());
+    }
+    let mut ps = Command::new("ps");
+    ps.args(["-axo", "pid=,ppid=,comm=,args="]);
+    let output = crate::platform::run_with_timeout(ps, Duration::from_secs(5))
+        .filter(|output| output.status.success())
+        .ok_or_else(|| "process table unavailable".to_string())?;
+    let body = String::from_utf8_lossy(&output.stdout);
+    let mut all = HashMap::new();
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(parent_pid), Some(executable)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(parent_pid)) = (pid.parse::<u32>(), parent_pid.parse::<u32>()) else {
+            continue;
+        };
+        all.insert(
+            pid,
+            ProcessObservation {
+                pid,
+                parent_pid: (parent_pid != 0).then_some(parent_pid),
+                executable: executable.to_string(),
+                arguments: fields.map(str::to_string).collect(),
+                cwd: None,
+            },
+        );
+    }
+
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut lsof = Command::new("lsof");
+    lsof.args(["-a", "-d", "cwd", "-p", &pid_list, "-Fn"]);
+    if let Some(output) = crate::platform::run_with_timeout(lsof, Duration::from_secs(5)) {
+        let mut current_pid = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(value) = line.strip_prefix('p') {
+                current_pid = value.parse::<u32>().ok();
+            } else if let (Some(pid), Some(path)) = (current_pid, line.strip_prefix('n'))
+                && let Some(observation) = all.get_mut(&pid)
+            {
+                observation.cwd = Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    let mut selected = HashMap::new();
+    for pid in pids {
+        let mut current = Some(*pid);
+        for _ in 0..MAX_ANCESTORS {
+            let Some(process_pid) = current else { break };
+            let Some(observation) = all.get(&process_pid).cloned() else {
+                break;
+            };
+            current = observation.parent_pid;
+            selected.entry(process_pid).or_insert(observation);
+        }
+    }
+    Ok(ProcessSnapshot {
+        observations: selected,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
+    let mut observations = HashMap::new();
+    for root_pid in pids {
+        let mut current = Some(*root_pid);
+        for depth in 0..MAX_ANCESTORS {
+            let Some(pid) = current else { break };
+            if observations.contains_key(&pid) {
+                break;
+            }
+            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+            let status = std::fs::read_to_string(proc_dir.join("status"))
+                .map_err(|error| format!("reading process {pid}: {error}"))?;
+            let parent_pid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:"))
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .filter(|value| *value != 0);
+            let executable = std::fs::read_link(proc_dir.join("exe"))
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|value| value.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let arguments = std::fs::read(proc_dir.join("cmdline"))
+                .unwrap_or_default()
+                .split(|byte| *byte == 0)
+                .filter(|value| !value.is_empty())
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .collect();
+            let cwd = (depth == 0)
+                .then(|| std::fs::read_link(proc_dir.join("cwd")).ok())
+                .flatten();
+            observations.insert(
+                pid,
+                ProcessObservation {
+                    pid,
+                    parent_pid,
+                    executable,
+                    arguments,
+                    cwd,
+                },
+            );
+            current = parent_pid;
+        }
+    }
+    Ok(ProcessSnapshot { observations })
+}
+
+#[cfg(windows)]
+fn capture_process_snapshot(pids: &[u32]) -> Result<ProcessSnapshot, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct WindowsProcess {
+        process_id: u32,
+        parent_process_id: u32,
+        executable_path: Option<String>,
+        command_line: Option<String>,
+    }
+
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress",
+    ]);
+    let output = crate::platform::run_with_timeout(command, Duration::from_secs(5))
+        .filter(|output| output.status.success())
+        .ok_or_else(|| "process table unavailable".to_string())?;
+    let mut rows: Vec<WindowsProcess> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("parsing process table: {error}"))?;
+    let all: HashMap<u32, WindowsProcess> =
+        rows.drain(..).map(|row| (row.process_id, row)).collect();
+    let mut observations = HashMap::new();
+    for root_pid in pids {
+        let mut current = Some(*root_pid);
+        for _ in 0..MAX_ANCESTORS {
+            let Some(pid) = current else { break };
+            let Some(row) = all.get(&pid) else { break };
+            let parent_pid = (row.parent_process_id != 0).then_some(row.parent_process_id);
+            observations.insert(
+                pid,
+                ProcessObservation {
+                    pid,
+                    parent_pid,
+                    executable: row
+                        .executable_path
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    arguments: row
+                        .command_line
+                        .as_deref()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect(),
+                    cwd: None,
+                },
+            );
+            current = parent_pid;
+        }
+    }
+    Ok(ProcessSnapshot { observations })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn capture_process_snapshot(_pids: &[u32]) -> Result<ProcessSnapshot, String> {
+    Ok(ProcessSnapshot::default())
 }
 
 fn harness(
@@ -508,5 +770,50 @@ mod tests {
         assert_eq!(unknown.cwd.as_deref(), plain.to_str());
         assert_eq!(unknown.name, None);
         assert_eq!(unknown.confidence, MetadataConfidence::Unknown);
+    }
+
+    #[test]
+    fn process_snapshot_cache_refreshes_only_when_pid_set_changes() {
+        let mut cache = ProcessSnapshotCache::default();
+        let probes = std::cell::Cell::new(0);
+        let mut probe = |pids: &[u32]| {
+            probes.set(probes.get() + 1);
+            Ok(ProcessSnapshot::from_observations(
+                pids.iter()
+                    .map(|pid| process(*pid, None, "wire", &["mcp"]))
+                    .collect(),
+            ))
+        };
+
+        cache.get_or_refresh(&[20, 10, 20], &mut probe);
+        cache.get_or_refresh(&[10, 20], &mut probe);
+        assert_eq!(probes.get(), 1);
+
+        cache.get_or_refresh(&[10, 30], &mut probe);
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn process_ancestry_is_bounded() {
+        let observations = (1..=20)
+            .map(|pid| process(pid, (pid > 1).then_some(pid - 1), "parent", &[]))
+            .collect();
+        let snapshot = ProcessSnapshot::from_observations(observations);
+
+        let ancestry = snapshot.ancestry(20);
+
+        assert_eq!(ancestry.len(), MAX_ANCESTORS);
+        assert_eq!(ancestry.first().map(|row| row.pid), Some(20));
+        assert_eq!(ancestry.last().map(|row| row.pid), Some(13));
+    }
+
+    #[test]
+    fn process_probe_failure_fails_open() {
+        let mut cache = ProcessSnapshotCache::default();
+        let snapshot = cache.get_or_refresh(&[42], |_| Err("probe failed".to_string()));
+
+        assert!(snapshot.ancestry(42).is_empty());
+        assert_eq!(snapshot.cwd(42), None);
+        assert_eq!(infer_harness("machine-default", &[]).kind, "unknown");
     }
 }
