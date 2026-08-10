@@ -341,6 +341,65 @@ pub fn collect_live_sessions() -> anyhow::Result<LiveSessionReport> {
     )
 }
 
+#[derive(Clone)]
+enum LiveRuntime {
+    Mcp(Box<crate::session_lifecycle::LeaseRecord>),
+    Daemon(crate::ensure_up::DaemonPid),
+}
+
+impl LiveRuntime {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Mcp(lease) => lease.pid,
+            Self::Daemon(record) => record.pid,
+        }
+    }
+
+    fn started_at(&self) -> Option<&str> {
+        match self {
+            Self::Mcp(lease) => lease.started_at.as_deref(),
+            Self::Daemon(record) => Some(&record.started_at),
+        }
+    }
+}
+
+fn daemon_record(home: &Path) -> Option<crate::ensure_up::DaemonPid> {
+    let body = std::fs::read(home.join("state/wire/daemon.pid")).ok()?;
+    let record: crate::ensure_up::DaemonPid = serde_json::from_slice(&body).ok()?;
+    (record.schema == crate::ensure_up::DAEMON_PID_SCHEMA).then_some(record)
+}
+
+fn daemon_identity(home: &Path) -> crate::session_metadata::IdentityDescriptor {
+    let session_keyed = home
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("by-key");
+    crate::session_metadata::IdentityDescriptor {
+        source: if session_keyed {
+            "wire-session".to_string()
+        } else {
+            "registry".to_string()
+        },
+        class: if session_keyed {
+            "session-keyed".to_string()
+        } else {
+            "registry-fallback".to_string()
+        },
+        warning: None,
+    }
+}
+
+fn daemon_harness() -> crate::session_metadata::HarnessDescriptor {
+    crate::session_metadata::HarnessDescriptor {
+        kind: "wire-daemon".to_string(),
+        label: "Wire daemon".to_string(),
+        mode: Some("background".to_string()),
+        confidence: crate::session_metadata::MetadataConfidence::Explicit,
+        evidence: "daemon-pidfile".to_string(),
+    }
+}
+
 fn collect_live_from(
     sessions: &[crate::session::SessionInfo],
     now: OffsetDateTime,
@@ -355,23 +414,37 @@ fn collect_live_from(
             continue;
         }
         let leases = crate::session_lifecycle::active_leases_at(&session.home_dir, now, is_alive);
-        let Some(lease) = leases
+        let lease = leases
             .iter()
             .filter(|lease| lease.role == "mcp")
             .max_by(|left, right| left.heartbeat_at.cmp(&right.heartbeat_at))
-        else {
+            .cloned();
+        let runtime = if let Some(lease) = lease {
+            LiveRuntime::Mcp(Box::new(lease))
+        } else if session.daemon_running {
+            let Some(record) = daemon_record(&session.home_dir).filter(|record| {
+                is_alive(record.pid)
+                    && record
+                        .did
+                        .as_deref()
+                        .is_none_or(|did| session.did.as_deref() == Some(did))
+            }) else {
+                continue;
+            };
+            LiveRuntime::Daemon(record)
+        } else {
             continue;
         };
-        candidates.push((session, lease.clone()));
+        candidates.push((session, runtime));
     }
     let snapshot = crate::session_metadata::process_snapshot(
         &candidates
             .iter()
-            .map(|(_, lease)| lease.pid)
+            .map(|(_, runtime)| runtime.pid())
             .collect::<Vec<_>>(),
     );
     let mut live = Vec::new();
-    for (session, lease) in candidates {
+    for (session, runtime) in candidates {
         let did = session.did.as_deref().expect("candidate DID");
         let handle = session.handle.as_deref().expect("candidate handle");
         let character = session
@@ -379,7 +452,7 @@ fn collect_live_from(
             .clone()
             .unwrap_or_else(|| crate::character::Character::from_did(did));
         let peers = crate::dash::read_peers(&session.home_dir, Some(did), Some(handle));
-        let age_seconds = lease.started_at.as_deref().and_then(|started| {
+        let age_seconds = runtime.started_at().and_then(|started| {
             OffsetDateTime::parse(started, &time::format_description::well_known::Rfc3339)
                 .ok()
                 .and_then(|started| {
@@ -394,50 +467,75 @@ fn collect_live_from(
         } else {
             "healthy"
         };
-        let harness = lease
-            .harness
-            .clone()
-            .filter(|value| {
-                value.confidence != crate::session_metadata::MetadataConfidence::Unknown
-            })
-            .unwrap_or_else(|| {
-                crate::session_metadata::harness_from_snapshot(
-                    &snapshot,
-                    lease.pid,
-                    &lease.session_source,
+        let (harness, identity, project, machine) = match &runtime {
+            LiveRuntime::Mcp(lease) => {
+                let harness = lease
+                    .harness
+                    .clone()
+                    .filter(|value| {
+                        value.confidence != crate::session_metadata::MetadataConfidence::Unknown
+                    })
+                    .unwrap_or_else(|| {
+                        crate::session_metadata::harness_from_snapshot(
+                            &snapshot,
+                            lease.pid,
+                            &lease.session_source,
+                        )
+                    });
+                let project = lease
+                    .project
+                    .clone()
+                    .filter(|value| {
+                        value.confidence != crate::session_metadata::MetadataConfidence::Unknown
+                    })
+                    .unwrap_or_else(|| {
+                        lease
+                            .cwd
+                            .as_deref()
+                            .or(session.cwd.as_deref())
+                            .map(Path::new)
+                            .map(crate::session_metadata::describe_project)
+                            .unwrap_or_else(|| {
+                                crate::session_metadata::project_from_snapshot(
+                                    &snapshot, lease.pid, None,
+                                )
+                            })
+                    });
+                (
+                    harness,
+                    crate::session_metadata::identity_descriptor(&lease.session_source),
+                    project,
+                    lease.machine.clone().unwrap_or_else(|| {
+                        crate::session_metadata::machine_descriptor(&lease.wire_version)
+                    }),
                 )
-            });
-        let project = lease
-            .project
-            .clone()
-            .filter(|value| {
-                value.confidence != crate::session_metadata::MetadataConfidence::Unknown
-            })
-            .unwrap_or_else(|| {
-                lease
+            }
+            LiveRuntime::Daemon(record) => (
+                daemon_harness(),
+                daemon_identity(&session.home_dir),
+                session
                     .cwd
                     .as_deref()
-                    .or(session.cwd.as_deref())
                     .map(Path::new)
                     .map(crate::session_metadata::describe_project)
                     .unwrap_or_else(|| {
-                        crate::session_metadata::project_from_snapshot(&snapshot, lease.pid, None)
-                    })
-            });
+                        crate::session_metadata::project_from_snapshot(&snapshot, record.pid, None)
+                    }),
+                crate::session_metadata::machine_descriptor(&record.version),
+            ),
+        };
         live.push(LiveSession {
             id: session.name.clone(),
             handle: handle.to_string(),
             did: did.to_string(),
             emoji: character.emoji,
             primary_hex: character.palette.primary_hex,
-            pid: lease.pid,
-            machine: lease.machine.clone().unwrap_or_else(|| {
-                crate::session_metadata::machine_descriptor(&lease.wire_version)
-            }),
+            pid: runtime.pid(),
+            machine,
             harness,
-            identity: crate::session_metadata::identity_descriptor(&lease.session_source),
+            identity,
             project,
-            started_at: lease.started_at.clone(),
+            started_at: runtime.started_at().map(str::to_string),
             age_seconds,
             direct_link_count: peers.len(),
             health: health.to_string(),
@@ -513,21 +611,49 @@ mod tests {
         .unwrap();
     }
 
+    fn daemon_pidfile(home: &Path, pid: u32, did: &str, now: OffsetDateTime) {
+        let state = home.join("state/wire");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("daemon.pid"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "wire-daemon-pid-v1",
+                "pid": pid,
+                "bin_path": "/opt/wire",
+                "version": "0.17.0",
+                "started_at": now
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+                "did": did,
+                "relay_url": "https://wireup.net"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn inventory_includes_only_live_mcp_sessions() {
+    fn inventory_includes_live_mcp_and_daemon_sessions_only() {
         let tmp = tempdir().unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let live_home = tmp.path().join("live");
-        let daemon_home = tmp.path().join("daemon-only");
+        let daemon_home = tmp.path().join("sessions/by-key/daemon-only");
         let expired_home = tmp.path().join("expired");
         let retired_home = tmp.path().join("retired");
         let dead_home = tmp.path().join("dead");
+        let mismatched_home = tmp.path().join("sessions/by-key/mismatched");
 
         lease(&live_home, "mcp", 101, now, 90);
-        lease(&daemon_home, "daemon", 102, now, 90);
+        daemon_pidfile(&daemon_home, 102, "did:wire:session-22222222", now);
         lease(&expired_home, "mcp", 103, now, 1);
         lease(&retired_home, "mcp", 104, now, 90);
         lease(&dead_home, "mcp", 105, now, 90);
+        daemon_pidfile(
+            &mismatched_home,
+            106,
+            "did:wire:other-session-99999999",
+            now,
+        );
         std::fs::create_dir_all(retired_home.join("state/wire")).unwrap();
         std::fs::write(retired_home.join("state/wire/retired.json"), "{}").unwrap();
 
@@ -537,28 +663,38 @@ mod tests {
             session(&expired_home, "33333333", true),
             session(&retired_home, "44444444", true),
             session(&dead_home, "55555555", true),
+            session(&mismatched_home, "66666666", true),
         ];
         let report = collect_live_from(&sessions, now + time::Duration::seconds(2), |pid| {
-            matches!(pid, 101..=104)
+            matches!(pid, 101..=104 | 106)
         })
         .unwrap();
 
         assert_eq!(report.schema, "wire-live-sessions-v2");
-        assert_eq!(report.sessions.len(), 1);
-        assert_eq!(report.sessions[0].id, "session-11111111");
-        assert_eq!(report.sessions[0].harness.kind, "codex-cli");
-        assert_eq!(report.sessions[0].identity.source, "codex-cli");
-        assert_eq!(report.sessions[0].identity.class, "session-keyed");
-        assert_eq!(
-            report.sessions[0].project.cwd.as_deref(),
-            Some("/work/wire")
-        );
-        assert_eq!(report.sessions[0].machine.wire_version, "0.17.0");
-        assert_eq!(report.sessions[0].pid, 101);
-        assert_eq!(
-            report.sessions[0].started_at.as_deref(),
-            Some("2023-11-14T22:13:20Z")
-        );
+        assert_eq!(report.sessions.len(), 2);
+        let mcp = report
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-11111111")
+            .unwrap();
+        assert_eq!(mcp.harness.kind, "codex-cli");
+        assert_eq!(mcp.identity.source, "codex-cli");
+        assert_eq!(mcp.identity.class, "session-keyed");
+        assert_eq!(mcp.project.cwd.as_deref(), Some("/work/wire"));
+        assert_eq!(mcp.machine.wire_version, "0.17.0");
+        assert_eq!(mcp.pid, 101);
+        assert_eq!(mcp.started_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+
+        let daemon = report
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-22222222")
+            .unwrap();
+        assert_eq!(daemon.pid, 102);
+        assert_eq!(daemon.harness.kind, "wire-daemon");
+        assert_eq!(daemon.identity.source, "wire-session");
+        assert_eq!(daemon.identity.class, "session-keyed");
+        assert_eq!(daemon.started_at.as_deref(), Some("2023-11-14T22:13:20Z"));
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("AGENT_SESSION_ID"));

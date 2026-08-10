@@ -61,6 +61,27 @@ Repair local Wire identity/daemon ambiguity and ship a one-machine operator dash
 - Deferred by AMANALAP: cache TTL, Git config includes/exotic remotes, transient hostname retries, macOS command paths with spaces, zebra-striping polish, and duplicate-Unknown copy.
 - Deferred: storage abstraction, cookie redemption, history/retirement, remote machines, extra browser scenarios.
 
+## macOS harness detector repair
+
+- Observed defect: 12 Goose sessions and two Claude Desktop sessions rendered as `Unknown` although their live parent chains reached `Goose.app` or `Claude.app`.
+- Root cause: macOS `ps -o comm` truncated executable paths to 16 characters (`/private/var/fol`, `/Applications/Cl`).
+- RED: the long-path detector regression classified the test process as its Codex parent instead of Goose; the spoof regression accepted a fake `/tmp/goose` argv path.
+- Fix: retain the bounded `ps` ancestry snapshot, then enrich each selected process from the kernel command-name `c` field in the existing bounded `lsof` cwd probe. Never classify from argv.
+- GREEN: both macOS parser regressions pass; arbitrary argument mentions still remain unknown; `cargo fmt --check`, Clippy with warnings denied, and 681 library tests pass with one expected ignore.
+- Review cycle 1 kept and fixed the argv spoofing blocker and path-with-spaces concern.
+- Review cycle 2 kept and removed the unverified first-`txt` ordering and high-volume mapped-image scan by using `lsof`'s command field instead.
+- Final review findings cut/deferred: `+c 0` is unnecessary for every supported command (`codex`, `Claude`, `goose`, `Cursor`, `Code`); fail-open diagnostics and generic future descriptor hardening do not affect the observed defect.
+
+## Live daemon-only sessions
+
+- Observed defect: `rusted-butte` was initialized by bare `wire up` and had a live daemon, but the board omitted it because inventory required an MCP lease.
+- RED: inventory fixture expected one MCP-backed and one daemon-only row but received only the MCP row.
+- Fix: when no active MCP lease exists, accept an initialized, non-retired session whose versioned daemon pidfile names a live PID and does not contradict the home DID. MCP remains the preferred runtime, preventing duplicate rows.
+- Daemon-only rows use the daemon pid/start/version, live process cwd for project discovery, `Wire daemon` as the observed runtime, and by-key versus registry identity provenance.
+- DID guard mutation check: removing the mismatch filter changed the expected two rows to three; restoring it returned green.
+- Review disposition: cut the alleged missing-DID panic because the existing initialized-session gate proves DID and handle before candidate creation; kept and tested DID mismatch rejection; deferred legacy pidfiles with no DID and registry-label coverage.
+- Full `cargo test --all-targets --all-features`: exit 0 after the daemon inventory change.
+
 ## Recovery note
 
 A browser race probe accidentally ran an older debug binary and linked `agate-starshine` to the `bubbling-kelp` session at `.../9583f4349f98ddea`. The exact bilateral pins were removed immediately with `wire forget-peer` on both homes; verification showed only each session's self-attestation remained. No files were purged.
