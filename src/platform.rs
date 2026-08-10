@@ -118,7 +118,7 @@ fn kill_pid_best_effort(pid: u32) {
 /// True iff pid is alive.
 ///
 /// - Linux: `/proc/<pid>` exists (no fork, no shell-out).
-/// - macOS / BSD: `kill -0 <pid>` (signal 0 = check only).
+/// - macOS / BSD: `kill(2)` with signal 0 (check only, no subprocess).
 /// - Windows: `tasklist /FI "PID eq <pid>" /FO CSV /NH`. A miss prints
 ///   `INFO: No tasks are running...` to stdout AND exits 0, so we
 ///   detect by content rather than exit code.
@@ -129,14 +129,17 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        // SAFETY: signal 0 never delivers a signal; it only asks the kernel
+        // whether the process exists and is visible to this user.
+        let result = unsafe { kill(pid, 0) };
+        result == 0
+            || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
     }
     #[cfg(windows)]
     {
@@ -619,6 +622,19 @@ mod tests {
         assert!(
             !process_alive(dead),
             "process_alive should return false for synthetic dead pid {dead}"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn repeated_process_liveness_checks_stay_in_process() {
+        let started = std::time::Instant::now();
+        for _ in 0..512 {
+            assert!(process_alive(std::process::id()));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "512 liveness checks must not fork one subprocess per PID"
         );
     }
 

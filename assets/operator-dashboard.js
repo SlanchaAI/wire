@@ -7,7 +7,7 @@
   const token = queryToken || window.sessionStorage.getItem("wire-launch-token") || "";
   window.history.replaceState({}, "", window.location.pathname);
 
-  const state = { sessions: [], selected: new Set(), expanded: new Set(), confirmedPair: [], busy: false };
+  const state = { sessions: [], selected: new Set(), expanded: new Set(), confirmedPair: [], busy: false, scanPromise: null };
   const rows = document.querySelector("#session-rows");
   const tableWrap = document.querySelector("#table-wrap");
   const loading = document.querySelector("#loading");
@@ -222,20 +222,24 @@
     updateActions();
   };
 
-  const scan = async () => {
-    try {
-      const response = await fetch("/api/sessions", {
-        cache: "no-store",
-        headers: { "X-Wire-Token": token }
-      });
-      if (!response.ok) throw new Error("Could not read live sessions.");
-      const report = await response.json();
-      state.sessions = Array.isArray(report.sessions) ? report.sessions : [];
-      render();
-    } catch (error) {
-      loading.hidden = true;
-      showNotice(error.message || "Session scan failed.", "error");
-    }
+  const scan = () => {
+    if (state.scanPromise) return state.scanPromise;
+    state.scanPromise = (async () => {
+      try {
+        const response = await fetch("/api/sessions", {
+          cache: "no-store",
+          headers: { "X-Wire-Token": token }
+        });
+        if (!response.ok) throw new Error("Could not read live sessions.");
+        const report = await response.json();
+        state.sessions = Array.isArray(report.sessions) ? report.sessions : [];
+        render();
+      } catch (error) {
+        loading.hidden = true;
+        showNotice(error.message || "Session scan failed.", "error");
+      }
+    })().finally(() => { state.scanPromise = null; });
+    return state.scanPromise;
   };
 
   const mutate = async (path, body) => {

@@ -97,6 +97,16 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - Installed caller proof: launchd supervisor PID `20898` spawned workers including `agate-starshine` PID `25241`; their pidfiles contain `supervisor_managed: true`. Operator-started `rusted-butte` PID `32746` omits the marker and remained healthy through repeated supervisor polls.
 - Chrome proof: refreshed the existing dashboard tab, found exactly one `rusted-butte` row, and left it visibly centered with `Wire daemon`, project `wire`, and `HEALTHY` status.
 
+## Dashboard responsiveness repair
+
+- Observed defect: `/api/sessions` took 14–25 seconds while the browser requested another scan every two seconds; link confirmation waited behind the same inventory backlog.
+- Root cause: this machine has 3,003 historical session homes and 1,739 daemon pidfiles. macOS liveness forked `/bin/kill -0` once per pidfile, so each inventory created roughly 1,739 subprocesses. Concurrent polling multiplied the scan.
+- RED/GREEN: 512 self-PID checks took 3.51 seconds and failed the one-second regression ceiling before the fix; the same test took 0.01 seconds after the fix. `wire session list --json` fell from 21.36 seconds to 1.01 seconds.
+- Fix: macOS/BSD liveness now invokes `kill(2)` with signal zero in-process and treats permission-denied as proof the PID exists. The browser coalesces poll ticks behind one shared scan promise, so mutation refreshes and interval ticks cannot overlap inventory requests.
+- Review cycle 1 kept and added proof that polling resumes after a completed scan. AMANALAP deferred an unobserved never-settling fetch timeout and timing-test hardening; it cut an errno-comment polish item.
+- Live caller: `GET /api/sessions` and link/group validation call `collect_live_sessions`; the dashboard JavaScript owns the two-second refresh cadence.
+- Persistent Wire monitor: `rusted-butte` monitor session remained armed throughout the repair.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.
@@ -104,6 +114,7 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - `src/session_metadata.rs` — provenance descriptors, Git discovery, identity classification, and bounded process snapshots.
 - `assets/operator-dashboard.{html,css,js}` — operator interface.
 - `tests/e2e_operator_dashboard.rs` — installed caller-path topology proof.
+- `tests/operator_dashboard_polling.test.mjs` — browser polling single-flight regression.
 - `docs/superpowers/specs/2026-08-10-operator-dashboard-design.md` — approved product and architecture boundary.
 - `docs/superpowers/specs/2026-08-10-fleet-session-provenance-design.md` — approved local metadata and future fleet boundary.
 - `docs/superpowers/plans/2026-08-10-fleet-session-provenance.md` — linted execution plan.
