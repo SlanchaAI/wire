@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Wire operator</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <main class="console-shell">
+    <header class="console-header">
+      <div>
+        <p class="eyebrow">Open Band / local operator</p>
+        <h1>Wire operator</h1>
+        <p class="lede">Tune the live sessions on this machine. Link two directly or open one shared room.</p>
+      </div>
+      <div class="machine-stamp" aria-label="Access scope">
+        <span class="machine-stamp__light" aria-hidden="true"></span>
+        <span>Loopback only</span>
+        <strong>This machine</strong>
+      </div>
+    </header>
+
+    <section class="band-scope" aria-labelledby="scope-title">
+      <div class="band-scope__readout">
+        <span id="scope-title">Live carrier</span>
+        <strong id="live-count">—</strong>
+        <small>agent sessions</small>
+      </div>
+      <div class="band-scope__line" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p id="last-scan">Waiting for first scan</p>
+    </section>
+
+    <section class="operations" aria-labelledby="operations-title">
+      <div class="operations__heading">
+        <div>
+          <p class="eyebrow">Operations list</p>
+          <h2 id="operations-title">Live sessions</h2>
+        </div>
+        <div class="selection-readout" aria-live="polite">
+          <strong id="selection-count">0</strong>
+          <span>selected</span>
+        </div>
+      </div>
+
+      <div class="action-strip" aria-label="Topology actions">
+        <button class="button button--primary" id="link-button" type="button" disabled>Link selected</button>
+        <button class="button button--secondary" id="group-button" type="button" disabled>Create group</button>
+        <p class="action-hint" id="action-hint">Select two sessions to link them.</p>
+      </div>
+
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="loading" class="loading-state" role="status">Scanning local session leases…</div>
+      <div id="empty" class="empty-state" hidden>
+        <strong>No live agent sessions</strong>
+        <p>Start a Codex, Claude, or Goose session with Wire enabled. It will appear on the next scan.</p>
+      </div>
+
+      <div class="session-table-wrap" id="table-wrap" hidden>
+        <table class="session-table">
+          <thead>
+            <tr>
+              <th scope="col"><span class="sr-only">Select</span></th>
+              <th scope="col">Session</th>
+              <th scope="col">Agent</th>
+              <th scope="col">Project</th>
+              <th scope="col">Uptime</th>
+              <th scope="col">Links</th>
+              <th scope="col">Signal</th>
+            </tr>
+          </thead>
+          <tbody id="session-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="console-footer">
+      <span>Reads active MCP leases only</span>
+      <span>Retired and historical identities stay off-band</span>
+    </footer>
+  </main>
+
+  <dialog id="confirm-dialog" class="wire-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <p class="eyebrow">Direct local trust</p>
+      <h2 id="confirm-title">Link these sessions?</h2>
+      <p id="confirm-copy"></p>
+      <div class="dialog-actions">
+        <button class="button button--quiet" value="cancel">Cancel</button>
+        <button class="button button--primary" id="confirm-link" value="default">Link sessions</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="group-dialog" class="wire-dialog" aria-labelledby="group-title">
+    <form method="dialog" id="group-form">
+      <p class="eyebrow">Shared room</p>
+      <h2 id="group-title">Create group</h2>
+      <p>Every selected session joins one room. This does not create a full mesh.</p>
+      <label for="group-name">Group name</label>
+      <input id="group-name" name="group-name" maxlength="80" autocomplete="off" required>
+      <label for="group-creator">Creator</label>
+      <select id="group-creator" name="group-creator" required></select>
+      <div class="dialog-actions">
+        <button class="button button--quiet" value="cancel">Cancel</button>
+        <button class="button button--secondary" id="confirm-group" value="default">Create group</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

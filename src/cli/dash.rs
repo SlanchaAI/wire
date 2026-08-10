@@ -38,6 +38,8 @@ fn emit(text: &str) {
 
 /// Parsed `wire dash` flags.
 pub struct DashArgs {
+    pub web: bool,
+    pub no_open: bool,
     pub watch: bool,
     pub json: bool,
     pub all: bool,
@@ -76,6 +78,11 @@ fn split_banner(color: bool) -> String {
 }
 
 pub fn cmd_dash(args: DashArgs) -> Result<()> {
+    if args.web {
+        return crate::operator_web::serve(crate::operator_web::ServeOptions {
+            open_browser: !args.no_open,
+        });
+    }
     if args.retire_idle {
         return cmd_retire_idle(
             args.older_than.unwrap_or(7),
