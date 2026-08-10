@@ -5,7 +5,7 @@
   const token = query.get("token") || "";
   window.history.replaceState({}, "", window.location.pathname);
 
-  const state = { sessions: [], selected: new Set(), busy: false };
+  const state = { sessions: [], selected: new Set(), confirmedPair: [], busy: false };
   const rows = document.querySelector("#session-rows");
   const tableWrap = document.querySelector("#table-wrap");
   const loading = document.querySelector("#loading");
@@ -131,7 +131,10 @@
 
   const scan = async () => {
     try {
-      const response = await fetch("/api/sessions", { cache: "no-store" });
+      const response = await fetch("/api/sessions", {
+        cache: "no-store",
+        headers: { "X-Wire-Token": token }
+      });
       if (!response.ok) throw new Error("Could not read live sessions.");
       const report = await response.json();
       state.sessions = Array.isArray(report.sessions) ? report.sessions : [];
@@ -167,14 +170,22 @@
   linkButton.addEventListener("click", () => {
     const selected = selectedSessions();
     if (selected.length !== 2) return;
+    state.confirmedPair = selected.map((session) => session.id);
     confirmCopy.textContent = `${selected[0].handle} and ${selected[1].handle} will trust each other on this machine.`;
     confirmDialog.showModal();
   });
 
   confirmLink.addEventListener("click", (event) => {
     event.preventDefault();
-    const sessions = selectedSessions().map((session) => session.id);
+    const liveIds = new Set(state.sessions.map((session) => session.id));
+    const sessions = [...state.confirmedPair];
     confirmDialog.close();
+    if (sessions.length !== 2 || sessions.some((id) => !liveIds.has(id))) {
+      showNotice("One of those sessions is no longer live. Select the pair again.", "error");
+      state.confirmedPair = [];
+      return;
+    }
+    state.confirmedPair = [];
     void mutate("/api/links", { sessions });
   });
 

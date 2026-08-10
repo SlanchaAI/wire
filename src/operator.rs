@@ -174,11 +174,15 @@ fn has_verified_peer(
         owner.handle.as_deref(),
     )
     .iter()
-    .any(|row| {
-        row.tier == "VERIFIED"
-            && (peer.did.as_deref() == Some(row.did.as_str())
-                || peer.handle.as_deref() == Some(row.handle.as_str()))
-    })
+    .any(|row| row.tier == "VERIFIED" && peer_row_matches(row, peer))
+}
+
+fn peer_row_matches(row: &crate::dash::PeerRow, peer: &crate::session::SessionInfo) -> bool {
+    if row.did.is_empty() {
+        peer.handle.as_deref() == Some(row.handle.as_str())
+    } else {
+        peer.did.as_deref() == Some(row.did.as_str())
+    }
 }
 
 fn bilateral_verified(
@@ -519,6 +523,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, OperatorError::Conflict(_)));
+    }
+
+    #[test]
+    fn verified_peer_match_never_overrides_a_mismatched_did_with_handle() {
+        let peer = crate::session::SessionInfo {
+            name: "same-handle".to_string(),
+            cwd: None,
+            home_dir: Path::new("/tmp/same-handle").to_path_buf(),
+            did: Some("did:wire:same-handle-11111111".to_string()),
+            handle: Some("same-handle".to_string()),
+            daemon_running: true,
+            character: None,
+        };
+        let row = crate::dash::PeerRow {
+            handle: peer.handle.clone().unwrap(),
+            did: "did:wire:different-peer-22222222".to_string(),
+            tier: "VERIFIED".to_string(),
+        };
+
+        assert!(!peer_row_matches(&row, &peer));
+
+        let legacy_row = crate::dash::PeerRow {
+            did: String::new(),
+            ..row
+        };
+        assert!(peer_row_matches(&legacy_row, &peer));
     }
 
     #[test]

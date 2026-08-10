@@ -48,7 +48,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 }
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
@@ -105,10 +105,27 @@ async fn security_headers(mut response: Response) -> Response {
 }
 
 fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
-    headers
+    let token_matches = headers
         .get("X-Wire-Token")
         .and_then(|value| value.to_str().ok())
-        == Some(state.token.as_str())
+        == Some(state.token.as_str());
+    token_matches && local_browser_request(headers)
+}
+
+fn local_browser_request(headers: &HeaderMap) -> bool {
+    let Some(authority) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Ok(host_url) = reqwest::Url::parse(&format!("http://{authority}")) else {
+        return false;
+    };
+    if !matches!(host_url.host_str(), Some("127.0.0.1" | "localhost")) {
+        return false;
+    }
+    headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|origin| origin.trim_end_matches('/') == format!("http://{authority}"))
 }
 
 fn error_response(status: StatusCode, message: &str, changed_sessions: Vec<String>) -> Response {
@@ -146,7 +163,10 @@ fn operator_error(error: crate::operator::OperatorError) -> Response {
     }
 }
 
-async fn get_sessions() -> Response {
+async fn get_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &state) {
+        return error_response(StatusCode::FORBIDDEN, "invalid launch token", Vec::new());
+    }
     match tokio::task::spawn_blocking(crate::operator::collect_live_sessions).await {
         Ok(Ok(report)) => Json(report).into_response(),
         _ => error_response(
@@ -254,7 +274,35 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(sessions.status(), StatusCode::FORBIDDEN);
+
+        let sessions = client
+            .get(format!("http://{address}/api/sessions"))
+            .header("X-Wire-Token", "test-token")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(sessions.status(), StatusCode::OK);
+
+        let rebound = client
+            .post(&links)
+            .header("Host", "attacker.example")
+            .header("X-Wire-Token", "test-token")
+            .json(&serde_json::json!({"sessions":["alice","bob"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), StatusCode::FORBIDDEN);
+
+        let cross_origin = client
+            .post(&links)
+            .header("Origin", "https://attacker.example")
+            .header("X-Wire-Token", "test-token")
+            .json(&serde_json::json!({"sessions":["alice","bob"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
         server.abort();
     }
 

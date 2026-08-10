@@ -123,6 +123,7 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
 
     let report: Value = client
         .get(format!("{origin}/api/sessions"))
+        .header("X-Wire-Token", &token)
         .send()
         .await
         .unwrap()
