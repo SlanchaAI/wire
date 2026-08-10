@@ -209,7 +209,7 @@ h2 { font-size: clamp(1.65rem, 3vw, 2.3rem); letter-spacing: -0.025em; }
 .signal::before { width: 9px; height: 9px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent); content: ""; }
 .signal--healthy { color: var(--dial-dark); }
 .signal--sync-stale, .signal--daemon-down { color: var(--danger); }
-.details-button { padding: 5px 8px; border: 1px solid var(--frame); color: var(--frame); background: transparent; font-family: var(--utility); font-size: 0.68rem; font-weight: 800; cursor: pointer; }
+.details-button { align-self: flex-start; margin-top: 3px; padding: 2px 5px; border: 1px solid var(--frame); color: var(--frame); background: transparent; font-family: var(--utility); font-size: 0.58rem; font-weight: 800; cursor: pointer; }
 .detail-row > td { padding: 20px 22px; }
 .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px 30px; }
 .detail-grid h3 { margin: 0 0 9px; color: var(--frame); font-family: var(--utility); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; }

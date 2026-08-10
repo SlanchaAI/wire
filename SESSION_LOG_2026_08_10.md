@@ -42,6 +42,7 @@ Repair local Wire identity/daemon ambiguity and ship a one-machine operator dash
 - Installed identity probes: schema v3.2, distinct `codex-cli` and `goose` session sources and session-keyed homes.
 - Installed dashboard API and security headers exercised on loopback.
 - Provenance Playwright proof: 35 live rows; Codex, Claude, machine-default warnings, repository/branch data, expanded details, selection persistence, desktop and 390 px mobile, no horizontal overflow, zero console errors, zero bad responses.
+- Installed 1440 px proof found and fixed 78 px of table overflow: moving Inspect into the Session cell reduced `scrollWidth` from 1172 to the 1094 px frame width; expanding details leaves `scrollLeft: 0`.
 
 ## Daemon repair
 

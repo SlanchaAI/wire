@@ -333,7 +333,7 @@ mod tests {
         assert!(html.contains("Link selected"));
         assert!(html.contains("Create group"));
         assert!(html.contains("aria-labelledby=\"group-title\""));
-        for heading in ["Harness", "Project", "Machine", "Identity", "Details"] {
+        for heading in ["Harness", "Project", "Machine", "Identity"] {
             assert!(
                 html.contains(heading),
                 "missing dashboard heading {heading}"
@@ -353,6 +353,7 @@ mod tests {
         assert!(!script.contains("innerHTML"));
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("aria-expanded"));
+        assert!(script.contains("details-button"));
         assert!(script.contains("detail-row"));
         assert!(script.contains("Unknown"));
         assert!(script.contains("PID ${known(session.pid)}"));

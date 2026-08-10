@@ -130,7 +130,20 @@
       identity.append(handle);
       const uptime = document.createElement("small");
       uptime.textContent = `${formatAge(session.age_seconds)} · PID ${known(session.pid)}`;
-      identity.append(uptime);
+      const detailsButton = document.createElement("button");
+      const expanded = state.expanded.has(session.id);
+      const detailId = `details-${session.id}`;
+      detailsButton.type = "button";
+      detailsButton.className = "details-button";
+      detailsButton.textContent = expanded ? "Hide details" : "Inspect details";
+      detailsButton.setAttribute("aria-expanded", String(expanded));
+      detailsButton.setAttribute("aria-controls", detailId);
+      detailsButton.addEventListener("click", () => {
+        if (state.expanded.has(session.id)) state.expanded.delete(session.id);
+        else state.expanded.add(session.id);
+        render();
+      });
+      identity.append(uptime, detailsButton);
       name.append(emoji, identity);
       nameCell.append(name);
 
@@ -152,23 +165,7 @@
       signal.textContent = session.health.replaceAll("-", " ");
       health.append(signal);
 
-      const detailsCell = cell("Details");
-      const detailsButton = document.createElement("button");
-      const expanded = state.expanded.has(session.id);
-      const detailId = `details-${session.id}`;
-      detailsButton.type = "button";
-      detailsButton.className = "details-button";
-      detailsButton.textContent = expanded ? "Hide" : "Inspect";
-      detailsButton.setAttribute("aria-expanded", String(expanded));
-      detailsButton.setAttribute("aria-controls", detailId);
-      detailsButton.addEventListener("click", () => {
-        if (state.expanded.has(session.id)) state.expanded.delete(session.id);
-        else state.expanded.add(session.id);
-        render();
-      });
-      detailsCell.append(detailsButton);
-
-      row.append(selectCell, nameCell, host, project, machine, identityCell, links, health, detailsCell);
+      row.append(selectCell, nameCell, host, project, machine, identityCell, links, health);
       fragment.append(row);
 
       const detailRow = document.createElement("tr");
@@ -176,7 +173,7 @@
       detailRow.className = "detail-row";
       detailRow.hidden = !expanded;
       const detailCell = document.createElement("td");
-      detailCell.colSpan = 9;
+      detailCell.colSpan = 8;
       const grid = document.createElement("div");
       grid.className = "detail-grid";
       grid.append(
