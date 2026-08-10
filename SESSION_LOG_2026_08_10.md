@@ -119,3 +119,4 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - `docs/superpowers/specs/2026-08-10-fleet-session-provenance-design.md` — approved local metadata and future fleet boundary.
 - `docs/superpowers/specs/2026-08-10-operator-topology-map-design.md` — approved clustered map, topology contract, and select-then-link boundary.
 - `docs/superpowers/plans/2026-08-10-fleet-session-provenance.md` — linted execution plan.
+- `docs/superpowers/plans/2026-08-10-operator-topology-map.md` — task-level TDD plan for the topology producer, authenticated route, shared browser state, native SVG map, and installed proof.
