@@ -334,8 +334,14 @@ pub fn create_local_group(request: GroupRequest) -> Result<MutationResult, Opera
 
 pub fn collect_live_sessions() -> anyhow::Result<LiveSessionReport> {
     let sessions = crate::session::list_sessions()?;
+    collect_live_sessions_from(&sessions)
+}
+
+pub(crate) fn collect_live_sessions_from(
+    sessions: &[crate::session::SessionInfo],
+) -> anyhow::Result<LiveSessionReport> {
     collect_live_from(
-        &sessions,
+        sessions,
         OffsetDateTime::now_utc(),
         crate::platform::process_alive,
     )
