@@ -302,7 +302,7 @@ fn list_groups_in(dir: &Path) -> Result<Vec<Group>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)?.flatten() {
+    for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
