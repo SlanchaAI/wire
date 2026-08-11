@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -116,8 +116,17 @@ fn validate_group_request<'a>(
     Ok(selected)
 }
 
-fn run_wire_at(home: &Path, args: &[String]) -> Result<serde_json::Value, OperatorError> {
-    const MAX_OUTPUT: usize = 256 * 1024;
+const MAX_WIRE_OUTPUT: usize = 256 * 1024;
+
+fn capped_wire_output(bytes: &[u8]) -> String {
+    let end = bytes.len().min(MAX_WIRE_OUTPUT);
+    String::from_utf8_lossy(&bytes[..end])
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect()
+}
+
+fn run_wire_command_at(home: &Path, args: &[String]) -> Result<Output, OperatorError> {
     let binary = crate::platform::current_exe_resolved()
         .map_err(|error| OperatorError::Internal(error.into()))?;
     let output = Command::new(binary)
@@ -136,25 +145,27 @@ fn run_wire_at(home: &Path, args: &[String]) -> Result<serde_json::Value, Operat
         .env_remove("WIRE_LOCAL_PAIR_ONE_WAY")
         .output()
         .map_err(|error| OperatorError::Internal(error.into()))?;
-    let capped = |bytes: &[u8]| {
-        let end = bytes.len().min(MAX_OUTPUT);
-        String::from_utf8_lossy(&bytes[..end])
-            .chars()
-            .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-            .collect::<String>()
-    };
     if !output.status.success() {
         return Err(OperatorError::Internal(anyhow::anyhow!(
             "wire command failed with {}: {}",
             output.status,
-            capped(&output.stderr).trim()
+            capped_wire_output(&output.stderr).trim()
         )));
     }
-    serde_json::from_str(capped(&output.stdout).trim()).map_err(|error| {
+    Ok(output)
+}
+
+fn parse_wire_stdout(stdout: &[u8]) -> Result<serde_json::Value, OperatorError> {
+    serde_json::from_str(capped_wire_output(stdout).trim()).map_err(|error| {
         OperatorError::Internal(anyhow::anyhow!(
             "wire command returned invalid JSON: {error}"
         ))
     })
+}
+
+fn run_wire_at(home: &Path, args: &[String]) -> Result<serde_json::Value, OperatorError> {
+    let output = run_wire_command_at(home, args)?;
+    parse_wire_stdout(&output.stdout)
 }
 
 fn post_create_output_field(
@@ -256,7 +267,7 @@ pub fn create_local_group(request: GroupRequest) -> Result<MutationResult, Opera
     let ids: Vec<String> = selected.iter().map(|session| session.id.clone()).collect();
     let sessions = crate::session::list_sessions().map_err(OperatorError::Internal)?;
     let creator = session_info(&sessions, &request.creator)?;
-    let created = run_wire_at(
+    let created = run_wire_command_at(
         &creator.home_dir,
         &[
             "group".to_string(),
@@ -266,7 +277,7 @@ pub fn create_local_group(request: GroupRequest) -> Result<MutationResult, Opera
         ],
     )?;
     let group_id = post_create_output_field(
-        Ok(created),
+        parse_wire_stdout(&created.stdout),
         "id",
         "group create response omitted id",
         &creator.name,
@@ -850,6 +861,13 @@ mod tests {
 
     #[test]
     fn post_create_output_failures_report_the_creator_as_changed() {
+        let malformed_create_stdout = post_create_output_field(
+            parse_wire_stdout(b"{not json}"),
+            "id",
+            "group create response omitted id",
+            "alice",
+        )
+        .unwrap_err();
         let malformed_create = post_create_output_field(
             Ok(serde_json::json!({})),
             "id",
@@ -872,7 +890,12 @@ mod tests {
         )
         .unwrap_err();
 
-        for error in [malformed_create, failed_invite, malformed_invite] {
+        for error in [
+            malformed_create_stdout,
+            malformed_create,
+            failed_invite,
+            malformed_invite,
+        ] {
             match error {
                 OperatorError::Partial {
                     changed_sessions, ..

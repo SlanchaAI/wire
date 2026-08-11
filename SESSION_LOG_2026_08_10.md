@@ -145,6 +145,14 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - Installed Playwright proof: real Cancel zero POST; group liveness race zero POST; focus survived three successful polls; anomaly subject text created no injected node; held-scan mutation order was GET, POST, GET; conflict and partial responses each forced a fresh GET; `changed_sessions` stayed literal text; desktop 1280×720 and mobile 390×844 had no horizontal overflow, clipped controls, or console errors.
 - Commits `0042329` and `6517384` were pushed to `origin/feat/operator-dashboard`.
 
+## Operator-authorized residual partial boundary repair
+
+- Defect: a successful `wire group create` could mutate the creator home, then emit malformed JSON. `run_wire_at` parsed that output before group creation established the creator as changed, so the operator route returned `Internal` instead of `Partial`.
+- RED: the focused operator regression fed malformed successful-create bytes through the same stdout parser used by group creation. Before the repair it failed to compile because no separable post-success parser existed.
+- Fix: command execution now retains its existing nonzero-to-`Internal` behavior. Group creation checks success before parsing stdout, then routes parse and missing-ID failures through the existing post-create partial boundary. Link creation and later invite/join behavior remain unchanged; invite command, parse, and missing-code failures retain the creator-only partial result.
+- GREEN: focused operator tests and the three-session operator dashboard end-to-end test passed. `cargo fmt --check`, Clippy with all targets/features and warnings denied, 32 Node tests, and `cargo test --all-targets --all-features` passed (700 library tests, one expected ignore, plus all enabled integration and stress targets).
+- Scope: `src/operator.rs` adds only the command-status/stdout-parsing split required for the irreversible create boundary and one malformed-byte regression.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.
