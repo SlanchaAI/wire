@@ -220,7 +220,7 @@
     const svg = svgElement("svg", {
       class: "topology-svg",
       viewBox: `0 0 ${viewportSize.width} ${viewportSize.height}`,
-      role: "img",
+      role: "group",
       "aria-label": "Live Wire session topology"
     });
     const viewport = svgElement("g", { class: "topology-viewport" });

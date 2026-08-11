@@ -148,6 +148,27 @@ test("layoutTopology preserves both endpoints for a cross-machine bilateral edge
   assert.match(edge.path, /^M /);
 });
 
+test("layoutTopology emits one group fragment per machine for members split across machines", () => {
+  const WireTopology = topology();
+  const snapshot = fixture();
+  snapshot.groups[0].members = [
+    { did: "did:wire:amber-00000001", tier: "creator", live: true },
+    { did: "did:wire:bravo-00000002", tier: "member", live: true }
+  ];
+  const visible = WireTopology.visibleTopology(snapshot, {});
+  const layout = WireTopology.layoutTopology(visible, { width: 800, height: 600 });
+
+  assert.equal(visible.groups.length, 1, "the two-member group remains visible");
+  assert.deepEqual(Array.from(layout.groupRegions, (region) => ({
+    machineId: region.machineId,
+    memberDids: Array.from(region.memberDids),
+    color: region.color
+  })), [
+    { machineId: "machine-a", memberDids: ["did:wire:amber-00000001"], color: WireTopology.groupColor("crew") },
+    { machineId: "machine-b", memberDids: ["did:wire:bravo-00000002"], color: WireTopology.groupColor("crew") }
+  ]);
+});
+
 test("fitTransform returns a finite positive scale for empty and populated layouts", () => {
   const WireTopology = topology();
   const viewport = { width: 800, height: 600 };

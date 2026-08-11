@@ -161,7 +161,6 @@
         byMachine.set(node.machineId, members);
       }
       for (const [machineId, members] of [...byMachine.entries()].sort((left, right) => compare(left[0], right[0]))) {
-        if (members.length < 2) continue;
         const left = Math.min(...members.map((node) => node.left)) - REGION_PADDING;
         const top = Math.min(...members.map((node) => node.top)) - REGION_PADDING;
         const right = Math.max(...members.map((node) => node.left + node.width)) + REGION_PADDING;

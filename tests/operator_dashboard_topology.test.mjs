@@ -235,6 +235,7 @@ test("map renders labeled machines, group fragments, direct edges, and accessibl
   const viewport = svg.children[0];
 
   assert.equal(svg.tagName, "SVG");
+  assert.equal(svg.attributes.get("role"), "group", "the SVG root must preserve descendant button semantics");
   assert.deepEqual(viewport.children.map((layer) => layer.dataset.layer), ["machines", "groups", "edges", "nodes"]);
   assert.equal(withClass(viewport.children[0], "topology-machine").length, 2);
   assert.match(withClass(viewport.children[0], "topology-machine")[0].attributes.get("aria-label"), /alpha.*verified/i);
