@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", windows))]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+#[cfg(any(target_os = "macos", windows))]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
