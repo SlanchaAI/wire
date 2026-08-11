@@ -4,6 +4,7 @@ use rand::RngCore;
 const HTML: &str = include_str!("../assets/operator-dashboard.html");
 const CSS: &str = include_str!("../assets/operator-dashboard.css");
 const JAVASCRIPT: &str = include_str!("../assets/operator-dashboard.js");
+const TOPOLOGY_JAVASCRIPT: &str = include_str!("../assets/operator-topology.js");
 
 pub struct ServeOptions {
     pub open_browser: bool,
@@ -66,6 +67,7 @@ fn router(token: String) -> Router {
         .route("/", get(index))
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/dashboard.css", get(stylesheet))
+        .route("/topology.js", get(topology_javascript))
         .route("/dashboard.js", get(javascript))
         .route("/api/sessions", get(get_sessions))
         .route("/api/topology", get(get_topology))
@@ -90,6 +92,13 @@ async fn javascript() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
         JAVASCRIPT,
+    )
+}
+
+async fn topology_javascript() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        TOPOLOGY_JAVASCRIPT,
     )
 }
 
@@ -385,6 +394,9 @@ mod tests {
         assert!(html.contains("Link selected"));
         assert!(html.contains("Create group"));
         assert!(html.contains("aria-labelledby=\"group-title\""));
+        let topology_script = html.find("/topology.js").unwrap();
+        let dashboard_script = html.find("/dashboard.js").unwrap();
+        assert!(topology_script < dashboard_script);
         for heading in ["Harness", "Project", "Machine", "Identity"] {
             assert!(
                 html.contains(heading),
@@ -409,6 +421,29 @@ mod tests {
         assert!(script.contains("detail-row"));
         assert!(script.contains("Unknown"));
         assert!(script.contains("PID ${known(session.pid)}"));
+
+        let topology = client
+            .get(format!("http://{address}/topology.js"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        for forbidden in [
+            "http://",
+            "https://",
+            "innerHTML",
+            "eval",
+            "createElement(\"script\")",
+            "createElement('script')",
+        ] {
+            assert!(
+                !topology.contains(forbidden),
+                "topology helper contains forbidden content: {forbidden}"
+            );
+        }
+        assert!(topology.contains("WireTopology"));
         server.abort();
     }
 }
