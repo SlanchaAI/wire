@@ -33,6 +33,23 @@ fn session_home(root: &Path, name: &str) -> PathBuf {
         ))
 }
 
+fn assert_no_forbidden_keys(value: &Value, forbidden: &[&str]) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                assert!(!forbidden.contains(&key.as_str()), "topology leaked {key}");
+                assert_no_forbidden_keys(value, forbidden);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_no_forbidden_keys(value, forbidden);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn add_live_lease(home: &Path, source: &str) {
     wire::session_lifecycle::write_lease_at(
         home,
@@ -121,6 +138,19 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
     let _dashboard = Dashboard(child);
     let client = reqwest::Client::new();
 
+    let topology: Value = client
+        .get(format!("{origin}/api/topology"))
+        .header("X-Wire-Token", &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(topology["schema"], "wire-topology-v1");
+    assert_eq!(topology["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(topology["machines"].as_array().unwrap().len(), 1);
+
     let report: Value = client
         .get(format!("{origin}/api/sessions"))
         .header("X-Wire-Token", &token)
@@ -196,6 +226,72 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         grouped.status().is_success(),
         "group failed: {}",
         grouped.text().await.unwrap()
+    );
+
+    let topology: Value = client
+        .get(format!("{origin}/api/topology"))
+        .header("X-Wire-Token", &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_did = topology["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session"]["id"] == ids[0])
+        .unwrap()["session"]["did"]
+        .as_str()
+        .unwrap();
+    let second_did = topology["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session"]["id"] == ids[1])
+        .unwrap()["session"]["did"]
+        .as_str()
+        .unwrap();
+    assert!(
+        topology["direct_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| {
+                link["state"] == "bilateral"
+                    && ((link["source_did"] == first_did && link["target_did"] == second_did)
+                        || (link["source_did"] == second_did && link["target_did"] == first_did))
+            })
+    );
+    let group = topology["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["name"] == "operator-proof")
+        .unwrap();
+    let group_members = group["members"].as_array().unwrap();
+    assert_eq!(group_members.len(), 3);
+    for did in topology["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| session["session"]["did"].as_str().unwrap())
+    {
+        assert!(group_members.iter().any(|member| member["did"] == did));
+    }
+    assert_no_forbidden_keys(
+        &topology,
+        &[
+            "relay_url",
+            "slot_id",
+            "slot_token",
+            "key_id",
+            "key",
+            "creator_sig",
+            "home_dir",
+            "command_line",
+        ],
     );
 
     for name in ["alice", "bob", "carol"] {

@@ -53,10 +53,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppState {
     token: String,
+    scan_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn router(token: String) -> Router {
@@ -66,9 +68,13 @@ fn router(token: String) -> Router {
         .route("/dashboard.css", get(stylesheet))
         .route("/dashboard.js", get(javascript))
         .route("/api/sessions", get(get_sessions))
+        .route("/api/topology", get(get_topology))
         .route("/api/links", post(post_links))
         .route("/api/groups", post(post_groups))
-        .with_state(AppState { token })
+        .with_state(AppState {
+            token,
+            scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
         .layer(middleware::map_response(security_headers))
 }
 
@@ -167,11 +173,27 @@ async fn get_sessions(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if !authorized(&headers, &state) {
         return error_response(StatusCode::FORBIDDEN, "invalid launch token", Vec::new());
     }
+    let _scan = state.scan_lock.lock().await;
     match tokio::task::spawn_blocking(crate::operator::collect_live_sessions).await {
         Ok(Ok(report)) => Json(report).into_response(),
         _ => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session inventory failed",
+            Vec::new(),
+        ),
+    }
+}
+
+async fn get_topology(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &state) {
+        return error_response(StatusCode::FORBIDDEN, "invalid launch token", Vec::new());
+    }
+    let _scan = state.scan_lock.lock().await;
+    match tokio::task::spawn_blocking(crate::operator_topology::collect_topology).await {
+        Ok(Ok(report)) => Json(report).into_response(),
+        _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "topology inventory failed",
             Vec::new(),
         ),
     }
@@ -275,6 +297,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions.status(), StatusCode::FORBIDDEN);
+
+        let topology = format!("http://{address}/api/topology");
+        let missing = client.get(&topology).send().await.unwrap();
+        assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+        let wrong = client
+            .get(&topology)
+            .header("X-Wire-Token", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let rebound = client
+            .get(&topology)
+            .header("Host", "attacker.example")
+            .header("X-Wire-Token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), StatusCode::FORBIDDEN);
+
+        let cross_origin = client
+            .get(&topology)
+            .header("Origin", "https://attacker.example")
+            .header("X-Wire-Token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
 
         let sessions = client
             .get(format!("http://{address}/api/sessions"))
