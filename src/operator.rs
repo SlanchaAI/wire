@@ -746,6 +746,7 @@ mod tests {
             handle: peer.handle.clone().unwrap(),
             did: "did:wire:different-peer-22222222".to_string(),
             tier: "VERIFIED".to_string(),
+            introduced_via: None,
         };
 
         assert!(!peer_row_matches(&row, &peer));

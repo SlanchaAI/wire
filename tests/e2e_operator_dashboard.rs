@@ -211,6 +211,21 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         linked.text().await.unwrap()
     );
 
+    let topology_before_group: Value = client
+        .get(format!("{origin}/api/topology"))
+        .header("X-Wire-Token", &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let direct_links_before_group = topology_before_group["direct_links"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(direct_links_before_group, 1);
+
     let grouped = client
         .post(format!("{origin}/api/groups"))
         .header("X-Wire-Token", &token)
@@ -237,6 +252,11 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        topology["direct_links"].as_array().unwrap().len(),
+        direct_links_before_group,
+        "group creation must not synthesize direct links: {topology}"
+    );
     let first_did = topology["sessions"]
         .as_array()
         .unwrap()

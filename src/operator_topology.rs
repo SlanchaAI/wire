@@ -161,7 +161,8 @@ fn build_topology(
     let mut observations = BTreeMap::<(String, String), BTreeSet<(String, String)>>::new();
     for source in &sources {
         for peer in &source.peers {
-            if peer.did.is_empty()
+            if peer.introduced_via.is_some()
+                || peer.did.is_empty()
                 || !live_dids.contains(&peer.did)
                 || peer.did == source.session.did
             {
@@ -375,6 +376,7 @@ mod tests {
             handle: did.to_string(),
             did: did.to_string(),
             tier: "VERIFIED".to_string(),
+            introduced_via: None,
         }
     }
 

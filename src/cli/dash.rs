@@ -598,6 +598,7 @@ mod tests {
                     handle: format!("peer{i}"),
                     did: format!("did:wire:peer{i}-0000"),
                     tier: "VERIFIED".to_string(),
+                    introduced_via: None,
                 })
                 .collect(),
             cwd: None,
@@ -699,6 +700,7 @@ mod tests {
             handle: "evil\x1b[2Jhandle".to_string(),
             did: "did:wire:evil-0000".to_string(),
             tier: "VERIFIED".to_string(),
+            introduced_via: None,
         }];
         s.likely_idle = false;
         let report = DashReport {

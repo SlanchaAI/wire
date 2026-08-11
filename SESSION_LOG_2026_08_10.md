@@ -107,9 +107,29 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - Live caller: `GET /api/sessions` and link/group validation call `collect_live_sessions`; the dashboard JavaScript owns the two-second refresh cadence.
 - Persistent Wire monitor: `rusted-butte` monitor session remained armed throughout the repair.
 
+## Topology final proof
+
+- Producer: `operator_topology::collect_topology` reads live inventory, peer records, group rosters, and machine descriptors. Caller: installed `wire dash --web --no-open` PID `50977` served the authenticated loopback dashboard at `http://127.0.0.1:54553`.
+- RED: the end-to-end caller linked two sessions, then created a three-session group. `direct_links` rose from one to two because a group-only `introduced_via` trust pin appeared as a one-sided direct edge.
+- Fix: `dash::read_peers` retains the non-serialized `introduced_via` provenance. The topology builder excludes group-only verification pins from direct-link observations. Direct pairing still replaces the trust record, and group introduction never marks an existing direct pin.
+- GREEN: the end-to-end test now compares `direct_links` before and after group creation, checks all three group members, and preserves the final assertion that the third member is not directly paired.
+- Gate: `cargo fmt --check`, Clippy with all targets/features and warnings denied, 23 Node topology/dashboard tests, and `cargo test --all-targets --all-features` passed. The library suite reported 697 passes and one expected ignore; every enabled integration and stress target passed.
+- Release install: `cargo build --release` completed in 1m35s. Atomic install used `wire.new` followed by `mv`. The release and installed binaries shared SHA-256 `21ddfe22c985ec7658ea96918bd9435842a94de6bec74a2fdb6069c4e045ff8c`.
+- API timing: three fresh installed cold launches returned topology in 1.399s, 1.364s, and 1.367s. Clean Playwright polling made seven requests, peaked at 1.561s, and never exceeded one in-flight request. One probe run immediately after the compile load took 2.085s; fresh cold trials did not repeat it.
+- Live browser proof: 63 live sessions; `rusted-butte` and `umber-savanna` rendered once with one bilateral edge. Map was the default; List remained available; two-node selection survived Map/List/Map; action counts and the link confirmation held; Fit returned every machine cluster to view.
+- No suitable live group existed. The dashboard created and retained `operator-topology-proof-20260810` for the two named sessions. The group region rendered and `direct_links` stayed at two before and after creation.
+- Desktop 1440×900 and narrow 390×844 each had document and body scroll width equal to viewport width. Console errors, failed requests, and HTTP error responses were zero.
+- Screenshots: `/tmp/wire-task6-live.E5rTku/desktop-selected.png`, `/tmp/wire-task6-live.E5rTku/desktop-group.png`, and `/tmp/wire-task6-live.E5rTku/narrow-group.png`. Visual inspection found no clipping, blank state, or failed render.
+- Review cycle 1 raised a MAJOR concern that `introduced_via` could outlive a later direct pair. Source tracing rejected it: every production pair writer calls `add_agent_card_pin`, which replaces the record; `promote_to_verified` has no production caller. Cycle 2 raised direct-pair-then-group ordering; the exact end-to-end order and `introduce_pin` existing-record branch disproved it. Final AMANALAP review returned no BLOCKER or MAJOR and cut speculative deserialization hardening and duplicate assertions.
+- Retrospective proposal recorded only: provenance-classifier review packets should include unchanged producer transition branches. No policy or skill changed, and no proposal was queued.
+- Incidental gate repair: Rust 1.95 Clippy rejected `read_dir(&dir)` in `group::list_groups_in`; the semantics-preserving `read_dir(dir)` edit cleared the required warnings-denied gate.
+- Persistent Wire daemon PID `20898` and monitor PIDs `17795`, `29336`, and `34962` stayed running. No persistent listener stopped.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.
+- `src/operator_topology.rs` — sanitized machine, direct-link, group, and anomaly producer.
+- `src/dash.rs` — peer provenance read without changing `wire-dash-v1` serialization.
 - `src/operator_web.rs` — loopback HTTP server and security boundary.
 - `src/session_metadata.rs` — provenance descriptors, Git discovery, identity classification, and bounded process snapshots.
 - `assets/operator-dashboard.{html,css,js}` — operator interface.
