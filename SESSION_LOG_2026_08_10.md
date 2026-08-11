@@ -125,6 +125,26 @@ After the first installed launch, refreshing the clean URL lost the in-memory la
 - Incidental gate repair: Rust 1.95 Clippy rejected `read_dir(&dir)` in `group::list_groups_in`; the semantics-preserving `read_dir(dir)` edit cleared the required warnings-denied gate.
 - Persistent Wire daemon PID `20898` and monitor PIDs `17795`, `29336`, and `34962` stayed running. No persistent listener stopped.
 
+## Final whole-branch fix wave
+
+- Scope followed the final AMANALAP disposition: fixed findings 1, 2, 3, 4, 5, 7, 8, 9, 12, and 14; deferred 6, 10, 11, and 13; cut 15.
+- Group Cancel is now an explicit non-submit button. Its handler closes and resets the dialog. Unit and installed-browser probes observed zero POST requests.
+- Group confirmation snapshots members and creator when the dialog opens. A successful poll that removes a member now closes the dialog, reports the race, and makes zero POST requests.
+- A higher group epoch now replaces its holder evidence. The epoch-2 Alice/Bob then epoch-3 Alice/Carol regression retains only Alice and Carol.
+- Inventory direct-link counts now exclude `introduced_via` group pins. The pure inventory regression and three-session end-to-end test show group creation leaves every direct-link count unchanged.
+- Poll rerenders preserve keyboard focus by control kind and stable session ID for map nodes, row checkboxes, and Inspect buttons. Each browser regression waits for a successful topology poll before asserting focus.
+- The map inspector renders topology anomalies with kind, subject group ID, and message through text-only DOM construction.
+- Link and group POST handlers share the server scan lock with inventory GETs. The browser waits for any in-flight scan, then orders mutation work as GET, POST, fresh GET even on conflict or partial failure. Safe notices include bounded string `changed_sessions`.
+- Fit records its actual scale as the wheel lower bound. Installed proof used a 0.1545 Fit: zoom-out stayed at 0.1545 and zoom-in stopped at 2.5.
+- Once group creation succeeds, missing create output and invite generation/execution failures become `Partial` results carrying the creator in `changed_sessions`.
+- State records the last successful scan time. Selection and filter renders no longer change it.
+- GitNexus warned that `collect_live_from` has HIGH upstream impact through two direct callers and the link/topology flows; the authorized fix continued after reporting. Other edited production symbols were LOW or MEDIUM. Staged change detection found only the intended files and flows.
+- RED/GREEN evidence: nine new browser regressions failed before the controller changes; the server lock regression failed to compile before `run_mutation`; the group epoch, direct-count, end-to-end count, and partial-boundary regressions failed before the Rust fixes. Final focused results were 24 browser/controller tests, 25 operator tests, and three operator-web tests, all passing.
+- Full gates: `cargo fmt --check`; Clippy for all targets and features with warnings denied; 32 Node tests; `cargo test --all-targets --all-features` with 700 library passes, one expected library ignore, and every enabled integration and stress target passing.
+- Release install: `cargo build --release` completed, then atomic `wire.new` install and rename produced an installed SHA-256 matching the release artifact: `d8c74aebd953d154982386e222e2f69a32c6069854c7b61a637dd633395b32fb`.
+- Installed Playwright proof: real Cancel zero POST; group liveness race zero POST; focus survived three successful polls; anomaly subject text created no injected node; held-scan mutation order was GET, POST, GET; conflict and partial responses each forced a fresh GET; `changed_sessions` stayed literal text; desktop 1280×720 and mobile 390×844 had no horizontal overflow, clipped controls, or console errors.
+- Commits `0042329` and `6517384` were pushed to `origin/feat/operator-dashboard`.
+
 ## Artifacts
 
 - `src/operator.rs` — live inventory and explicit-home topology operations.
