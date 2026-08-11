@@ -87,6 +87,10 @@ pub struct DaemonPid {
     /// Relay this daemon was bound to at spawn. Catches daemon-bound-to-
     /// old-relay-after-migration drift.
     pub relay_url: Option<String>,
+    /// True when the all-session supervisor spawned this daemon. False for
+    /// operator-started daemons and older pidfiles.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supervisor_managed: bool,
 }
 
 /// Result of reading a pid file. JSON (full metadata) is the only
@@ -515,6 +519,7 @@ fn build_pid_record(pid: u32) -> DaemonPid {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
     let (did, relay_url) = identity_for_pid_record();
+    let supervisor_managed = std::env::var("WIRE_SUPERVISOR_MANAGED").is_ok_and(|raw| raw == "1");
     DaemonPid {
         schema: DAEMON_PID_SCHEMA.to_string(),
         pid,
@@ -523,6 +528,7 @@ fn build_pid_record(pid: u32) -> DaemonPid {
         started_at,
         did,
         relay_url,
+        supervisor_managed,
     }
 }
 
@@ -736,6 +742,7 @@ mod tests {
                 started_at: "2026-05-16T01:23:45Z".to_string(),
                 did: Some("did:wire:paul-mac".to_string()),
                 relay_url: Some("https://wireup.net".to_string()),
+                supervisor_managed: false,
             };
             write_pid_record("daemon", &record).unwrap();
             let read = read_pid_record("daemon");
@@ -744,6 +751,42 @@ mod tests {
                 other => panic!("expected JSON record, got {other:?}"),
             }
         });
+    }
+
+    #[test]
+    fn pid_record_marks_supervisor_owned_worker() {
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("WIRE_SUPERVISOR_MANAGED");
+        // SAFETY: ENV_LOCK serializes environment mutation in tests.
+        unsafe { std::env::set_var("WIRE_SUPERVISOR_MANAGED", "1") };
+        let value = serde_json::to_value(build_pid_record(12345)).unwrap();
+        // SAFETY: ENV_LOCK remains held through restoration.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("WIRE_SUPERVISOR_MANAGED", value),
+                None => std::env::remove_var("WIRE_SUPERVISOR_MANAGED"),
+            }
+        }
+
+        assert_eq!(value["supervisor_managed"], true);
+    }
+
+    #[test]
+    fn pid_record_without_supervisor_owner_remains_readable() {
+        let record: DaemonPid = serde_json::from_value(serde_json::json!({
+            "schema": DAEMON_PID_SCHEMA,
+            "pid": 12345,
+            "bin_path": "/usr/local/bin/wire",
+            "version": "0.17.0",
+            "started_at": "2026-08-10T00:00:00Z",
+            "did": null,
+            "relay_url": null
+        }))
+        .unwrap();
+
+        assert!(!record.supervisor_managed);
     }
 
     #[test]

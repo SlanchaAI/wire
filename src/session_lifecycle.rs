@@ -19,6 +19,16 @@ pub struct LeaseRecord {
     pub wire_version: String,
     pub bin_path: String,
     pub session_source: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub machine: Option<crate::session_metadata::MachineDescriptor>,
+    #[serde(default)]
+    pub harness: Option<crate::session_metadata::HarnessDescriptor>,
+    #[serde(default)]
+    pub project: Option<crate::session_metadata::ProjectDescriptor>,
 }
 
 pub fn lease_dir(home: &Path) -> PathBuf {
@@ -59,6 +69,7 @@ pub fn write_lease_at(
     wire_version: &str,
     bin_path: &Path,
     session_source: &str,
+    cwd: Option<&Path>,
 ) -> Result<PathBuf> {
     if role.is_empty()
         || !role
@@ -69,6 +80,7 @@ pub fn write_lease_at(
     }
     let path = lease_dir(home).join(format!("{role}-{pid}.json"));
     let expires = now + time::Duration::seconds(ttl.as_secs() as i64);
+    let snapshot = crate::session_metadata::process_snapshot(&[pid]);
     let record = LeaseRecord {
         schema: LEASE_SCHEMA.to_string(),
         role: role.to_string(),
@@ -78,6 +90,17 @@ pub fn write_lease_at(
         wire_version: wire_version.to_string(),
         bin_path: bin_path.to_string_lossy().into_owned(),
         session_source: session_source.to_string(),
+        started_at: Some(format_time(now)?),
+        cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+        machine: Some(crate::session_metadata::machine_descriptor(wire_version)),
+        harness: Some(crate::session_metadata::harness_from_snapshot(
+            &snapshot,
+            pid,
+            session_source,
+        )),
+        project: Some(crate::session_metadata::project_from_snapshot(
+            &snapshot, pid, cwd,
+        )),
     };
     persist_record(&path, &record)?;
     Ok(path)
@@ -87,6 +110,30 @@ pub fn heartbeat_lease_at(path: &Path, now: OffsetDateTime, ttl: Duration) -> Re
     let body = std::fs::read(path).with_context(|| format!("reading session lease {path:?}"))?;
     let mut record: LeaseRecord =
         serde_json::from_slice(&body).with_context(|| format!("parsing session lease {path:?}"))?;
+    let snapshot = crate::session_metadata::process_snapshot(&[record.pid]);
+    if record.machine.is_none() {
+        record.machine = Some(crate::session_metadata::machine_descriptor(
+            &record.wire_version,
+        ));
+    }
+    if record.harness.as_ref().is_none_or(|value| {
+        value.confidence == crate::session_metadata::MetadataConfidence::Unknown
+    }) {
+        record.harness = Some(crate::session_metadata::harness_from_snapshot(
+            &snapshot,
+            record.pid,
+            &record.session_source,
+        ));
+    }
+    if record.project.as_ref().is_none_or(|value| {
+        value.confidence == crate::session_metadata::MetadataConfidence::Unknown
+    }) {
+        record.project = Some(crate::session_metadata::project_from_snapshot(
+            &snapshot,
+            record.pid,
+            record.cwd.as_deref().map(Path::new),
+        ));
+    }
     record.heartbeat_at = format_time(now)?;
     record.expires_at = format_time(now + time::Duration::seconds(ttl.as_secs() as i64))?;
     persist_record(path, &record)
@@ -151,6 +198,7 @@ impl LeaseGuard {
             .and_then(Path::parent)
             .ok_or_else(|| anyhow!("state directory has no session-home parent"))?;
         let bin = crate::platform::current_exe_resolved()?;
+        let cwd = std::env::current_dir().ok();
         Self::acquire_at(
             home,
             role,
@@ -160,6 +208,7 @@ impl LeaseGuard {
             env!("CARGO_PKG_VERSION"),
             &bin,
             crate::session::session_source(),
+            cwd.as_deref(),
         )
     }
 
@@ -177,6 +226,7 @@ impl LeaseGuard {
         wire_version: &str,
         bin_path: &Path,
         session_source: &str,
+        cwd: Option<&Path>,
     ) -> Result<Self> {
         let path = write_lease_at(
             home,
@@ -187,6 +237,7 @@ impl LeaseGuard {
             wire_version,
             bin_path,
             session_source,
+            cwd,
         )?;
         Ok(Self { path, ttl })
     }
@@ -225,6 +276,7 @@ mod tests {
             "0.17.0",
             Path::new("/opt/wire"),
             "override",
+            Some(Path::new("/work/wire")),
         )
         .unwrap()
     }
@@ -243,6 +295,52 @@ mod tests {
         assert_eq!(leases[0].role, "mcp");
         assert_eq!(leases[0].pid, 42);
         assert_eq!(leases[0].session_source, "override");
+        assert_eq!(
+            leases[0].started_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(leases[0].cwd.as_deref(), Some("/work/wire"));
+    }
+
+    #[test]
+    fn lease_without_inventory_metadata_remains_readable() {
+        let record: LeaseRecord = serde_json::from_str(
+            r#"{
+                "schema":"wire-session-lease-v1",
+                "role":"mcp",
+                "pid":42,
+                "heartbeat_at":"2023-11-14T22:13:20Z",
+                "expires_at":"2023-11-14T22:14:50Z",
+                "wire_version":"0.17.0",
+                "bin_path":"/opt/wire",
+                "session_source":"override"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(record.started_at, None);
+        assert_eq!(record.cwd, None);
+        assert_eq!(record.machine, None);
+        assert_eq!(record.harness, None);
+        assert_eq!(record.project, None);
+    }
+
+    #[test]
+    fn new_lease_round_trips_structured_metadata() {
+        let tmp = tempdir().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let path = write_test_lease(tmp.path(), std::process::id(), now, Duration::from_secs(90));
+
+        let record: LeaseRecord = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(record.machine.is_some());
+        assert!(record.harness.is_some());
+        assert_eq!(
+            record
+                .project
+                .as_ref()
+                .and_then(|value| value.cwd.as_deref()),
+            Some("/work/wire")
+        );
     }
 
     #[test]
@@ -276,6 +374,34 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_preserves_known_metadata() {
+        let tmp = tempdir().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let path = write_test_lease(tmp.path(), 42, now, Duration::from_secs(90));
+        let mut record: LeaseRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.harness = Some(crate::session_metadata::HarnessDescriptor {
+            kind: "goose".to_string(),
+            label: "Goose".to_string(),
+            mode: Some("mcp-host".to_string()),
+            confidence: crate::session_metadata::MetadataConfidence::Explicit,
+            evidence: "lease-source".to_string(),
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        heartbeat_lease_at(
+            &path,
+            now + time::Duration::seconds(30),
+            Duration::from_secs(90),
+        )
+        .unwrap();
+
+        let refreshed: LeaseRecord = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(refreshed.harness, record.harness);
+        assert_eq!(refreshed.started_at, record.started_at);
+    }
+
+    #[test]
     fn pruning_removes_expired_dead_and_malformed_records_only() {
         let tmp = tempdir().unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -304,6 +430,7 @@ mod tests {
             "0.17.0",
             Path::new("/opt/wire"),
             "codex-cli",
+            Some(Path::new("/work/wire")),
         )
         .unwrap();
         let path = guard.path.clone();

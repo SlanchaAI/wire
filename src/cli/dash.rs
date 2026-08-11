@@ -38,6 +38,8 @@ fn emit(text: &str) {
 
 /// Parsed `wire dash` flags.
 pub struct DashArgs {
+    pub web: bool,
+    pub no_open: bool,
     pub watch: bool,
     pub json: bool,
     pub all: bool,
@@ -76,6 +78,11 @@ fn split_banner(color: bool) -> String {
 }
 
 pub fn cmd_dash(args: DashArgs) -> Result<()> {
+    if args.web {
+        return crate::operator_web::serve(crate::operator_web::ServeOptions {
+            open_browser: !args.no_open,
+        });
+    }
     if args.retire_idle {
         return cmd_retire_idle(
             args.older_than.unwrap_or(7),
@@ -591,6 +598,7 @@ mod tests {
                     handle: format!("peer{i}"),
                     did: format!("did:wire:peer{i}-0000"),
                     tier: "VERIFIED".to_string(),
+                    introduced_via: None,
                 })
                 .collect(),
             cwd: None,
@@ -692,6 +700,7 @@ mod tests {
             handle: "evil\x1b[2Jhandle".to_string(),
             did: "did:wire:evil-0000".to_string(),
             tier: "VERIFIED".to_string(),
+            introduced_via: None,
         }];
         s.likely_idle = false;
         let report = DashReport {

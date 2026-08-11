@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::signing::{b64decode, b64encode, canonical_event};
 
@@ -290,12 +290,19 @@ pub fn load_group(id: &str) -> Result<Group> {
 
 /// List all persisted groups (skips unparseable files).
 pub fn list_groups() -> Result<Vec<Group>> {
-    let dir = groups_dir()?;
+    list_groups_in(&groups_dir()?)
+}
+
+pub(crate) fn list_groups_at(home: &Path) -> Result<Vec<Group>> {
+    list_groups_in(&home.join("config/wire/groups"))
+}
+
+fn list_groups_in(dir: &Path) -> Result<Vec<Group>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)?.flatten() {
+    for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;

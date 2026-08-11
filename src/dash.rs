@@ -47,6 +47,8 @@ pub struct PeerRow {
     pub handle: String,
     pub did: String,
     pub tier: String,
+    #[serde(skip_serializing)]
+    pub introduced_via: Option<String>,
 }
 
 /// A single wire identity on this box + its live-ish state.
@@ -170,6 +172,10 @@ pub fn read_peers(home: &Path, own_did: Option<&str>, own_handle: Option<&str>) 
                 .and_then(|t| t.as_str())
                 .unwrap_or("UNTRUSTED")
                 .to_string(),
+            introduced_via: rec
+                .get("introduced_via")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
         });
     }
     out.sort_by(|a, b| a.handle.cmp(&b.handle));

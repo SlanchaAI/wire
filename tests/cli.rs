@@ -62,6 +62,22 @@ fn help_flag_lists_subcommands() {
 }
 
 #[test]
+fn dash_web_rejects_terminal_json_mode() {
+    let home = fresh_home();
+    let out = run(&home, &["dash", "--web", "--json"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn dash_no_open_requires_web_mode() {
+    let home = fresh_home();
+    let out = run(&home, &["dash", "--no-open"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("required arguments"));
+}
+
+#[test]
 fn whoami_before_init_degrades_when_piped() {
     // Contract change (v0.14.x): `wire whoami` with stdout piped auto-selects
     // JSON via `json_default`. Pre-fix this bailed (exit 1, no stdout), which

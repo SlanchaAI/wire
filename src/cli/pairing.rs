@@ -836,6 +836,8 @@ fn run_wire_for_session(home: &std::path::Path, args: &[&str], one_way: bool) ->
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
+        .env_remove("AGENT")
+        .env_remove("AGENT_SESSION_ID")
         .env_remove("COPILOT_AGENT_SESSION_ID")
         .env_remove("VSCODE_GIT_REPOSITORY_ROOT");
     if one_way {

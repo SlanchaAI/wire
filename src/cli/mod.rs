@@ -131,6 +131,12 @@ pub enum Command {
     /// pinned peers, relay binding, and sync recency. Read-only; paired
     /// sessions float to the top, idle solo daemons collapse into a count.
     Dash {
+        /// Open the local operator dashboard in a browser.
+        #[arg(long, conflicts_with_all = ["watch", "json", "retire_idle"])]
+        web: bool,
+        /// Start the web dashboard without opening a browser.
+        #[arg(long, requires = "web")]
+        no_open: bool,
         /// Live-refresh every 2s (Ctrl-C to exit).
         #[arg(long)]
         watch: bool,
@@ -1912,6 +1918,8 @@ pub fn run() -> Result<()> {
         } => identity::cmd_whoami(json_default(json), short, colored),
         Command::Peers { json } => comms::cmd_peers(json_default(json)),
         Command::Dash {
+            web,
+            no_open,
             watch,
             json,
             all,
@@ -1922,6 +1930,8 @@ pub fn run() -> Result<()> {
             dry_run,
             force,
         } => dash::cmd_dash(dash::DashArgs {
+            web,
+            no_open,
             watch,
             json: json_default(json),
             all,
