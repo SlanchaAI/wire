@@ -220,6 +220,7 @@ fn build_topology(
                     holders,
                 }) if group.epoch > existing.epoch => {
                     *existing = group.clone();
+                    holders.clear();
                     holders.insert(holder);
                 }
                 Some(GroupResolution::Accepted {
@@ -238,21 +239,20 @@ fn build_topology(
                         holders.insert(holder);
                     }
                 }
-                Some(GroupResolution::Conflicted { epoch, holders }) if group.epoch > *epoch => {
-                    let mut holders = std::mem::take(holders);
-                    holders.insert(holder);
+                Some(GroupResolution::Conflicted { epoch, .. }) if group.epoch > *epoch => {
                     group_resolutions.insert(
                         group.id.clone(),
                         GroupResolution::Accepted {
                             group: group.clone(),
-                            holders,
+                            holders: BTreeSet::from([holder]),
                         },
                     );
                 }
-                Some(GroupResolution::Accepted { holders, .. })
-                | Some(GroupResolution::Conflicted { holders, .. }) => {
+                Some(GroupResolution::Conflicted { epoch, holders }) if group.epoch == *epoch => {
                     holders.insert(holder);
                 }
+                Some(GroupResolution::Accepted { .. })
+                | Some(GroupResolution::Conflicted { .. }) => {}
             }
         }
     }
@@ -551,36 +551,40 @@ mod tests {
 
     #[test]
     fn highest_group_epoch_wins() {
-        let mut older = source(live("alice", ALICE, Some("machine-1")));
-        older.groups.push(group(
+        let mut older_alice = source(live("alice", ALICE, Some("machine-1")));
+        older_alice.groups.push(group(
             "crew",
-            1,
+            2,
             ALICE,
             &[(ALICE, GroupTier::Creator), (BOB, GroupTier::Member)],
         ));
-        let mut newer = source(live("bob", BOB, Some("machine-1")));
-        newer.groups.push(group(
+        let mut older_bob = source(live("bob", BOB, Some("machine-1")));
+        older_bob.groups.push(group(
             "crew",
             2,
+            ALICE,
+            &[(ALICE, GroupTier::Creator), (BOB, GroupTier::Member)],
+        ));
+        let mut newer_carol = source(live("carol", CAROL, Some("machine-1")));
+        newer_carol.groups.push(group(
+            "crew",
+            3,
             ALICE,
             &[(ALICE, GroupTier::Creator), (CAROL, GroupTier::Member)],
         ));
 
-        let report = build_topology(vec![older, newer], generated_at());
+        let report = build_topology(vec![older_alice, older_bob, newer_carol], generated_at());
 
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].epoch, 2);
-        assert!(
+        assert_eq!(report.groups[0].epoch, 3);
+        assert_eq!(
             report.groups[0]
                 .members
                 .iter()
-                .any(|member| member.did == CAROL && member.tier == "member")
-        );
-        assert!(
-            report.groups[0]
-                .members
-                .iter()
-                .any(|member| member.did == BOB && member.tier == "introduced")
+                .map(|member| (member.did.as_str(), member.tier.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(ALICE, "creator"), (CAROL, "member")],
+            "holders of lower-epoch copies must not return as introduced members"
         );
     }
 

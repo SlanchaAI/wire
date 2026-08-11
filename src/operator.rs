@@ -157,6 +157,24 @@ fn run_wire_at(home: &Path, args: &[String]) -> Result<serde_json::Value, Operat
     })
 }
 
+fn post_create_output_field(
+    output: Result<serde_json::Value, OperatorError>,
+    field: &str,
+    failure: &str,
+    creator: &str,
+) -> Result<String, OperatorError> {
+    let partial = |message| OperatorError::Partial {
+        message,
+        changed_sessions: vec![creator.to_string()],
+    };
+    let output = output.map_err(|error| partial(format!("{failure}: {error}")))?;
+    output
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| partial(failure.to_string()))
+}
+
 fn session_info<'a>(
     sessions: &'a [crate::session::SessionInfo],
     id: &str,
@@ -247,29 +265,26 @@ pub fn create_local_group(request: GroupRequest) -> Result<MutationResult, Opera
             "--json".to_string(),
         ],
     )?;
-    let group_id = created
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            OperatorError::Internal(anyhow::anyhow!("group create response omitted id"))
-        })?
-        .to_string();
-    let invite = run_wire_at(
-        &creator.home_dir,
-        &[
-            "group".to_string(),
-            "invite".to_string(),
-            group_id.clone(),
-            "--json".to_string(),
-        ],
+    let group_id = post_create_output_field(
+        Ok(created),
+        "id",
+        "group create response omitted id",
+        &creator.name,
     )?;
-    let code = invite
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            OperatorError::Internal(anyhow::anyhow!("group invite response omitted code"))
-        })?
-        .to_string();
+    let code = post_create_output_field(
+        run_wire_at(
+            &creator.home_dir,
+            &[
+                "group".to_string(),
+                "invite".to_string(),
+                group_id.clone(),
+                "--json".to_string(),
+            ],
+        ),
+        "code",
+        "group invite response omitted code",
+        &creator.name,
+    )?;
 
     let mut changed = vec![creator.name.clone()];
     for id in &ids {
@@ -543,7 +558,10 @@ fn collect_live_from(
             project,
             started_at: runtime.started_at().map(str::to_string),
             age_seconds,
-            direct_link_count: peers.len(),
+            direct_link_count: peers
+                .iter()
+                .filter(|peer| peer.introduced_via.is_none())
+                .count(),
             health: health.to_string(),
         });
     }
@@ -785,6 +803,82 @@ mod tests {
         ];
         for request in cases {
             assert!(validate_group_request(&request, &live).is_err());
+        }
+    }
+
+    #[test]
+    fn inventory_direct_link_count_excludes_group_introduced_pins() {
+        let tmp = tempdir().unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let home = tmp.path().join("live");
+        lease(&home, "mcp", 101, now, 90);
+        let trust_dir = home.join("config/wire");
+        std::fs::create_dir_all(&trust_dir).unwrap();
+        std::fs::write(
+            trust_dir.join("trust.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "agents": {
+                    "session-11111111": {
+                        "did": "did:wire:session-11111111",
+                        "tier": "ATTESTED"
+                    },
+                    "direct-peer": {
+                        "did": "did:wire:direct-peer-22222222",
+                        "tier": "VERIFIED"
+                    },
+                    "group-peer": {
+                        "did": "did:wire:group-peer-33333333",
+                        "tier": "VERIFIED",
+                        "introduced_via": "crew"
+                    }
+                },
+                "version": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = collect_live_from(
+            &[session(&home, "11111111", true)],
+            now + time::Duration::seconds(2),
+            |pid| pid == 101,
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions[0].direct_link_count, 1);
+    }
+
+    #[test]
+    fn post_create_output_failures_report_the_creator_as_changed() {
+        let malformed_create = post_create_output_field(
+            Ok(serde_json::json!({})),
+            "id",
+            "group create response omitted id",
+            "alice",
+        )
+        .unwrap_err();
+        let failed_invite = post_create_output_field(
+            Err(OperatorError::Internal(anyhow::anyhow!("invite failed"))),
+            "code",
+            "group invite failed",
+            "alice",
+        )
+        .unwrap_err();
+        let malformed_invite = post_create_output_field(
+            Ok(serde_json::json!({})),
+            "code",
+            "group invite response omitted code",
+            "alice",
+        )
+        .unwrap_err();
+
+        for error in [malformed_create, failed_invite, malformed_invite] {
+            match error {
+                OperatorError::Partial {
+                    changed_sessions, ..
+                } => assert_eq!(changed_sessions, vec!["alice"]),
+                other => panic!("expected partial mutation, got {other:?}"),
+            }
         }
     }
 }

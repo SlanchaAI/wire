@@ -5,6 +5,20 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+fn direct_link_counts(topology: &Value) -> std::collections::BTreeMap<String, u64> {
+    topology["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["session"]["id"].as_str().unwrap().to_string(),
+                entry["session"]["direct_link_count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
 fn wire_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wire"))
 }
@@ -225,6 +239,7 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         .unwrap()
         .len();
     assert_eq!(direct_links_before_group, 1);
+    let direct_link_counts_before_group = direct_link_counts(&topology_before_group);
 
     let grouped = client
         .post(format!("{origin}/api/groups"))
@@ -256,6 +271,11 @@ async fn dashboard_links_two_and_materializes_one_shared_group() {
         topology["direct_links"].as_array().unwrap().len(),
         direct_links_before_group,
         "group creation must not synthesize direct links: {topology}"
+    );
+    assert_eq!(
+        direct_link_counts(&topology),
+        direct_link_counts_before_group,
+        "group creation must not inflate per-session direct link counts"
     );
     let first_did = topology["sessions"]
         .as_array()
