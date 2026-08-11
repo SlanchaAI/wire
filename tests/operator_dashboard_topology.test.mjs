@@ -15,8 +15,23 @@ class ElementStub {
     this.disabled = false;
     this.checked = false;
     this.value = "";
-    this.textContent = "";
-    this.style = {};
+    this._textContent = "";
+    this.style = {
+      values: new Map(),
+      setProperty(name, value) { this.values.set(name, String(value)); },
+      getPropertyValue(name) { return this.values.get(name) || ""; }
+    };
+    this.clientWidth = 800;
+    this.clientHeight = 520;
+  }
+
+  get textContent() {
+    return this._textContent + this.children.map((child) => child && child.textContent || "").join("");
+  }
+
+  set textContent(value) {
+    this._textContent = String(value);
+    this.children = [];
   }
 
   addEventListener(type, listener) {
@@ -26,16 +41,28 @@ class ElementStub {
   }
 
   dispatch(type, detail = {}) {
-    const event = { preventDefault() {}, target: this, ...detail };
+    const event = {
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      target: this,
+      type,
+      ...detail
+    };
     for (const listener of this.listeners.get(type) || []) listener(event);
+    return event;
   }
 
+  dispatchEvent(event) { return !this.dispatch(event.type, event).defaultPrevented; }
+
   append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  replaceChildren(...children) { this._textContent = ""; this.children = children; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   showModal() { this.open = true; }
   close() { this.open = false; }
-  focus() {}
+  focus() { this.focused = true; }
+  getBoundingClientRect() { return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight }; }
+  setPointerCapture() {}
+  releasePointerCapture() {}
   reset() {}
   reportValidity() { return true; }
 }
@@ -63,28 +90,43 @@ const snapshot = () => ({
   schema: "wire-topology-v1",
   generated_at: "2026-08-10T20:00:00Z",
   machines: [
-    { id: "machine-a", hostname: "alpha", os: "macos", arch: "aarch64" },
-    { id: "machine-b", hostname: "bravo", os: "linux", arch: "x86_64" }
+    { id: "machine-a", hostname: "alpha", os: "macos", arch: "aarch64", identity_confidence: "verified" },
+    { id: "machine-b", hostname: "bravo", os: "linux", arch: "x86_64", identity_confidence: "unverified" }
   ],
   sessions: [
     entry("amber"),
     entry("bravo", { machineId: "machine-b", harness: "Claude Code", project: "Studio", health: "sync-stale" }),
-    entry("cedar", { machineId: "machine-b", harness: "Goose Shell", project: "Wire" })
+    entry("cedar", { machineId: "machine-b", harness: "Goose Shell", project: "Wire" }),
+    entry("delta")
   ],
-  direct_links: [{
-    id: "amber-bravo",
-    source_did: "did:wire:amber-00000001",
-    target_did: "did:wire:bravo-00000001",
-    state: "bilateral"
+  direct_links: [
+    {
+      id: "amber-bravo",
+      source_did: "did:wire:amber-00000001",
+      target_did: "did:wire:bravo-00000001",
+      state: "bilateral"
+    },
+    {
+      id: "cedar-delta",
+      source_did: "did:wire:cedar-00000001",
+      target_did: "did:wire:delta-00000001",
+      state: "one-sided"
+    }
+  ],
+  groups: [{
+    id: "crew",
+    name: "Crew",
+    members: ["amber", "bravo", "cedar", "delta"].map((id) => ({
+      did: `did:wire:${id}-00000001`, live: true, tier: id === "amber" ? "creator" : "member"
+    }))
   }],
-  groups: [],
   anomalies: []
 });
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 const selectors = [
-  "#session-rows", "#table-wrap", "#map-panel", "#list-panel", "#topology-map", "#map-inspector",
+  "#session-rows", "#table-wrap", "#map-panel", "#list-panel", "#topology-map", "#map-inspector", "#fit-map",
   "#map-view-button", "#list-view-button", "#loading", "#empty", "#empty-title", "#empty-copy",
   "#notice", "#live-count", "#last-scan", "#selection-count", "#action-hint", "#link-button",
   "#group-button", "#confirm-dialog", "#confirm-copy", "#confirm-link", "#group-dialog", "#group-form",
@@ -108,7 +150,13 @@ const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
     created.push(element);
     return element;
   };
+  document.createElementNS = (namespaceURI, tagName) => {
+    const element = document.createElement(tagName);
+    element.namespaceURI = namespaceURI;
+    return element;
+  };
   document.createDocumentFragment = () => new ElementStub("fragment");
+  document.getElementById = (id) => elements.get(`#${id}`) || null;
 
   const storage = new Map();
   const window = {
@@ -120,7 +168,14 @@ const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
     },
     setInterval: (callback) => intervals.push(callback)
   };
+  class CustomEvent {
+    constructor(type, options = {}) {
+      this.type = type;
+      this.detail = options.detail;
+    }
+  }
   const context = {
+    CustomEvent,
     URLSearchParams,
     console,
     document,
@@ -137,6 +192,12 @@ const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
   await flush();
   return { created, document, elements, intervals, requests };
 };
+
+const descendants = (element) => element.children.flatMap((child) => [child, ...descendants(child)]);
+const classNames = (element) => (element.attributes.get("class") || "").split(/\s+/).filter(Boolean);
+const withClass = (element, className) => descendants(element).filter((candidate) => classNames(candidate).includes(className));
+const mapNode = (page, id) => withClass(page.elements.get("#topology-map"), "topology-node")
+  .find((node) => node.dataset.sessionId === id);
 
 const renderedRows = (page) => {
   const fragment = page.elements.get("#session-rows").children[0];
@@ -165,6 +226,88 @@ test("map selection survives List and Map view changes", async () => {
   assert.equal(page.elements.get("#list-panel").hidden, true);
   assert.equal(mapButton.attributes.get("aria-pressed"), "true");
   assert.equal(listButton.attributes.get("aria-pressed"), "false");
+});
+
+test("map renders labeled machines, group fragments, direct edges, and accessible session nodes in paint order", async () => {
+  const page = await dashboard();
+  const map = page.elements.get("#topology-map");
+  const svg = map.children[0];
+  const viewport = svg.children[0];
+
+  assert.equal(svg.tagName, "SVG");
+  assert.deepEqual(viewport.children.map((layer) => layer.dataset.layer), ["machines", "groups", "edges", "nodes"]);
+  assert.equal(withClass(viewport.children[0], "topology-machine").length, 2);
+  assert.match(withClass(viewport.children[0], "topology-machine")[0].attributes.get("aria-label"), /alpha.*verified/i);
+  assert.match(withClass(viewport.children[0], "topology-machine")[1].attributes.get("aria-label"), /bravo.*unverified/i);
+
+  const groupFragments = withClass(viewport.children[1], "topology-group");
+  assert.equal(groupFragments.length, 2, "a cross-machine group paints one fragment in each machine");
+  assert.ok(groupFragments.every((fragment) => /Crew/.test(fragment.textContent)));
+
+  const edges = withClass(viewport.children[2], "topology-edge");
+  assert.equal(edges.length, 2, "group membership must not synthesize direct edges");
+  assert.ok(classNames(edges[0]).includes("topology-edge--bilateral"));
+  assert.ok(classNames(edges[1]).includes("topology-edge--one-sided"));
+
+  const nodes = withClass(viewport.children[3], "topology-node");
+  assert.equal(nodes.length, 4);
+  for (const node of nodes) {
+    assert.equal(node.attributes.get("role"), "button");
+    assert.equal(node.attributes.get("tabindex"), "0");
+    assert.equal(node.attributes.get("aria-pressed"), "false");
+    assert.equal(withClass(node, "topology-health-ring").length, 1);
+  }
+  assert.match(mapNode(page, "amber").textContent, /◆.*amber-handle.*Codex CLI/);
+});
+
+test("click, Enter, and Space emit shared map selection and keep the node keyboard reachable", async () => {
+  const page = await dashboard();
+
+  mapNode(page, "amber").dispatch("click");
+  assert.equal(page.elements.get("#selection-count").textContent, "1");
+  assert.equal(mapNode(page, "amber").attributes.get("aria-pressed"), "true");
+  assert.match(page.elements.get("#map-inspector").textContent, /amber-handle.*Codex CLI.*machine-a/i);
+
+  const enter = mapNode(page, "bravo").dispatch("keydown", { key: "Enter" });
+  assert.equal(enter.defaultPrevented, true);
+  assert.equal(page.elements.get("#selection-count").textContent, "2");
+  assert.equal(mapNode(page, "bravo").focused, true);
+
+  const space = mapNode(page, "bravo").dispatch("keydown", { key: " " });
+  assert.equal(space.defaultPrevented, true);
+  assert.equal(page.elements.get("#selection-count").textContent, "1");
+  assert.equal(mapNode(page, "bravo").attributes.get("aria-pressed"), "false");
+});
+
+test("Fit map restores the helper-derived viewport after zoom and pan changes", async () => {
+  const page = await dashboard();
+  const map = page.elements.get("#topology-map");
+  const fit = page.elements.get("#fit-map");
+  const transform = () => map.children[0].children[0].attributes.get("transform");
+  const fitted = transform();
+
+  map.dispatch("wheel", { deltaY: -120, clientX: 400, clientY: 260 });
+  map.dispatch("pointerdown", { pointerId: 7, clientX: 100, clientY: 100 });
+  map.dispatch("pointermove", { pointerId: 7, clientX: 160, clientY: 140 });
+  map.dispatch("pointerup", { pointerId: 7 });
+  assert.notEqual(transform(), fitted);
+
+  fit.dispatch("click");
+  assert.equal(transform(), fitted);
+});
+
+test("Fit map can use a helper scale below the interactive wheel minimum for crowded topology", async () => {
+  const crowded = snapshot();
+  crowded.machines = crowded.machines.slice(0, 1);
+  crowded.sessions = Array.from({ length: 40 }, (_, index) => entry(`session-${String(index).padStart(2, "0")}`));
+  crowded.direct_links = [];
+  crowded.groups = [];
+  const page = await dashboard({ fetchImpl: async () => ({ ok: true, json: async () => crowded }) });
+  const transform = page.elements.get("#topology-map").children[0].children[0].attributes.get("transform");
+  const scale = Number(transform.match(/scale\(([^)]+)\)/)[1]);
+
+  assert.ok(scale < 0.35, `expected Fit scale below wheel floor, got ${scale}`);
+  assert.ok(scale > 0);
 });
 
 test("selection count enables Link for exactly two and Create group for two or more", async () => {

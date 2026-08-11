@@ -36,6 +36,7 @@
   const listPanel = document.querySelector("#list-panel");
   const topologyMap = document.querySelector("#topology-map");
   const mapInspector = document.querySelector("#map-inspector");
+  const fitMapButton = document.getElementById?.("fit-map");
   const mapViewButton = document.querySelector("#map-view-button");
   const listViewButton = document.querySelector("#list-view-button");
   const loading = document.querySelector("#loading");
@@ -62,6 +63,13 @@
   const projectFilter = document.querySelector("#project-filter");
   const healthFilter = document.querySelector("#health-filter");
   const connectedFilter = document.querySelector("#connected-filter");
+  const svgNamespace = "http\u003a//www.w3.org/2000/svg";
+  let mapLayout = null;
+  let mapViewport = null;
+  let mapTransform = { x: 0, y: 0, scale: 1 };
+  let mapHasFit = false;
+  let mapDrag = null;
+  let mapNodesById = new Map();
 
   const known = (value) => value === null || value === undefined || value === "" ? "Unknown" : String(value);
 
@@ -133,6 +141,185 @@
     for (const [label, value] of items) list.append(detailItem(label, value));
     section.append(heading, list);
     return section;
+  };
+
+  const svgElement = (tagName, attributes = {}) => {
+    const element = document.createElementNS
+      ? document.createElementNS(svgNamespace, tagName)
+      : document.createElement(tagName);
+    for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+    return element;
+  };
+
+  const mapViewportSize = () => {
+    const bounds = topologyMap.getBoundingClientRect?.();
+    return {
+      width: Number.isFinite(bounds?.width) && bounds.width > 0 ? bounds.width : 800,
+      height: Number.isFinite(bounds?.height) && bounds.height > 0 ? bounds.height : 520
+    };
+  };
+
+  const boundedViewport = ({ x, y, scale }) => {
+    const viewport = mapViewportSize();
+    const nextScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    const bounds = mapLayout?.bounds;
+    if (!bounds?.width || !bounds?.height) {
+      return {
+        x: Number.isFinite(x) ? x : viewport.width / 2,
+        y: Number.isFinite(y) ? y : viewport.height / 2,
+        scale: nextScale
+      };
+    }
+    const contentWidth = bounds.width * nextScale;
+    const contentHeight = bounds.height * nextScale;
+    const xLimits = [64 - contentWidth, viewport.width - 64].sort((left, right) => left - right);
+    const yLimits = [64 - contentHeight, viewport.height - 64].sort((left, right) => left - right);
+    return {
+      x: Math.min(xLimits[1], Math.max(xLimits[0], Number.isFinite(x) ? x : 0)),
+      y: Math.min(yLimits[1], Math.max(yLimits[0], Number.isFinite(y) ? y : 0)),
+      scale: nextScale
+    };
+  };
+
+  const setViewport = (transform) => {
+    mapTransform = boundedViewport(transform || {});
+    mapViewport?.setAttribute("transform", `translate(${mapTransform.x} ${mapTransform.y}) scale(${mapTransform.scale})`);
+  };
+
+  const fitMap = () => {
+    if (!mapLayout) return;
+    setViewport(window.WireTopology.fitTransform(mapLayout, mapViewportSize()));
+  };
+
+  const paintInspector = (visible, layout) => {
+    const visibleById = new Map(visible.sessions.map((entry) => [entry.session.id, entry.session]));
+    const selected = [...state.selected].reverse().map((id) => visibleById.get(id)).find(Boolean);
+    mapInspector.classList.toggle("map-inspector--selected", Boolean(selected));
+    if (!selected) {
+      mapInspector.textContent = `${layout.nodes.length} visible session${layout.nodes.length === 1 ? "" : "s"} · ${layout.edges.length} direct link${layout.edges.length === 1 ? "" : "s"}`;
+      return;
+    }
+    mapInspector.replaceChildren(detailSection("Selected session", [
+      ["Handle", selected.handle],
+      ["Harness", selected.harness?.label],
+      ["Project", selected.project?.name],
+      ["Machine", selected.machine?.hostname],
+      ["DID", selected.did],
+      ["Health", selected.health]
+    ]));
+  };
+
+  const emitMapSelection = (id) => {
+    topologyMap.dispatchEvent(new CustomEvent("wire:toggle-selection", { detail: { id } }));
+    mapNodesById.get(id)?.focus();
+  };
+
+  const renderMap = (visible) => {
+    const viewportSize = mapViewportSize();
+    const layout = window.WireTopology.layoutTopology(visible, viewportSize);
+    const svg = svgElement("svg", {
+      class: "topology-svg",
+      viewBox: `0 0 ${viewportSize.width} ${viewportSize.height}`,
+      role: "img",
+      "aria-label": "Live Wire session topology"
+    });
+    const viewport = svgElement("g", { class: "topology-viewport" });
+    const machinesLayer = svgElement("g", { class: "topology-layer topology-machines" });
+    const groupsLayer = svgElement("g", { class: "topology-layer topology-groups" });
+    const edgesLayer = svgElement("g", { class: "topology-layer topology-edges" });
+    const nodesLayer = svgElement("g", { class: "topology-layer topology-nodes" });
+    machinesLayer.dataset.layer = "machines";
+    groupsLayer.dataset.layer = "groups";
+    edgesLayer.dataset.layer = "edges";
+    nodesLayer.dataset.layer = "nodes";
+
+    for (const machine of layout.machines) {
+      const confidence = machine.identity_confidence || "unverified";
+      const cluster = svgElement("g", {
+        class: `topology-machine topology-machine--${confidence === "verified" ? "verified" : "unverified"}`,
+        role: "group",
+        "aria-label": `${known(machine.hostname)} machine, ${confidence}`
+      });
+      cluster.append(
+        svgElement("rect", { x: machine.x, y: machine.y, width: machine.width, height: machine.height, rx: 6 }),
+        svgElement("text", { class: "topology-machine__name", x: machine.x + 18, y: machine.y + 25 }),
+        svgElement("text", { class: "topology-machine__confidence", x: machine.x + machine.width - 18, y: machine.y + 25, "text-anchor": "end" })
+      );
+      cluster.children[1].textContent = known(machine.hostname);
+      cluster.children[2].textContent = confidence;
+      machinesLayer.append(cluster);
+    }
+
+    for (const region of layout.groupRegions) {
+      const fragment = svgElement("g", {
+        class: "topology-group",
+        role: "group",
+        "aria-label": `${known(region.name)} group on ${known(region.machineId)}`
+      });
+      if (fragment.style?.setProperty) fragment.style.setProperty("--group-color", window.WireTopology.groupColor(region.groupId));
+      const rectangle = svgElement("rect", { x: region.x, y: region.y, width: region.width, height: region.height, rx: 8 });
+      const label = svgElement("text", { x: region.x + 9, y: region.y + 15 });
+      label.textContent = known(region.name);
+      fragment.append(rectangle, label);
+      groupsLayer.append(fragment);
+    }
+
+    for (const edge of layout.edges) {
+      const bilateral = edge.state === "bilateral";
+      edgesLayer.append(svgElement("path", {
+        class: `topology-edge topology-edge--${bilateral ? "bilateral" : "one-sided"}`,
+        d: edge.path,
+        "aria-label": `${bilateral ? "Bilateral" : "One-sided"} direct link`
+      }));
+    }
+
+    const nextNodesById = new Map();
+    for (const node of layout.nodes) {
+      const session = node.session;
+      const selected = state.selected.has(session.id);
+      const healthClass = session.health === "healthy" ? "healthy" : "warning";
+      const group = svgElement("g", {
+        class: `topology-node topology-node--${healthClass}${selected ? " topology-node--selected" : ""}`,
+        role: "button",
+        tabindex: "0",
+        "aria-pressed": String(selected),
+        "aria-label": `${known(session.handle)}, ${known(session.harness?.label)}, ${known(session.health)}`
+      });
+      group.dataset.sessionId = session.id;
+      if (group.style?.setProperty) group.style.setProperty("--persona-color", session.primary_hex || "#5b1a2e");
+      const body = svgElement("rect", { class: "topology-node__body", x: node.left, y: node.top, width: node.width, height: node.height, rx: 5 });
+      const ring = svgElement("circle", { class: "topology-health-ring", cx: node.left + 18, cy: node.top + 18, r: 11 });
+      const emoji = svgElement("text", { class: "topology-node__emoji", x: node.left + 18, y: node.top + 22, "text-anchor": "middle" });
+      const handle = svgElement("text", { class: "topology-node__handle", x: node.left + 36, y: node.top + 21 });
+      const harness = svgElement("text", { class: "topology-node__harness", x: node.left + 36, y: node.top + 38 });
+      emoji.textContent = known(session.emoji);
+      handle.textContent = known(session.handle);
+      harness.textContent = known(session.harness?.label);
+      group.append(body, ring, emoji, handle, harness);
+      group.addEventListener("click", () => emitMapSelection(session.id));
+      group.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        emitMapSelection(session.id);
+      });
+      nextNodesById.set(session.id, group);
+      nodesLayer.append(group);
+    }
+
+    viewport.append(machinesLayer, groupsLayer, edgesLayer, nodesLayer);
+    svg.append(viewport);
+    const fitOnFirstContent = layout.nodes.length > 0 && (!mapHasFit || !mapLayout?.nodes.length);
+    mapLayout = layout;
+    mapViewport = viewport;
+    mapNodesById = nextNodesById;
+    topologyMap.replaceChildren(svg);
+    if (fitOnFirstContent) {
+      fitMap();
+      mapHasFit = true;
+    } else {
+      setViewport(mapTransform);
+    }
+    paintInspector(visible, layout);
   };
 
   const toggleSelection = (id) => {
@@ -303,7 +490,7 @@
     mapViewButton.setAttribute("aria-pressed", String(state.activeView === "map"));
     listViewButton.setAttribute("aria-pressed", String(state.activeView === "list"));
     topologyMap.dataset.visibleSessionIds = sessions.map((session) => session.id).join(",");
-    mapInspector.textContent = `${sessions.length} visible session${sessions.length === 1 ? "" : "s"} · ${visible.directLinks.length} direct link${visible.directLinks.length === 1 ? "" : "s"}`;
+    renderMap(visible);
     if (!state.stale) {
       lastScan.textContent = `Scan ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     }
@@ -416,6 +603,41 @@
   mapViewButton.addEventListener("click", () => setView("map"));
   listViewButton.addEventListener("click", () => setView("list"));
   topologyMap.addEventListener("wire:toggle-selection", (event) => toggleSelection(event.detail?.id));
+  fitMapButton?.addEventListener("click", fitMap);
+  topologyMap.addEventListener("pointerdown", (event) => {
+    if ((event.button !== undefined && event.button !== 0) || event.target.closest?.(".topology-node")) return;
+    mapDrag = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: mapTransform.x, originY: mapTransform.y };
+    topologyMap.setPointerCapture?.(event.pointerId);
+  });
+  topologyMap.addEventListener("pointermove", (event) => {
+    if (!mapDrag || event.pointerId !== mapDrag.pointerId) return;
+    setViewport({
+      x: mapDrag.originX + event.clientX - mapDrag.x,
+      y: mapDrag.originY + event.clientY - mapDrag.y,
+      scale: mapTransform.scale
+    });
+  });
+  const finishMapDrag = (event) => {
+    if (!mapDrag || event.pointerId !== mapDrag.pointerId) return;
+    topologyMap.releasePointerCapture?.(event.pointerId);
+    mapDrag = null;
+  };
+  topologyMap.addEventListener("pointerup", finishMapDrag);
+  topologyMap.addEventListener("pointercancel", finishMapDrag);
+  topologyMap.addEventListener("wheel", (event) => {
+    if (!mapLayout?.nodes.length) return;
+    event.preventDefault();
+    const bounds = topologyMap.getBoundingClientRect?.() || { left: 0, top: 0 };
+    const pointX = event.clientX - bounds.left;
+    const pointY = event.clientY - bounds.top;
+    const scale = Math.min(2.5, Math.max(0.35, mapTransform.scale * Math.exp(-event.deltaY * 0.001)));
+    const ratio = scale / mapTransform.scale;
+    setViewport({
+      x: pointX - (pointX - mapTransform.x) * ratio,
+      y: pointY - (pointY - mapTransform.y) * ratio,
+      scale
+    });
+  }, { passive: false });
 
   const bindFilter = (element, key, eventName = "change") => {
     element.addEventListener(eventName, () => {
