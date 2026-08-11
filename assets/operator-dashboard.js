@@ -28,7 +28,9 @@
     busy: false,
     scanPromise: null,
     stale: false,
-    confirmedPair: []
+    confirmedPair: [],
+    confirmedGroup: null,
+    lastSuccessfulScanAt: ""
   };
   const rows = document.querySelector("#session-rows");
   const tableWrap = document.querySelector("#table-wrap");
@@ -57,6 +59,7 @@
   const groupForm = document.querySelector("#group-form");
   const groupName = document.querySelector("#group-name");
   const groupCreator = document.querySelector("#group-creator");
+  const cancelGroup = document.querySelector("#cancel-group");
   const searchFilter = document.querySelector("#search-filter");
   const machineFilter = document.querySelector("#machine-filter");
   const harnessFilter = document.querySelector("#harness-filter");
@@ -67,9 +70,25 @@
   let mapLayout = null;
   let mapViewport = null;
   let mapTransform = { x: 0, y: 0, scale: 1 };
+  let mapMinimumScale = 0.35;
   let mapHasFit = false;
   let mapDrag = null;
   let mapNodesById = new Map();
+
+  const focusedControlIdentity = () => {
+    const active = document.activeElement;
+    const control = active?.dataset?.focusControl;
+    const sessionId = active?.dataset?.sessionId;
+    return control && sessionId ? { control, sessionId } : null;
+  };
+
+  const restoreFocusedControl = (identity, listControls) => {
+    if (!identity) return;
+    const target = identity.control === "map-node"
+      ? mapNodesById.get(identity.sessionId)
+      : listControls.get(`${identity.control}:${identity.sessionId}`);
+    target?.focus({ preventScroll: true });
+  };
 
   const known = (value) => value === null || value === undefined || value === "" ? "Unknown" : String(value);
 
@@ -188,25 +207,40 @@
 
   const fitMap = () => {
     if (!mapLayout) return;
-    setViewport(window.WireTopology.fitTransform(mapLayout, mapViewportSize()));
+    const fitted = window.WireTopology.fitTransform(mapLayout, mapViewportSize());
+    mapMinimumScale = Math.min(0.35, fitted.scale);
+    setViewport(fitted);
   };
 
   const paintInspector = (visible, layout) => {
     const visibleById = new Map(visible.sessions.map((entry) => [entry.session.id, entry.session]));
     const selected = [...state.selected].reverse().map((id) => visibleById.get(id)).find(Boolean);
+    const anomalies = Array.isArray(state.topology.anomalies)
+      ? state.topology.anomalies.filter((anomaly) => anomaly && typeof anomaly === "object")
+      : [];
+    const content = [];
     mapInspector.classList.toggle("map-inspector--selected", Boolean(selected));
     if (!selected) {
-      mapInspector.textContent = `${layout.nodes.length} visible session${layout.nodes.length === 1 ? "" : "s"} · ${layout.edges.length} direct link${layout.edges.length === 1 ? "" : "s"}`;
-      return;
+      const summary = document.createElement("p");
+      summary.textContent = `${layout.nodes.length} visible session${layout.nodes.length === 1 ? "" : "s"} · ${layout.edges.length} direct link${layout.edges.length === 1 ? "" : "s"}`;
+      content.push(summary);
+    } else {
+      content.push(detailSection("Selected session", [
+        ["Handle", selected.handle],
+        ["Harness", selected.harness?.label],
+        ["Project", selected.project?.name],
+        ["Machine", selected.machine?.hostname],
+        ["DID", selected.did],
+        ["Health", selected.health]
+      ]));
     }
-    mapInspector.replaceChildren(detailSection("Selected session", [
-      ["Handle", selected.handle],
-      ["Harness", selected.harness?.label],
-      ["Project", selected.project?.name],
-      ["Machine", selected.machine?.hostname],
-      ["DID", selected.did],
-      ["Health", selected.health]
-    ]));
+    if (anomalies.length) {
+      content.push(detailSection("Topology anomalies", anomalies.map((anomaly) => [
+        `${known(anomaly.kind)} · ${known(anomaly.subject_id)}`,
+        anomaly.message
+      ])));
+    }
+    mapInspector.replaceChildren(...content);
   };
 
   const emitMapSelection = (id) => {
@@ -286,6 +320,7 @@
         "aria-label": `${known(session.handle)}, ${known(session.harness?.label)}, ${known(session.health)}`
       });
       group.dataset.sessionId = session.id;
+      group.dataset.focusControl = "map-node";
       if (group.style?.setProperty) group.style.setProperty("--persona-color", session.primary_hex || "#5b1a2e");
       const body = svgElement("rect", { class: "topology-node__body", x: node.left, y: node.top, width: node.width, height: node.height, rx: 5 });
       const ring = svgElement("circle", { class: "topology-health-ring", cx: node.left + 18, cy: node.top + 18, r: 11 });
@@ -360,9 +395,11 @@
   };
 
   const render = () => {
+    const focusIdentity = focusedControlIdentity();
     const visible = window.WireTopology.visibleTopology(state.topology, state.filters);
     const sessions = visible.sessions.map((entry) => entry.session);
     const fragment = document.createDocumentFragment();
+    const listControls = new Map();
 
     for (const session of sessions) {
       const row = document.createElement("tr");
@@ -372,8 +409,11 @@
       checkbox.type = "checkbox";
       checkbox.className = "session-check";
       checkbox.checked = state.selected.has(session.id);
+      checkbox.dataset.sessionId = session.id;
+      checkbox.dataset.focusControl = "row-checkbox";
       checkbox.setAttribute("aria-label", `Select ${session.handle}`);
       checkbox.addEventListener("change", () => toggleSelection(session.id));
+      listControls.set(`row-checkbox:${session.id}`, checkbox);
       selectCell.append(checkbox);
 
       const nameCell = cell("Session");
@@ -395,6 +435,8 @@
       const detailId = `details-${session.id}`;
       detailsButton.type = "button";
       detailsButton.className = "details-button";
+      detailsButton.dataset.sessionId = session.id;
+      detailsButton.dataset.focusControl = "inspect";
       detailsButton.textContent = expanded ? "Hide details" : "Inspect details";
       detailsButton.setAttribute("aria-expanded", String(expanded));
       detailsButton.setAttribute("aria-controls", detailId);
@@ -403,6 +445,7 @@
         else state.expanded.add(session.id);
         render();
       });
+      listControls.set(`inspect:${session.id}`, detailsButton);
       identity.append(uptime, detailsButton);
       name.append(emoji, identity);
       nameCell.append(name);
@@ -491,9 +534,8 @@
     listViewButton.setAttribute("aria-pressed", String(state.activeView === "list"));
     topologyMap.dataset.visibleSessionIds = sessions.map((session) => session.id).join(",");
     renderMap(visible);
-    if (!state.stale) {
-      lastScan.textContent = `Scan ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
-    }
+    if (!state.stale && state.lastSuccessfulScanAt) lastScan.textContent = `Scan ${state.lastSuccessfulScanAt}`;
+    restoreFocusedControl(focusIdentity, listControls);
     updateActions();
   };
 
@@ -513,6 +555,7 @@
         state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
         state.expanded = new Set([...state.expanded].filter((id) => liveIds.has(id)));
         state.stale = false;
+        state.lastSuccessfulScanAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
         populateFilterOptions();
         if (wasStale) showNotice(token ? "" : "Launch token missing. Restart wire dash --web.", token ? "ok" : "error");
         render();
@@ -531,20 +574,41 @@
   const mutate = async (path, body) => {
     state.busy = true;
     updateActions();
+    let outcome = { message: "Topology action failed.", kind: "error" };
     try {
+      if (state.scanPromise) await state.scanPromise;
       const response = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Wire-Token": token },
         body: JSON.stringify(body)
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Topology action failed.");
-      showNotice(payload.message || "Topology updated.");
-      state.selected.clear();
+      let payload = {};
+      try {
+        payload = await response.json();
+      } catch (_) {
+        payload = {};
+      }
+      const changed = Array.isArray(payload.changed_sessions)
+        ? payload.changed_sessions
+          .filter((value) => typeof value === "string")
+          .slice(0, 50)
+          .map((value) => value.slice(0, 128))
+        : [];
+      const baseMessage = response.ok
+        ? payload.message || "Topology updated."
+        : payload.error || "Topology action failed.";
+      outcome = {
+        message: `${baseMessage}${changed.length ? ` Changed sessions: ${changed.join(", ")}.` : ""}`,
+        kind: response.ok ? "ok" : "error"
+      };
+      if (response.ok) state.selected.clear();
       await scan();
     } catch (error) {
-      showNotice(error.message || "Topology action failed.", "error");
+      outcome = { message: error.message || "Topology action failed.", kind: "error" };
+      await scan();
     } finally {
+      if (state.stale) outcome.message += " Topology refresh failed; showing stale data.";
+      showNotice(outcome.message, outcome.kind);
       state.busy = false;
       updateActions();
     }
@@ -558,11 +622,12 @@
     confirmDialog.showModal();
   });
 
-  confirmLink.addEventListener("click", (event) => {
+  confirmLink.addEventListener("click", async (event) => {
     event.preventDefault();
-    const liveIds = new Set(allSessions().map((session) => session.id));
     const sessions = [...state.confirmedPair];
     confirmDialog.close();
+    if (state.scanPromise) await state.scanPromise;
+    const liveIds = new Set(allSessions().map((session) => session.id));
     if (sessions.length !== 2 || sessions.some((id) => !liveIds.has(id))) {
       showNotice("One of those sessions is no longer live. Select the pair again.", "error");
       state.confirmedPair = [];
@@ -575,6 +640,8 @@
   groupButton.addEventListener("click", () => {
     const selected = selectedSessions();
     if (selected.length < 2) return;
+    const members = selected.map((session) => session.id);
+    state.confirmedGroup = { members, creator: members[0] };
     const options = selected.map((session) => {
       const option = document.createElement("option");
       option.value = session.id;
@@ -582,17 +649,48 @@
       return option;
     });
     groupCreator.replaceChildren(...options);
+    groupCreator.value = state.confirmedGroup.creator;
     groupDialog.showModal();
     groupName.focus();
   });
 
-  groupForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    if (!groupName.reportValidity()) return;
-    const members = selectedSessions().map((session) => session.id);
-    const body = { name: groupName.value.trim(), creator: groupCreator.value, members };
+  groupCreator.addEventListener("change", () => {
+    if (state.confirmedGroup?.members.includes(groupCreator.value)) {
+      state.confirmedGroup.creator = groupCreator.value;
+    }
+  });
+
+  const closeGroupDialog = () => {
     groupDialog.close();
     groupForm.reset();
+    state.confirmedGroup = null;
+  };
+
+  cancelGroup.addEventListener("click", closeGroupDialog);
+
+  groupForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!groupName.reportValidity()) return;
+    if (state.scanPromise) await state.scanPromise;
+    const confirmed = state.confirmedGroup;
+    const liveIds = new Set(allSessions().map((session) => session.id));
+    const selectedIds = new Set(selectedSessions().map((session) => session.id));
+    const unchanged = confirmed
+      && selectedIds.size === confirmed.members.length
+      && confirmed.members.every((id) => selectedIds.has(id) && liveIds.has(id))
+      && confirmed.members.includes(confirmed.creator)
+      && confirmed.creator === groupCreator.value;
+    if (!unchanged) {
+      closeGroupDialog();
+      showNotice("The selected group sessions changed or are no longer live. Select them again.", "error");
+      return;
+    }
+    const body = {
+      name: groupName.value.trim(),
+      creator: confirmed.creator,
+      members: [...confirmed.members]
+    };
+    closeGroupDialog();
     void mutate("/api/groups", body);
   });
 
@@ -630,7 +728,7 @@
     const bounds = topologyMap.getBoundingClientRect?.() || { left: 0, top: 0 };
     const pointX = event.clientX - bounds.left;
     const pointY = event.clientY - bounds.top;
-    const scale = Math.min(2.5, Math.max(0.35, mapTransform.scale * Math.exp(-event.deltaY * 0.001)));
+    const scale = Math.min(2.5, Math.max(mapMinimumScale, mapTransform.scale * Math.exp(-event.deltaY * 0.001)));
     const ratio = scale / mapTransform.scale;
     setViewport({
       x: pointX - (pointX - mapTransform.x) * ratio,

@@ -208,6 +208,24 @@ async fn get_topology(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+async fn run_mutation(
+    state: &AppState,
+    action: impl FnOnce() -> Result<crate::operator::MutationResult, crate::operator::OperatorError>
+    + Send
+    + 'static,
+) -> Response {
+    let _scan = state.scan_lock.lock().await;
+    match tokio::task::spawn_blocking(action).await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(error)) => operator_error(error),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operator action failed",
+            Vec::new(),
+        ),
+    }
+}
+
 async fn post_links(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -222,15 +240,10 @@ async fn post_links(
             return error_response(error.status(), "request must be JSON", Vec::new());
         }
     };
-    match tokio::task::spawn_blocking(move || crate::operator::link_local_sessions(request)).await {
-        Ok(Ok(result)) => Json(result).into_response(),
-        Ok(Err(error)) => operator_error(error),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "operator action failed",
-            Vec::new(),
-        ),
-    }
+    run_mutation(&state, move || {
+        crate::operator::link_local_sessions(request)
+    })
+    .await
 }
 
 async fn post_groups(
@@ -247,20 +260,45 @@ async fn post_groups(
             return error_response(error.status(), "request must be JSON", Vec::new());
         }
     };
-    match tokio::task::spawn_blocking(move || crate::operator::create_local_group(request)).await {
-        Ok(Ok(result)) => Json(result).into_response(),
-        Ok(Err(error)) => operator_error(error),
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "operator action failed",
-            Vec::new(),
-        ),
-    }
+    run_mutation(&state, move || crate::operator::create_local_group(request)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mutation_work_waits_for_the_inventory_scan_lock() {
+        let state = AppState {
+            token: "test-token".to_string(),
+            scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let scan = state.scan_lock.lock().await;
+        let action_state = state.clone();
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let action = tokio::spawn(async move {
+            run_mutation(&action_state, move || {
+                let _ = started_tx.send(());
+                Ok(crate::operator::MutationResult {
+                    ok: true,
+                    message: "changed".to_string(),
+                    changed_sessions: Vec::new(),
+                })
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(scan);
+
+        let response = action.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        started_rx.await.unwrap();
+    }
 
     #[tokio::test]
     async fn mutation_routes_require_token_and_json() {
@@ -394,6 +432,10 @@ mod tests {
         assert!(html.contains("Link selected"));
         assert!(html.contains("Create group"));
         assert!(html.contains("aria-labelledby=\"group-title\""));
+        assert!(
+            html.contains("id=\"cancel-group\" type=\"button\""),
+            "group Cancel must not submit the creation form"
+        );
         let topology_script = html.find("/topology.js").unwrap();
         let dashboard_script = html.find("/dashboard.js").unwrap();
         assert!(topology_script < dashboard_script);

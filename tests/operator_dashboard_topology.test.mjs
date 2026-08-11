@@ -15,6 +15,8 @@ class ElementStub {
     this.disabled = false;
     this.checked = false;
     this.value = "";
+    this.ownerDocument = null;
+    this.resetCount = 0;
     this._textContent = "";
     this.style = {
       values: new Map(),
@@ -59,11 +61,14 @@ class ElementStub {
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   showModal() { this.open = true; }
   close() { this.open = false; }
-  focus() { this.focused = true; }
+  focus() {
+    this.focused = true;
+    if (this.ownerDocument) this.ownerDocument.activeElement = this;
+  }
   getBoundingClientRect() { return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight }; }
   setPointerCapture() {}
   releasePointerCapture() {}
-  reset() {}
+  reset() { this.resetCount += 1; }
   reportValidity() { return true; }
 }
 
@@ -130,16 +135,18 @@ const selectors = [
   "#map-view-button", "#list-view-button", "#loading", "#empty", "#empty-title", "#empty-copy",
   "#notice", "#live-count", "#last-scan", "#selection-count", "#action-hint", "#link-button",
   "#group-button", "#confirm-dialog", "#confirm-copy", "#confirm-link", "#group-dialog", "#group-form",
-  "#group-name", "#group-creator", "#search-filter", "#machine-filter", "#harness-filter",
+  "#group-name", "#group-creator", "#cancel-group", "#search-filter", "#machine-filter", "#harness-filter",
   "#project-filter", "#health-filter", "#connected-filter"
 ];
 
-const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
+const dashboard = async ({ token = "test-token", fetchImpl, DateImpl = Date } = {}) => {
   const elements = new Map(selectors.map((selector) => [selector, new ElementStub(selector.slice(1))]));
   const created = [];
   const requests = [];
   const intervals = [];
   const document = new ElementStub("document");
+  document.activeElement = null;
+  for (const element of elements.values()) element.ownerDocument = document;
   document.querySelector = (selector) => {
     if (!elements.has(selector)) throw new Error(`Unexpected dashboard selector: ${selector}`);
     return elements.get(selector);
@@ -147,6 +154,7 @@ const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
   document.createElement = (tagName) => {
     const element = new ElementStub();
     element.tagName = tagName.toUpperCase();
+    element.ownerDocument = document;
     created.push(element);
     return element;
   };
@@ -176,6 +184,7 @@ const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
   }
   const context = {
     CustomEvent,
+    Date: DateImpl,
     URLSearchParams,
     console,
     document,
@@ -207,6 +216,10 @@ const renderedRows = (page) => {
 const checkboxFor = (page, handle) => renderedRows(page)
   .map((row) => row.children[0].children[0])
   .find((element) => element.attributes.get("aria-label") === `Select ${handle}`);
+
+const inspectFor = (page, id) => descendants(
+  renderedRows(page).find((row) => row.dataset.sessionId === id)
+).find((element) => element.className === "details-button");
 
 test("map selection survives List and Map view changes", async () => {
   const page = await dashboard();
@@ -311,6 +324,25 @@ test("Fit map can use a helper scale below the interactive wheel minimum for cro
   assert.ok(scale > 0);
 });
 
+test("wheel zoom stays within the fitted lower bound and interactive upper bound", async () => {
+  const crowded = snapshot();
+  crowded.machines = crowded.machines.slice(0, 1);
+  crowded.sessions = Array.from({ length: 40 }, (_, index) => entry(`session-${String(index).padStart(2, "0")}`));
+  crowded.direct_links = [];
+  crowded.groups = [];
+  const page = await dashboard({ fetchImpl: async () => ({ ok: true, json: async () => crowded }) });
+  const map = page.elements.get("#topology-map");
+  const scale = () => Number(map.children[0].children[0].attributes.get("transform").match(/scale\(([^)]+)\)/)[1]);
+  const fitted = scale();
+  assert.ok(fitted < 0.35);
+
+  map.dispatch("wheel", { deltaY: 100_000, clientX: 400, clientY: 260 });
+  assert.ok(scale() <= fitted, `zooming out from ${fitted} must not jump in to ${scale()}`);
+
+  map.dispatch("wheel", { deltaY: -100_000, clientX: 400, clientY: 260 });
+  assert.equal(scale(), 2.5);
+});
+
 test("selection count enables Link for exactly two and Create group for two or more", async () => {
   const page = await dashboard();
   const map = page.elements.get("#topology-map");
@@ -400,4 +432,190 @@ test("interaction after a failed refresh preserves the stale scan timestamp", as
   assert.match(recoveredLabel, /^Scan /);
   assert.notEqual(recoveredLabel, failedLabel);
   assert.equal(responses.length, 0);
+});
+
+test("successful scan timestamp remains stable across selection and filter renders", async () => {
+  let tick = 0;
+  class TickDate {
+    toLocaleTimeString() { return `time-${++tick}`; }
+  }
+  const page = await dashboard({ DateImpl: TickDate });
+  const initial = page.elements.get("#last-scan").textContent;
+
+  page.elements.get("#topology-map").dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  assert.equal(page.elements.get("#last-scan").textContent, initial);
+
+  const search = page.elements.get("#search-filter");
+  search.value = "amber";
+  search.dispatch("input");
+  assert.equal(page.elements.get("#last-scan").textContent, initial);
+  assert.equal(tick, 1, "only the successful scan records a time");
+});
+
+test("successful polls restore focus to stable map, checkbox, and Inspect controls", async () => {
+  const page = await dashboard();
+
+  const oldMapNode = mapNode(page, "amber");
+  oldMapNode.focus();
+  page.intervals[0]();
+  await flush();
+  assert.notEqual(mapNode(page, "amber"), oldMapNode);
+  assert.equal(page.document.activeElement, mapNode(page, "amber"));
+
+  page.elements.get("#list-view-button").dispatch("click");
+  const oldCheckbox = checkboxFor(page, "amber-handle");
+  oldCheckbox.focus();
+  page.intervals[0]();
+  await flush();
+  assert.notEqual(checkboxFor(page, "amber-handle"), oldCheckbox);
+  assert.equal(page.document.activeElement, checkboxFor(page, "amber-handle"));
+
+  const oldInspect = inspectFor(page, "amber");
+  oldInspect.focus();
+  page.intervals[0]();
+  await flush();
+  assert.notEqual(inspectFor(page, "amber"), oldInspect);
+  assert.equal(page.document.activeElement, inspectFor(page, "amber"));
+});
+
+test("group Cancel closes and resets the dialog without a POST", async () => {
+  const page = await dashboard();
+  const map = page.elements.get("#topology-map");
+  map.dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  map.dispatch("wire:toggle-selection", { detail: { id: "bravo" } });
+  page.elements.get("#group-button").dispatch("click");
+  page.elements.get("#group-name").value = "crew";
+  page.elements.get("#group-creator").value = "amber";
+
+  page.elements.get("#cancel-group").dispatch("click");
+
+  assert.equal(page.elements.get("#group-dialog").open, false);
+  assert.equal(page.elements.get("#group-form").resetCount, 1);
+  assert.equal(page.requests.filter((request) => request.options?.method === "POST").length, 0);
+});
+
+test("group submit aborts with zero POST when a successful poll changes confirmed members", async () => {
+  let topologyFetches = 0;
+  let finishPoll;
+  const page = await dashboard({
+    fetchImpl: async (path) => {
+      if (path === "/api/groups") {
+        return { ok: true, json: async () => ({ ok: true, message: "created", changed_sessions: [] }) };
+      }
+      topologyFetches += 1;
+      if (topologyFetches === 1) return { ok: true, json: async () => snapshot() };
+      return new Promise((resolve) => {
+        const changed = snapshot();
+        changed.sessions = changed.sessions.filter((item) => item.session.id !== "bravo");
+        finishPoll = () => resolve({ ok: true, json: async () => changed });
+      });
+    }
+  });
+  const map = page.elements.get("#topology-map");
+  map.dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  map.dispatch("wire:toggle-selection", { detail: { id: "bravo" } });
+  page.elements.get("#group-button").dispatch("click");
+  page.elements.get("#group-name").value = "crew";
+  page.elements.get("#group-creator").value = "amber";
+
+  page.intervals[0]();
+  finishPoll();
+  await flush();
+  page.elements.get("#group-form").dispatch("submit");
+
+  assert.equal(page.requests.filter((request) => request.path === "/api/groups").length, 0);
+  assert.match(page.elements.get("#notice").textContent, /changed|no longer live|select again/i);
+});
+
+test("mutation waits for a pre-action poll and starts a fresh post-action scan", async () => {
+  let topologyFetches = 0;
+  let finishPoll;
+  const page = await dashboard({
+    fetchImpl: async (path) => {
+      if (path === "/api/links") {
+        return { ok: true, json: async () => ({ ok: true, message: "linked", changed_sessions: ["amber", "bravo"] }) };
+      }
+      topologyFetches += 1;
+      if (topologyFetches === 2) {
+        return new Promise((resolve) => {
+          finishPoll = () => resolve({ ok: true, json: async () => snapshot() });
+        });
+      }
+      return { ok: true, json: async () => snapshot() };
+    }
+  });
+  const map = page.elements.get("#topology-map");
+  map.dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  map.dispatch("wire:toggle-selection", { detail: { id: "bravo" } });
+  page.intervals[0]();
+  page.elements.get("#link-button").dispatch("click");
+  page.elements.get("#confirm-link").dispatch("click");
+
+  assert.equal(page.requests.filter((request) => request.path === "/api/links").length, 0);
+  finishPoll();
+  await flush();
+  await flush();
+
+  assert.deepEqual(
+    page.requests.map((request) => request.path),
+    ["/api/topology", "/api/topology", "/api/links", "/api/topology"]
+  );
+});
+
+test("link conflicts trigger a fresh topology scan", async () => {
+  const page = await dashboard({
+    fetchImpl: async (path) => path === "/api/links"
+      ? { ok: false, json: async () => ({ error: "session vanished", changed_sessions: [] }) }
+      : { ok: true, json: async () => snapshot() }
+  });
+  const map = page.elements.get("#topology-map");
+  map.dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  map.dispatch("wire:toggle-selection", { detail: { id: "bravo" } });
+  page.elements.get("#link-button").dispatch("click");
+  page.elements.get("#confirm-link").dispatch("click");
+  await flush();
+  await flush();
+
+  assert.equal(page.requests.filter((request) => request.path === "/api/topology").length, 2);
+  assert.match(page.elements.get("#notice").textContent, /session vanished/i);
+});
+
+test("group partial failures refresh and expose changed sessions as text", async () => {
+  const changed = "<b>bravo</b>";
+  const page = await dashboard({
+    fetchImpl: async (path) => path === "/api/groups"
+      ? { ok: false, json: async () => ({ error: "join failed", changed_sessions: ["amber", changed] }) }
+      : { ok: true, json: async () => snapshot() }
+  });
+  const map = page.elements.get("#topology-map");
+  map.dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  map.dispatch("wire:toggle-selection", { detail: { id: "bravo" } });
+  page.elements.get("#group-button").dispatch("click");
+  page.elements.get("#group-name").value = "crew";
+  page.elements.get("#group-creator").value = "amber";
+  page.elements.get("#group-creator").dispatch("change");
+  page.elements.get("#group-form").dispatch("submit");
+  await flush();
+  await flush();
+
+  assert.equal(page.requests.filter((request) => request.path === "/api/topology").length, 2);
+  assert.match(page.elements.get("#notice").textContent, /amber.*<b>bravo<\/b>/);
+  assert.equal(page.created.some((element) => element.tagName === "B"), false);
+});
+
+test("safe topology anomalies retain the conflicting group subject ID in the inspector", async () => {
+  const subject = "crew-<img src=x>";
+  const topology = snapshot();
+  topology.anomalies = [{
+    kind: "conflicting-group",
+    subject_id: subject,
+    message: "Live sessions disagree about the highest group roster"
+  }];
+  const page = await dashboard({ fetchImpl: async () => ({ ok: true, json: async () => topology }) });
+
+  assert.match(page.elements.get("#map-inspector").textContent, /Topology anomalies/);
+  assert.match(page.elements.get("#map-inspector").textContent, /crew-<img src=x>/);
+  page.elements.get("#topology-map").dispatch("wire:toggle-selection", { detail: { id: "amber" } });
+  assert.match(page.elements.get("#map-inspector").textContent, /crew-<img src=x>/);
+  assert.equal(page.created.some((element) => element.tagName === "IMG"), false);
 });

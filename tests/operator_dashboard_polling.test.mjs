@@ -14,8 +14,17 @@ class ElementStub {
     this.hidden = false;
     this.disabled = false;
     this.checked = false;
-    this.textContent = "";
+    this._textContent = "";
     this.style = {};
+  }
+
+  get textContent() {
+    return this._textContent + this.children.map((child) => child?.textContent || "").join("");
+  }
+
+  set textContent(value) {
+    this._textContent = String(value);
+    this.children = [];
   }
 
   addEventListener(type, listener) {
@@ -30,7 +39,7 @@ class ElementStub {
   }
 
   append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  replaceChildren(...children) { this._textContent = ""; this.children = children; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   showModal() { this.open = true; }
   close() { this.open = false; }
@@ -71,7 +80,7 @@ const selectors = [
   "#map-view-button", "#list-view-button", "#loading", "#empty", "#empty-title", "#empty-copy",
   "#notice", "#live-count", "#last-scan", "#selection-count", "#action-hint", "#link-button",
   "#group-button", "#confirm-dialog", "#confirm-copy", "#confirm-link", "#group-dialog", "#group-form",
-  "#group-name", "#group-creator", "#search-filter", "#machine-filter", "#harness-filter",
+  "#group-name", "#group-creator", "#cancel-group", "#search-filter", "#machine-filter", "#harness-filter",
   "#project-filter", "#health-filter", "#connected-filter"
 ];
 
