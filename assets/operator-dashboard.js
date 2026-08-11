@@ -7,11 +7,41 @@
   const token = queryToken || window.sessionStorage.getItem("wire-launch-token") || "";
   window.history.replaceState({}, "", window.location.pathname);
 
-  const state = { sessions: [], selected: new Set(), expanded: new Set(), confirmedPair: [], busy: false, scanPromise: null };
+  const emptyTopology = Object.freeze({
+    schema: "wire-topology-v1",
+    generated_at: "",
+    machines: [],
+    sessions: [],
+    direct_links: [],
+    groups: [],
+    anomalies: []
+  });
+  const state = {
+    topology: emptyTopology,
+    selected: new Set(),
+    expanded: new Set(),
+    filters: {
+      search: "", machine: "", harness: "", project: "", health: "",
+      connectedOnly: false
+    },
+    activeView: "map",
+    busy: false,
+    scanPromise: null,
+    stale: false,
+    confirmedPair: []
+  };
   const rows = document.querySelector("#session-rows");
   const tableWrap = document.querySelector("#table-wrap");
+  const mapPanel = document.querySelector("#map-panel");
+  const listPanel = document.querySelector("#list-panel");
+  const topologyMap = document.querySelector("#topology-map");
+  const mapInspector = document.querySelector("#map-inspector");
+  const mapViewButton = document.querySelector("#map-view-button");
+  const listViewButton = document.querySelector("#list-view-button");
   const loading = document.querySelector("#loading");
   const empty = document.querySelector("#empty");
+  const emptyTitle = document.querySelector("#empty-title");
+  const emptyCopy = document.querySelector("#empty-copy");
   const notice = document.querySelector("#notice");
   const liveCount = document.querySelector("#live-count");
   const lastScan = document.querySelector("#last-scan");
@@ -26,6 +56,12 @@
   const groupForm = document.querySelector("#group-form");
   const groupName = document.querySelector("#group-name");
   const groupCreator = document.querySelector("#group-creator");
+  const searchFilter = document.querySelector("#search-filter");
+  const machineFilter = document.querySelector("#machine-filter");
+  const harnessFilter = document.querySelector("#harness-filter");
+  const projectFilter = document.querySelector("#project-filter");
+  const healthFilter = document.querySelector("#health-filter");
+  const connectedFilter = document.querySelector("#connected-filter");
 
   const known = (value) => value === null || value === undefined || value === "" ? "Unknown" : String(value);
 
@@ -43,7 +79,11 @@
     notice.hidden = !message;
   };
 
-  const selectedSessions = () => state.sessions.filter((session) => state.selected.has(session.id));
+  const sessionEntries = () => Array.isArray(state.topology.sessions) ? state.topology.sessions : [];
+  const allSessions = () => sessionEntries()
+    .filter((entry) => entry && entry.session)
+    .map((entry) => entry.session);
+  const selectedSessions = () => allSessions().filter((session) => state.selected.has(session.id));
 
   const updateActions = () => {
     const count = state.selected.size;
@@ -95,25 +135,58 @@
     return section;
   };
 
+  const toggleSelection = (id) => {
+    if (!allSessions().some((session) => session.id === id)) return;
+    if (state.selected.has(id)) state.selected.delete(id);
+    else state.selected.add(id);
+    render();
+  };
+
+  const option = (value, label = value) => {
+    const element = document.createElement("option");
+    element.value = value;
+    element.textContent = label;
+    return element;
+  };
+
+  const replaceOptions = (select, values, labels = new Map()) => {
+    const current = select.value;
+    const options = [option("", "All")];
+    for (const value of [...values].sort((left, right) => left.localeCompare(right))) {
+      options.push(option(value, labels.get(value) || value));
+    }
+    select.replaceChildren(...options);
+    select.value = values.has(current) ? current : "";
+  };
+
+  const populateFilterOptions = () => {
+    const entries = sessionEntries().filter((entry) => entry && entry.session);
+    const machineLabels = new Map((state.topology.machines || []).map((machine) => [machine.id, machine.hostname || machine.id]));
+    replaceOptions(machineFilter, new Set(entries.map((entry) => entry.machine_id).filter(Boolean)), machineLabels);
+    replaceOptions(harnessFilter, new Set(entries.map((entry) => entry.session.harness?.label).filter(Boolean)));
+    replaceOptions(projectFilter, new Set(entries.map((entry) => entry.session.project?.name).filter(Boolean)));
+    replaceOptions(healthFilter, new Set(entries.map((entry) => entry.session.health).filter(Boolean)));
+    state.filters.machine = machineFilter.value;
+    state.filters.harness = harnessFilter.value;
+    state.filters.project = projectFilter.value;
+    state.filters.health = healthFilter.value;
+  };
+
   const render = () => {
-    const liveIds = new Set(state.sessions.map((session) => session.id));
-    state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
-    state.expanded = new Set([...state.expanded].filter((id) => liveIds.has(id)));
+    const visible = window.WireTopology.visibleTopology(state.topology, state.filters);
+    const sessions = visible.sessions.map((entry) => entry.session);
     const fragment = document.createDocumentFragment();
 
-    for (const session of state.sessions) {
+    for (const session of sessions) {
       const row = document.createElement("tr");
+      row.dataset.sessionId = session.id;
       const selectCell = cell("Select");
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.className = "session-check";
       checkbox.checked = state.selected.has(session.id);
       checkbox.setAttribute("aria-label", `Select ${session.handle}`);
-      checkbox.addEventListener("change", () => {
-        if (checkbox.checked) state.selected.add(session.id);
-        else state.selected.delete(session.id);
-        updateActions();
-      });
+      checkbox.addEventListener("change", () => toggleSelection(session.id));
       selectCell.append(checkbox);
 
       const nameCell = cell("Session");
@@ -214,10 +287,23 @@
       fragment.append(detailRow);
     }
     rows.replaceChildren(fragment);
-    liveCount.textContent = String(state.sessions.length);
+    const liveSessions = allSessions();
+    const hasLiveSessions = liveSessions.length !== 0;
+    const hasVisibleSessions = sessions.length !== 0;
+    liveCount.textContent = String(liveSessions.length);
     loading.hidden = true;
-    empty.hidden = state.sessions.length !== 0;
-    tableWrap.hidden = state.sessions.length === 0;
+    empty.hidden = hasVisibleSessions;
+    emptyTitle.textContent = hasLiveSessions ? "Filters hide all live sessions" : "No live agent sessions";
+    emptyCopy.textContent = hasLiveSessions
+      ? "Clear or change filters to bring sessions back into view."
+      : "Start a Codex, Claude, or Goose session with Wire enabled. It will appear on the next scan.";
+    mapPanel.hidden = state.activeView !== "map" || !hasVisibleSessions;
+    listPanel.hidden = state.activeView !== "list" || !hasVisibleSessions;
+    tableWrap.hidden = !hasVisibleSessions;
+    mapViewButton.setAttribute("aria-pressed", String(state.activeView === "map"));
+    listViewButton.setAttribute("aria-pressed", String(state.activeView === "list"));
+    topologyMap.dataset.visibleSessionIds = sessions.map((session) => session.id).join(",");
+    mapInspector.textContent = `${sessions.length} visible session${sessions.length === 1 ? "" : "s"} · ${visible.directLinks.length} direct link${visible.directLinks.length === 1 ? "" : "s"}`;
     lastScan.textContent = `Scan ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     updateActions();
   };
@@ -226,17 +312,28 @@
     if (state.scanPromise) return state.scanPromise;
     state.scanPromise = (async () => {
       try {
-        const response = await fetch("/api/sessions", {
+        const response = await fetch("/api/topology", {
           cache: "no-store",
           headers: { "X-Wire-Token": token }
         });
-        if (!response.ok) throw new Error("Could not read live sessions.");
-        const report = await response.json();
-        state.sessions = Array.isArray(report.sessions) ? report.sessions : [];
+        if (!response.ok) throw new Error("Could not refresh topology.");
+        const topology = await response.json();
+        const wasStale = state.stale;
+        state.topology = topology && typeof topology === "object" ? topology : emptyTopology;
+        const liveIds = new Set(allSessions().map((session) => session.id));
+        state.selected = new Set([...state.selected].filter((id) => liveIds.has(id)));
+        state.expanded = new Set([...state.expanded].filter((id) => liveIds.has(id)));
+        state.stale = false;
+        populateFilterOptions();
+        if (wasStale) showNotice(token ? "" : "Launch token missing. Restart wire dash --web.", token ? "ok" : "error");
         render();
       } catch (error) {
+        state.stale = true;
         loading.hidden = true;
-        showNotice(error.message || "Session scan failed.", "error");
+        const failedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        lastScan.textContent = `Refresh failed ${failedAt} · showing stale data`;
+        showNotice(`${error.message || "Topology refresh failed."} Showing the last known topology.`, "error");
+        updateActions();
       }
     })().finally(() => { state.scanPromise = null; });
     return state.scanPromise;
@@ -274,7 +371,7 @@
 
   confirmLink.addEventListener("click", (event) => {
     event.preventDefault();
-    const liveIds = new Set(state.sessions.map((session) => session.id));
+    const liveIds = new Set(allSessions().map((session) => session.id));
     const sessions = [...state.confirmedPair];
     confirmDialog.close();
     if (sessions.length !== 2 || sessions.some((id) => !liveIds.has(id))) {
@@ -308,6 +405,35 @@
     groupDialog.close();
     groupForm.reset();
     void mutate("/api/groups", body);
+  });
+
+  const setView = (view) => {
+    state.activeView = view;
+    render();
+  };
+  mapViewButton.addEventListener("click", () => setView("map"));
+  listViewButton.addEventListener("click", () => setView("list"));
+  topologyMap.addEventListener("wire:toggle-selection", (event) => toggleSelection(event.detail?.id));
+
+  const bindFilter = (element, key, eventName = "change") => {
+    element.addEventListener(eventName, () => {
+      state.filters[key] = element.value;
+      render();
+    });
+  };
+  bindFilter(searchFilter, "search", "input");
+  bindFilter(machineFilter, "machine");
+  bindFilter(harnessFilter, "harness");
+  bindFilter(projectFilter, "project");
+  bindFilter(healthFilter, "health");
+  connectedFilter.addEventListener("change", () => {
+    state.filters.connectedOnly = connectedFilter.checked;
+    render();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || state.selected.size === 0) return;
+    state.selected.clear();
+    render();
   });
 
   if (!token) showNotice("Launch token missing. Restart wire dash --web.", "error");
