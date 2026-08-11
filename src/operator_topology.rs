@@ -71,8 +71,14 @@ struct TopologySource {
 }
 
 enum GroupResolution {
-    Accepted(crate::group::Group),
-    Conflicted { epoch: u64 },
+    Accepted {
+        group: crate::group::Group,
+        holders: BTreeSet<String>,
+    },
+    Conflicted {
+        epoch: u64,
+        holders: BTreeSet<String>,
+    },
 }
 
 pub fn collect_topology() -> Result<TopologyReport> {
@@ -195,33 +201,64 @@ fn build_topology(
     }
 
     let mut group_resolutions = BTreeMap::<String, GroupResolution>::new();
-    for group in sources.iter().flat_map(|source| source.groups.iter()) {
-        match group_resolutions.get_mut(&group.id) {
-            None => {
-                group_resolutions
-                    .insert(group.id.clone(), GroupResolution::Accepted(group.clone()));
-            }
-            Some(GroupResolution::Accepted(existing)) if group.epoch > existing.epoch => {
-                *existing = group.clone();
-            }
-            Some(GroupResolution::Accepted(existing)) if group.epoch == existing.epoch => {
-                if !groups_agree(existing, group) {
-                    let epoch = existing.epoch;
-                    group_resolutions
-                        .insert(group.id.clone(), GroupResolution::Conflicted { epoch });
+    for source in &sources {
+        for group in &source.groups {
+            let holder = source.session.did.clone();
+            match group_resolutions.get_mut(&group.id) {
+                None => {
+                    group_resolutions.insert(
+                        group.id.clone(),
+                        GroupResolution::Accepted {
+                            group: group.clone(),
+                            holders: BTreeSet::from([holder]),
+                        },
+                    );
+                }
+                Some(GroupResolution::Accepted {
+                    group: existing,
+                    holders,
+                }) if group.epoch > existing.epoch => {
+                    *existing = group.clone();
+                    holders.insert(holder);
+                }
+                Some(GroupResolution::Accepted {
+                    group: existing,
+                    holders,
+                }) if group.epoch == existing.epoch => {
+                    if !groups_agree(existing, group) {
+                        let epoch = existing.epoch;
+                        let mut holders = std::mem::take(holders);
+                        holders.insert(holder);
+                        group_resolutions.insert(
+                            group.id.clone(),
+                            GroupResolution::Conflicted { epoch, holders },
+                        );
+                    } else {
+                        holders.insert(holder);
+                    }
+                }
+                Some(GroupResolution::Conflicted { epoch, holders }) if group.epoch > *epoch => {
+                    let mut holders = std::mem::take(holders);
+                    holders.insert(holder);
+                    group_resolutions.insert(
+                        group.id.clone(),
+                        GroupResolution::Accepted {
+                            group: group.clone(),
+                            holders,
+                        },
+                    );
+                }
+                Some(GroupResolution::Accepted { holders, .. })
+                | Some(GroupResolution::Conflicted { holders, .. }) => {
+                    holders.insert(holder);
                 }
             }
-            Some(GroupResolution::Conflicted { epoch }) if group.epoch > *epoch => {
-                group_resolutions
-                    .insert(group.id.clone(), GroupResolution::Accepted(group.clone()));
-            }
-            _ => {}
         }
     }
     let mut groups = Vec::new();
     for (id, resolution) in group_resolutions {
         match resolution {
-            GroupResolution::Accepted(group) => {
+            GroupResolution::Accepted { group, holders } => {
                 let mut members = group
                     .members
                     .iter()
@@ -231,6 +268,15 @@ fn build_topology(
                         live: live_dids.contains(&member.did),
                     })
                     .collect::<Vec<_>>();
+                for did in holders {
+                    if members.iter().all(|member| member.did != did) {
+                        members.push(TopologyGroupMember {
+                            did,
+                            tier: "introduced".to_string(),
+                            live: true,
+                        });
+                    }
+                }
                 members.sort_by(|left, right| {
                     left.did
                         .cmp(&right.did)
@@ -474,6 +520,34 @@ mod tests {
     }
 
     #[test]
+    fn materialized_group_homes_appear_as_introduced_live_members() {
+        let creator_roster = group("crew", 1, ALICE, &[(ALICE, GroupTier::Creator)]);
+        let mut alice = source(live("alice", ALICE, Some("machine-1")));
+        alice.groups.push(creator_roster.clone());
+        let mut bob = source(live("bob", BOB, Some("machine-1")));
+        bob.groups.push(creator_roster.clone());
+        let mut carol = source(live("carol", CAROL, Some("machine-1")));
+        carol.groups.push(creator_roster);
+
+        let report = build_topology(vec![alice, bob, carol], generated_at());
+
+        assert!(report.direct_links.is_empty());
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(
+            report.groups[0]
+                .members
+                .iter()
+                .map(|member| (member.did.clone(), member.tier.clone(), member.live))
+                .collect::<Vec<_>>(),
+            vec![
+                (ALICE.to_string(), "creator".to_string(), true),
+                (BOB.to_string(), "introduced".to_string(), true),
+                (CAROL.to_string(), "introduced".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
     fn highest_group_epoch_wins() {
         let mut older = source(live("alice", ALICE, Some("machine-1")));
         older.groups.push(group(
@@ -494,7 +568,18 @@ mod tests {
 
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].epoch, 2);
-        assert_eq!(report.groups[0].members[1].did, CAROL);
+        assert!(
+            report.groups[0]
+                .members
+                .iter()
+                .any(|member| member.did == CAROL && member.tier == "member")
+        );
+        assert!(
+            report.groups[0]
+                .members
+                .iter()
+                .any(|member| member.did == BOB && member.tier == "introduced")
+        );
     }
 
     #[test]
