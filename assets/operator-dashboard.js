@@ -304,7 +304,9 @@
     listViewButton.setAttribute("aria-pressed", String(state.activeView === "list"));
     topologyMap.dataset.visibleSessionIds = sessions.map((session) => session.id).join(",");
     mapInspector.textContent = `${sessions.length} visible session${sessions.length === 1 ? "" : "s"} · ${visible.directLinks.length} direct link${visible.directLinks.length === 1 ? "" : "s"}`;
-    lastScan.textContent = `Scan ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+    if (!state.stale) {
+      lastScan.textContent = `Scan ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+    }
     updateActions();
   };
 

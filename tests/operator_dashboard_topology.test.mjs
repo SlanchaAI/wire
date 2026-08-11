@@ -92,10 +92,11 @@ const selectors = [
   "#project-filter", "#health-filter", "#connected-filter"
 ];
 
-const dashboard = async ({ token = "test-token" } = {}) => {
+const dashboard = async ({ token = "test-token", fetchImpl } = {}) => {
   const elements = new Map(selectors.map((selector) => [selector, new ElementStub(selector.slice(1))]));
   const created = [];
   const requests = [];
+  const intervals = [];
   const document = new ElementStub("document");
   document.querySelector = (selector) => {
     if (!elements.has(selector)) throw new Error(`Unexpected dashboard selector: ${selector}`);
@@ -117,7 +118,7 @@ const dashboard = async ({ token = "test-token" } = {}) => {
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => storage.set(key, value)
     },
-    setInterval() {}
+    setInterval: (callback) => intervals.push(callback)
   };
   const context = {
     URLSearchParams,
@@ -125,14 +126,16 @@ const dashboard = async ({ token = "test-token" } = {}) => {
     document,
     fetch: async (path, options) => {
       requests.push({ path, options });
-      return { ok: true, json: async () => snapshot() };
+      return fetchImpl
+        ? fetchImpl(path, options)
+        : { ok: true, json: async () => snapshot() };
     },
     window
   };
   vm.runInNewContext(readFileSync(new URL("../assets/operator-topology.js", import.meta.url), "utf8"), context);
   vm.runInNewContext(readFileSync(new URL("../assets/operator-dashboard.js", import.meta.url), "utf8"), context);
   await flush();
-  return { created, document, elements, requests };
+  return { created, document, elements, intervals, requests };
 };
 
 const renderedRows = (page) => {
@@ -225,4 +228,32 @@ test("successful inventory refresh does not hide the missing launch-token warnin
   assert.match(page.elements.get("#notice").textContent, /launch token missing/i);
   assert.equal(page.elements.get("#link-button").disabled, true);
   assert.equal(page.elements.get("#group-button").disabled, true);
+});
+
+test("interaction after a failed refresh preserves the stale scan timestamp", async () => {
+  const responses = [
+    { ok: true, json: async () => snapshot() },
+    { ok: false, json: async () => ({}) },
+    { ok: true, json: async () => snapshot() }
+  ];
+  const page = await dashboard({ fetchImpl: async () => responses.shift() });
+
+  assert.equal(page.intervals.length, 1);
+  page.intervals[0]();
+  await flush();
+  const failedLabel = page.elements.get("#last-scan").textContent;
+  assert.match(failedLabel, /^Refresh failed .* · showing stale data$/);
+
+  const search = page.elements.get("#search-filter");
+  search.value = "amber";
+  search.dispatch("input");
+
+  assert.equal(page.elements.get("#last-scan").textContent, failedLabel);
+
+  page.intervals[0]();
+  await flush();
+  const recoveredLabel = page.elements.get("#last-scan").textContent;
+  assert.match(recoveredLabel, /^Scan /);
+  assert.notEqual(recoveredLabel, failedLabel);
+  assert.equal(responses.length, 0);
 });
