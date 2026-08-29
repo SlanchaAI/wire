@@ -446,7 +446,6 @@ pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
     println!("{entry_pretty}");
     println!();
 
-
     if !apply {
         println!("Probable MCP host config locations on this machine:");
         for (name, path) in &targets {

@@ -175,7 +175,10 @@ pub fn find_session_home_by_name(name: &str) -> Result<Option<PathBuf>> {
 /// True when `path` is a wire session home rather than a stray directory: a
 /// self-card is written by `init` and is what every reader needs.
 pub fn is_session_home(path: &std::path::Path) -> bool {
-    path.join("config").join("wire").join("agent-card.json").is_file()
+    path.join("config")
+        .join("wire")
+        .join("agent-card.json")
+        .is_file()
 }
 
 /// The pre-RFC-006 layout: `sessions/<name>` used to be where a named session
@@ -625,7 +628,9 @@ pub fn resolve_local_sister(input: &str) -> Option<SisterMatch> {
     }
     match matches.len() {
         0 => None,
-        1 => Some(SisterMatch::Unique(matches.into_iter().next().unwrap().home)),
+        1 => Some(SisterMatch::Unique(
+            matches.into_iter().next().unwrap().home,
+        )),
         _ => Some(SisterMatch::Ambiguous(matches)),
     }
 }

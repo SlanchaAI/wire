@@ -2454,9 +2454,12 @@ fn cmd_session(cmd: SessionCommand) -> Result<()> {
         SessionCommand::Env { name, json } => session::cmd_session_env(name.as_deref(), json),
         SessionCommand::Current { json } => session::cmd_session_current(json),
         SessionCommand::Bind { name, json } => cmd_session_bind(name.as_deref(), json),
-        SessionCommand::Migrate { name, all, apply, json } => {
-            session::cmd_session_migrate(name.as_deref(), all, apply, json)
-        }
+        SessionCommand::Migrate {
+            name,
+            all,
+            apply,
+            json,
+        } => session::cmd_session_migrate(name.as_deref(), all, apply, json),
         SessionCommand::Destroy { name, force, json } => {
             session::cmd_session_destroy(&name, force, json)
         }

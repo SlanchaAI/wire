@@ -786,10 +786,11 @@ fn resolve_local_session<'a>(
     }) {
         return Ok(s);
     }
-    if let Some(s) = sessions
-        .iter()
-        .find(|s| s.did.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(input)))
-    {
+    if let Some(s) = sessions.iter().find(|s| {
+        s.did
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case(input))
+    }) {
         return Ok(s);
     }
 
@@ -2028,8 +2029,18 @@ mod tests {
 
     #[test]
     fn resolve_local_session_refuses_name_shared_by_two_dids() {
-        let a = session("amber-tarn", "aaaa111122223333", "did:wire:amber-tarn-11111111", "amber-tarn");
-        let b = session("amber-tarn", "bbbb111122223333", "did:wire:amber-tarn-22222222", "amber-tarn");
+        let a = session(
+            "amber-tarn",
+            "aaaa111122223333",
+            "did:wire:amber-tarn-11111111",
+            "amber-tarn",
+        );
+        let b = session(
+            "amber-tarn",
+            "bbbb111122223333",
+            "did:wire:amber-tarn-22222222",
+            "amber-tarn",
+        );
         let sessions = vec![a, b];
 
         // The name is shared, so the old first-match behavior would silently
@@ -2049,7 +2060,12 @@ mod tests {
 
         // The two remedies printed in that error must actually resolve.
         let by_did = resolve_local_session(&sessions, "did:wire:amber-tarn-22222222").unwrap();
-        assert!(by_did.home_dir.to_string_lossy().ends_with("bbbb111122223333"));
+        assert!(
+            by_did
+                .home_dir
+                .to_string_lossy()
+                .ends_with("bbbb111122223333")
+        );
         let by_home = resolve_local_session(&sessions, "aaaa111122223333").unwrap();
         assert_eq!(by_home.did.as_deref(), Some("did:wire:amber-tarn-11111111"));
     }
@@ -2058,8 +2074,18 @@ mod tests {
     fn resolve_local_session_allows_one_identity_at_two_homes() {
         // An identity present at two homes is one peer, not a choice between
         // peers — refusing here would be a false stop.
-        let a = session("lone-larch", "aaaa111122223333", "did:wire:lone-larch-33333333", "lone-larch");
-        let b = session("lone-larch", "cccc111122223333", "did:wire:lone-larch-33333333", "lone-larch");
+        let a = session(
+            "lone-larch",
+            "aaaa111122223333",
+            "did:wire:lone-larch-33333333",
+            "lone-larch",
+        );
+        let b = session(
+            "lone-larch",
+            "cccc111122223333",
+            "did:wire:lone-larch-33333333",
+            "lone-larch",
+        );
         let binding = [a, b];
         let got = resolve_local_session(&binding, "lone-larch")
             .expect("same DID at two homes must resolve");
@@ -2068,7 +2094,12 @@ mod tests {
 
     #[test]
     fn resolve_local_session_still_resolves_plain_names_and_reports_missing() {
-        let a = session("quiet-pond", "aaaa111122223333", "did:wire:quiet-pond-44444444", "quiet-pond");
+        let a = session(
+            "quiet-pond",
+            "aaaa111122223333",
+            "did:wire:quiet-pond-44444444",
+            "quiet-pond",
+        );
         let sessions = vec![a];
         assert!(resolve_local_session(&sessions, "quiet-pond").is_ok());
         match resolve_local_session(&sessions, "no-such-session") {

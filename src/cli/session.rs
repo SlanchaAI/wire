@@ -1496,16 +1496,16 @@ pub(crate) fn cmd_session_migrate(
         }
         // Renaming out from under a live daemon would leave it writing to a path
         // that no longer resolves to its name.
-        if let Some(pid) = crate::session::session_daemon_pid(&from) {
-            if crate::platform::process_alive(pid) {
-                rows.push(Row {
-                    name: raw,
-                    from: Some(from.display().to_string()),
-                    to: to.display().to_string(),
-                    action: format!("refused: daemon pid {pid} is live on this home; stop it first"),
-                });
-                continue;
-            }
+        if let Some(pid) = crate::session::session_daemon_pid(&from)
+            && crate::platform::process_alive(pid)
+        {
+            rows.push(Row {
+                name: raw,
+                from: Some(from.display().to_string()),
+                to: to.display().to_string(),
+                action: format!("refused: daemon pid {pid} is live on this home; stop it first"),
+            });
+            continue;
         }
 
         if !apply {
@@ -1522,9 +1522,8 @@ pub(crate) fn cmd_session_migrate(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::rename(&from, &to).with_context(|| {
-            format!("moving {} to {}", from.display(), to.display())
-        })?;
+        std::fs::rename(&from, &to)
+            .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
         // Confirm both ends before claiming the move: a rename that half-happened
         // (different filesystem, permissions) must not be reported as success.
         anyhow::ensure!(

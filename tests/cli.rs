@@ -1994,7 +1994,10 @@ fn session_current_reports_operative_identity_alongside_the_registry_name() {
     // Fresh home: nothing registered for this cwd, so there is no claim to
     // compare against. `agrees` is null (not true) because agreement was never
     // verified. The operative identity is still named.
-    assert!(v["session"].is_null(), "no registry entry expected; got {v}");
+    assert!(
+        v["session"].is_null(),
+        "no registry entry expected; got {v}"
+    );
     assert!(
         v["agrees"].is_null(),
         "agrees must be null when there is nothing to compare; got {v}"
@@ -2007,7 +2010,8 @@ fn session_current_reports_operative_identity_alongside_the_registry_name() {
     // WIRE_HOME_FORCE label; a plain WIRE_HOME pin reports `env:WIRE_HOME`. Both
     // are the deliberate-fleet-share pins, and neither is a cwd-derived source.
     assert!(
-        ["env:WIRE_HOME", "env:WIRE_HOME_FORCE"].contains(&v["session_source"].as_str().unwrap_or("")),
+        ["env:WIRE_HOME", "env:WIRE_HOME_FORCE"]
+            .contains(&v["session_source"].as_str().unwrap_or("")),
         "session_source must name the explicit home pin; got {v}"
     );
 
@@ -2089,7 +2093,10 @@ fn session_migrate_moves_a_legacy_named_home_into_the_by_key_layout() {
     assert!(!target.exists(), "dry run must not create the target");
 
     // Apply: the move lands and the identity is the same one.
-    let apply = run(&home, &["session", "migrate", "legacy-api", "--apply", "--json"]);
+    let apply = run(
+        &home,
+        &["session", "migrate", "legacy-api", "--apply", "--json"],
+    );
     assert!(apply.status.success());
     let done: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
     assert_eq!(done["migrated"], 1, "apply must move one home: {done}");
@@ -2142,10 +2149,9 @@ fn session_migrate_refuses_to_merge_two_homes() {
         .expect("init legacy home");
     assert!(init.status.success());
 
-    let plan: serde_json::Value = serde_json::from_slice(
-        &run(&home, &["session", "migrate", "clash-api", "--json"]).stdout,
-    )
-    .unwrap();
+    let plan: serde_json::Value =
+        serde_json::from_slice(&run(&home, &["session", "migrate", "clash-api", "--json"]).stdout)
+            .unwrap();
     let target = PathBuf::from(plan["rows"][0]["to"].as_str().unwrap());
     std::fs::create_dir_all(&target).unwrap();
     let rival = Command::new(wire_bin())
@@ -2156,7 +2162,10 @@ fn session_migrate_refuses_to_merge_two_homes() {
         .expect("init rival by-key home");
     assert!(rival.status.success());
 
-    let apply = run(&home, &["session", "migrate", "clash-api", "--apply", "--json"]);
+    let apply = run(
+        &home,
+        &["session", "migrate", "clash-api", "--apply", "--json"],
+    );
     assert!(apply.status.success());
     let done: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
     assert_eq!(done["migrated"], 0, "collision must not move: {done}");
