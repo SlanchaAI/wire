@@ -60,8 +60,11 @@ wire keys identity to the Pi session id:
   the bare key, so one conversation resolves to one home either way. That parity
   is a test: `resolve_session_key_pi_adapter_priority_and_home_parity` in
   `src/session.rs`.
-- An operator `WIRE_HOME` or `WIRE_SESSION_ID` pin wins. The extension respects
-  it so a deliberate fleet-share stays one identity.
+- An operator `WIRE_SESSION_ID` pin wins: the extension leaves it alone, so a
+  deliberate share stays one identity. A `WIRE_HOME` pin is a different axis and
+  is also left untouched, but it does *not* suppress the session key — it picks
+  the root, and N Pi sessions under one shared root stay N identities. Collapsing
+  them was the bug; `wireEnv` in `extensions/wire.ts` carries the note.
 
 Requires wire with the `pi` session adapter. That adapter is added on this branch
 and is not in a release as of `Cargo.toml` 0.17.0; without it a Pi session falls

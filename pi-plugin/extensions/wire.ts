@@ -34,10 +34,14 @@ const BIN = process.env.WIRE_BIN ?? "wire";
 /** Env for one `wire` invocation. Operator pins always win over the Pi key. */
 function wireEnv(ctx: ExtensionContext): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  // `WIRE_HOME` is the RFC-008 §C deliberate fleet-share pin and
-  // `WIRE_SESSION_ID` the operator-override channel; overwriting either would
-  // silently split an intentionally shared identity into per-session ones.
-  if (env.WIRE_HOME || env.WIRE_SESSION_ID) return env;
+  // An explicit `WIRE_SESSION_ID` is the operator-override channel (a deliberate
+  // share, or a fleet key), so respect it verbatim. A `WIRE_HOME` pin is a
+  // *different axis*: RFC-008 §C uses it to say which root a fleet lives in, not
+  // that every session in that root is one agent. Treating it as an identity pin
+  // suppressed the session key, which collapsed every Pi session under a shared
+  // root onto the machine default — the "every session shows the same persona"
+  // symptom v0.13 was filed for. Root pin still passes through untouched.
+  if (env.WIRE_SESSION_ID) return env;
   env.WIRE_SESSION_ID = ctx.sessionManager.getSessionId();
   return env;
 }

@@ -97,8 +97,14 @@ Identity is keyed to the Pi session id, not the working directory.
   `CODEX_SESSION_ID` to its children — started *inside* a Pi shell inherits the
   parent Pi session's home and shares its inbox. Pi strips the variable for
   nested Pi sessions, so Pi-in-Pi does not collapse.
-- An operator `WIRE_HOME` or `WIRE_SESSION_ID` wins over the Pi key. The package
-  leaves both alone so a deliberate fleet-share stays one identity.
+- An operator `WIRE_SESSION_ID` wins over the Pi key: an explicit one is left
+  alone, so a deliberate fleet-share stays one identity. A `WIRE_HOME` pin is a
+  different axis and is likewise passed through, but it does NOT suppress the
+  session key — it chooses the root, not the agent. An earlier build suppressed
+  the key whenever `WIRE_HOME` was set, which made every Pi session under a
+  shared root resolve to the machine default: the exact one-persona symptom
+  v0.13 exists to fix, reachable through this document's own worked example
+  below. Fixed; the precedence is now as stated.
 
 Check what wire actually resolved:
 
