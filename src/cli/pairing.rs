@@ -334,10 +334,18 @@ pub(crate) fn resolve_name_to_target(name: &str) -> Result<DialTarget> {
         }
     }
 
-    // 2. Local sister sessions.
-    if let Some(session_name) = crate::session::resolve_local_sister(needle) {
+    // 2. Local sister sessions. Ambiguity is fatal here on purpose: dialing the
+    //    wrong one of two same-named identities pairs us with a stranger. The
+    //    token is the `by-key` home name, so the lookup keys on home — keying on
+    //    name would re-enter the collision (both candidates share the name).
+    if let Some(sister_home) = crate::session::resolve_local_sister_unique(needle)? {
         let sessions = crate::session::list_sessions().unwrap_or_default();
-        let s = sessions.iter().find(|s| s.name == session_name);
+        let s = sessions.iter().find(|s| {
+            s.home_dir
+                .file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|h| h == sister_home)
+        });
         if let Some(s) = s {
             return Ok(DialTarget::LocalSister {
                 session_name: s.name.clone(),
@@ -730,11 +738,61 @@ fn resolve_local_session<'a>(
     sessions: &'a [crate::session::SessionInfo],
     input: &str,
 ) -> Result<&'a crate::session::SessionInfo, ResolveError> {
-    // Exact session-name match always wins, even if a nickname elsewhere
-    // also matches. Predictable for scripts and operator muscle memory.
-    if let Some(s) = sessions.iter().find(|s| s.name == input) {
+    // Exact session-name match wins for predictability — but only when it is
+    // ONE identity. list_sessions overrides name to the persona handle, and a
+    // persona nickname comes from a 243x242 word pair, so two different DIDs can
+    // share one name. Picking the first exact match (the previous behavior) sent
+    // signed traffic to whichever home readdir happened to yield first.
+    let name_matches: Vec<&crate::session::SessionInfo> =
+        sessions.iter().filter(|s| s.name == input).collect();
+    match name_matches.len() {
+        1 => return Ok(name_matches[0]),
+        n if n > 1 => {
+            let distinct_dids: std::collections::HashSet<&str> = name_matches
+                .iter()
+                .filter_map(|s| s.did.as_deref())
+                .collect();
+            if distinct_dids.len() > 1 {
+                return Err(ResolveError::Ambiguous(
+                    name_matches
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "did={} home={}",
+                                s.did.as_deref().unwrap_or("(no card)"),
+                                s.home_dir
+                                    .file_name()
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("?")
+                            )
+                        })
+                        .collect(),
+                ));
+            }
+            // Same identity at several homes: any match is the same peer.
+            return Ok(name_matches[0]);
+        }
+        _ => {}
+    }
+
+    // The two forms an operator or agent retypes after an ambiguity refusal, and
+    // the forms resolve_local_sister itself accepts. Matched before nicknames
+    // because they are strictly more specific than a colliding word pair.
+    if let Some(s) = sessions.iter().find(|s| {
+        s.home_dir
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|h| h.eq_ignore_ascii_case(input))
+    }) {
         return Ok(s);
     }
+    if let Some(s) = sessions
+        .iter()
+        .find(|s| s.did.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(input)))
+    {
+        return Ok(s);
+    }
+
     let nick_matches: Vec<&crate::session::SessionInfo> = sessions
         .iter()
         .filter(|s| {
@@ -748,7 +806,19 @@ fn resolve_local_session<'a>(
         0 => Err(ResolveError::NotFound),
         1 => Ok(nick_matches[0]),
         _ => Err(ResolveError::Ambiguous(
-            nick_matches.iter().map(|s| s.name.clone()).collect(),
+            nick_matches
+                .iter()
+                .map(|s| {
+                    format!(
+                        "did={} home={}",
+                        s.did.as_deref().unwrap_or("(no card)"),
+                        s.home_dir
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or("?")
+                    )
+                })
+                .collect(),
         )),
     }
 }
@@ -885,10 +955,10 @@ pub(crate) fn add_local_sister_core(sister_name: &str) -> Result<LocalSisterDrop
              Run `wire session list` to see what's available."
         ),
         Err(ResolveError::Ambiguous(candidates)) => bail!(
-            "nickname `{sister_name}` is ambiguous — matches {} sessions: {}. \
-             Disambiguate by passing the session name (one of those listed) instead of the nickname.",
+            "nickname `{sister_name}` is ambiguous — matches {} sessions: {}. \n\
+             Repeat with the DID, or with the home name plus `--local-sister`.",
             candidates.len(),
-            candidates.join(", ")
+            candidates.join(", "),
         ),
     };
 
@@ -1126,15 +1196,15 @@ pub(super) fn cmd_add(
     // its character name" ergonomic gap that forced operators into
     // `wire session list-local | grep <nick> | awk` dances.
     if local_sister {
-        let resolved = crate::session::resolve_local_sister(handle_arg)
+        let resolved = crate::session::resolve_local_sister_unique(handle_arg)?
             .unwrap_or_else(|| handle_arg.to_string());
         return cmd_add_local_sister(&resolved, as_json);
     }
     if !handle_arg.contains('@')
-        && let Some(resolved) = crate::session::resolve_local_sister(handle_arg)
+        && let Some(resolved) = crate::session::resolve_local_sister_unique(handle_arg)?
     {
         eprintln!(
-            "wire add: `{handle_arg}` resolved to local sister session `{resolved}` \
+            "wire add: `{handle_arg}` resolved to local sister session home `{resolved}` \
              — routing via --local-sister (disk-read card, no relay lookup)."
         );
         return cmd_add_local_sister(&resolved, as_json);
@@ -1931,5 +2001,79 @@ mod resolve_tier_tests {
             };
             assert_eq!(tier, "VERIFIED");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn session(name: &str, home: &str, did: &str, nickname: &str) -> crate::session::SessionInfo {
+        // Same nickname on two sessions is exactly a persona collision: one
+        // nickname, two DIDs. Character is normally derived from the DID, so the
+        // nickname is set explicitly to reproduce the collision shape.
+        let mut character = crate::character::Character::from_did(did);
+        character.nickname = nickname.to_string();
+        crate::session::SessionInfo {
+            name: name.to_string(),
+            cwd: None,
+            home_dir: PathBuf::from("/tmp/fake").join(home),
+            did: Some(did.to_string()),
+            handle: Some(name.to_string()),
+            daemon_running: false,
+            character: Some(character),
+        }
+    }
+
+    #[test]
+    fn resolve_local_session_refuses_name_shared_by_two_dids() {
+        let a = session("amber-tarn", "aaaa111122223333", "did:wire:amber-tarn-11111111", "amber-tarn");
+        let b = session("amber-tarn", "bbbb111122223333", "did:wire:amber-tarn-22222222", "amber-tarn");
+        let sessions = vec![a, b];
+
+        // The name is shared, so the old first-match behavior would silently
+        // pick `aaaa...` and pair with, or send signed events to, that agent.
+        let err = resolve_local_session(&sessions, "amber-tarn")
+            .expect_err("a name owned by two DIDs must not resolve");
+        match err {
+            ResolveError::Ambiguous(c) => {
+                assert_eq!(c.len(), 2, "both candidates must be listed; got {c:?}");
+                assert!(
+                    c.iter().all(|x| x.contains("did=") && x.contains("home=")),
+                    "candidates must carry the two tokens that DO resolve; got {c:?}"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+
+        // The two remedies printed in that error must actually resolve.
+        let by_did = resolve_local_session(&sessions, "did:wire:amber-tarn-22222222").unwrap();
+        assert!(by_did.home_dir.to_string_lossy().ends_with("bbbb111122223333"));
+        let by_home = resolve_local_session(&sessions, "aaaa111122223333").unwrap();
+        assert_eq!(by_home.did.as_deref(), Some("did:wire:amber-tarn-11111111"));
+    }
+
+    #[test]
+    fn resolve_local_session_allows_one_identity_at_two_homes() {
+        // An identity present at two homes is one peer, not a choice between
+        // peers — refusing here would be a false stop.
+        let a = session("lone-larch", "aaaa111122223333", "did:wire:lone-larch-33333333", "lone-larch");
+        let b = session("lone-larch", "cccc111122223333", "did:wire:lone-larch-33333333", "lone-larch");
+        let binding = [a, b];
+        let got = resolve_local_session(&binding, "lone-larch")
+            .expect("same DID at two homes must resolve");
+        assert_eq!(got.did.as_deref(), Some("did:wire:lone-larch-33333333"));
+    }
+
+    #[test]
+    fn resolve_local_session_still_resolves_plain_names_and_reports_missing() {
+        let a = session("quiet-pond", "aaaa111122223333", "did:wire:quiet-pond-44444444", "quiet-pond");
+        let sessions = vec![a];
+        assert!(resolve_local_session(&sessions, "quiet-pond").is_ok());
+        match resolve_local_session(&sessions, "no-such-session") {
+            Err(ResolveError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

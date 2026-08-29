@@ -1292,18 +1292,73 @@ pub(super) fn cmd_session_current(as_json: bool) -> Result<()> {
                 .map(|(_, v)| v)
         })
         .cloned();
+    // The registry answers "which session NAME was registered for this cwd".
+    // It is NOT the identity in use: since v0.13 identity resolves from a
+    // session-id key (`by-key/<hash>`) or the machine default, and never from
+    // the cwd registry (see `maybe_adopt_session_home`, which deliberately
+    // refuses cwd resolution). Reporting only the registry name made this
+    // command assert an identity binding that resolution no longer honours —
+    // `wire session current` said one handle while `wire whoami` signed as
+    // another. Report both, and say plainly when they disagree.
+    let registry_name = name.clone();
+    // Report `config_dir` exactly as `wire whoami --json` does, and the raw
+    // WIRE_HOME env separately — a set WIRE_HOME is the operator's deliberate
+    // pin, and collapsing the two would hide which case a session is in.
+    let config_dir = crate::config::config_dir()
+        .ok()
+        .map(|d| d.display().to_string());
+    let wire_home = std::env::var("WIRE_HOME").ok();
+    let operative_handle = crate::session::operational_handle();
+    let source = crate::session::session_source();
+    // `null`, not `true`, when there is nothing to compare: an uninitialized
+    // home has no operative handle, and reporting agreement there would assert a
+    // binding the command never verified.
+    let agrees = match (&registry_name, &operative_handle) {
+        (Some(reg), Some(op)) => Some(reg == op),
+        _ => None,
+    };
     if as_json {
         println!(
             "{}",
             serde_json::to_string(&json!({
                 "cwd": cwd_key,
-                "session": name,
+                // `session` keeps its pre-existing meaning (registry name) so
+                // scripts reading it are unaffected.
+                "session": registry_name,
+                "operative_handle": operative_handle,
+                "session_source": source,
+                "config_dir": config_dir,
+                "wire_home": wire_home,
+                "agrees": agrees,
+                "note": if agrees == Some(false) { Some(
+                    "the cwd registry names a different session than the identity this process \
+                     resolves; `operative_handle` is the one that signs. Identity has not come \
+                     from the cwd registry since v0.13."
+                ) } else if agrees.is_none() && registry_name.is_some() { Some(
+                    "a session is registered for this cwd but this home is uninitialized, so \n\
+                     agreement with the registry could not be checked."
+                ) } else { None }
             }))?
         );
     } else if let Some(n) = name {
         println!("{n}");
+        if agrees == Some(false) {
+            // stderr, per the repo's convention that agent-visible streams stay
+            // clean; stdout keeps exactly the historical single-token answer.
+            eprintln!(
+                "wire session current: NOTE the registry says `{n}` but this process resolves \
+                 handle `{}` (session_source={source}). The registry has not driven identity \
+                 since v0.13 — that handle is the one that signs.",
+                operative_handle.as_deref().unwrap_or("(uninitialized)")
+            );
+        }
     } else {
         println!("(no session registered for this cwd)");
+        eprintln!(
+            "wire session current: identity in use is handle `{}` (session_source={source}); \
+             the cwd registry does not select identity since v0.13.",
+            operative_handle.as_deref().unwrap_or("(uninitialized)")
+        );
     }
     Ok(())
 }

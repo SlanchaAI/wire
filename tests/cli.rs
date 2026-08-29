@@ -1949,3 +1949,88 @@ fn tail_multi_peer_sorts_by_timestamp() {
         "expected 3 newest across peers (interleaved by timestamp)"
     );
 }
+
+#[test]
+fn session_current_reports_operative_identity_alongside_the_registry_name() {
+    // `wire session current` used to print only the cwd registry's name, which
+    // since v0.13 is not the identity that signs: resolution comes from a
+    // session-id key or the machine default and never from the registry. The
+    // two disagreeing silently is how an operator ends up sending as a persona
+    // they believe they are not. The registry answer is still reported (scripts
+    // parse it) and the operative identity is reported beside it.
+    let home = fresh_home();
+    let up = run(&home, &["up", "--offline"]);
+    assert!(
+        up.status.success(),
+        "offline up must succeed: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+
+    let out = Command::new(wire_bin())
+        .args(["session", "current", "--json"])
+        .current_dir(&home)
+        .env("WIRE_HOME", &home)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("spawn wire session current --json");
+    assert!(out.status.success());
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("session current --json must emit JSON");
+    for key in [
+        "cwd",
+        "session",
+        "operative_handle",
+        "session_source",
+        "config_dir",
+        "wire_home",
+        "agrees",
+        "note",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "`session current --json` must expose `{key}`; got {v}"
+        );
+    }
+    // Fresh home: nothing registered for this cwd, so there is no claim to
+    // compare against. `agrees` is null (not true) because agreement was never
+    // verified. The operative identity is still named.
+    assert!(v["session"].is_null(), "no registry entry expected; got {v}");
+    assert!(
+        v["agrees"].is_null(),
+        "agrees must be null when there is nothing to compare; got {v}"
+    );
+    assert!(
+        v["operative_handle"].is_string(),
+        "operative_handle must name the signing persona; got {v}"
+    );
+    // This harness forces the legacy home shape, so the source is the
+    // WIRE_HOME_FORCE label; a plain WIRE_HOME pin reports `env:WIRE_HOME`. Both
+    // are the deliberate-fleet-share pins, and neither is a cwd-derived source.
+    assert!(
+        ["env:WIRE_HOME", "env:WIRE_HOME_FORCE"].contains(&v["session_source"].as_str().unwrap_or("")),
+        "session_source must name the explicit home pin; got {v}"
+    );
+
+    // The historical stdout contract is untouched: first line is the registry
+    // name, or the same sentinel. The honesty went to stderr so nothing parsing
+    // stdout breaks.
+    let text = Command::new(wire_bin())
+        .args(["session", "current"])
+        .current_dir(&home)
+        .env("WIRE_HOME", &home)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("spawn wire session current");
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "(no session registered for this cwd)\n",
+        "stdout must keep its historical single-line answer"
+    );
+    let err = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        err.contains("does not select identity") && err.contains("session_source="),
+        "stderr must state that the registry does not drive identity: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
