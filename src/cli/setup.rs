@@ -398,6 +398,31 @@ pub(crate) fn standard_mcp_entry() -> Value {
     })
 }
 
+/// Hosts that need a third-party bridge before they will read the entry
+/// `wire setup` writes, with the note to show for them. Pi has no MCP client of
+/// its own (its README: "No MCP."), so `~/.pi/agent/mcp.json` is inert unless
+/// pi-mcp-adapter is installed. Saying so is the difference between `--apply`
+/// looking like it connected the host and being an honest account of what was
+/// written.
+const BRIDGE_ONLY_HOSTS: &[(&str, &str)] = &[(
+    "Pi",
+    "Pi has no MCP client (its README: \"No MCP.\"). ~/.pi/agent/mcp.json is read\n   \
+         by the third-party pi-mcp-adapter, not by Pi. For Pi prefer the native\n   \
+         package: `pi install <wire-checkout>/pi-plugin` — no adapter, no MCP server.\n   \
+         The snippet above also pins WIRE_SESSION_ID to ${CLAUDE_CODE_SESSION_ID},\n   \
+         which is the wrong variable under Pi.",
+)];
+
+/// Notes for the bridge-only hosts present in `present`'s judgement. Shared by
+/// the dry-run listing and the post-apply summary so both say the same thing.
+fn bridge_notes(present: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    BRIDGE_ONLY_HOSTS
+        .iter()
+        .filter(|(host, _)| present(host))
+        .copied()
+        .collect()
+}
+
 pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
     use crate::adapters::harness::HARNESS_ADAPTERS;
     use std::path::PathBuf;
@@ -421,6 +446,7 @@ pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
     println!("{entry_pretty}");
     println!();
 
+
     if !apply {
         println!("Probable MCP host config locations on this machine:");
         for (name, path) in &targets {
@@ -436,6 +462,10 @@ pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
         println!(
             "Existing entries with a different command keep yours unchanged unless wire's exact entry is missing."
         );
+        for (host, note) in bridge_notes(|h| targets.iter().any(|(name, _)| *name == h)) {
+            println!();
+            println!("Note on {host}: {note}");
+        }
         return Ok(());
     }
 
@@ -470,6 +500,11 @@ pub(crate) fn cmd_setup(apply: bool) -> Result<()> {
         for line in &skipped {
             println!("  {line}");
         }
+    }
+    for (host, note) in bridge_notes(|h| modified.iter().any(|l| l.starts_with(&format!("✓ {h} "))))
+    {
+        println!();
+        println!("Note on {host}: {note}");
     }
     Ok(())
 }
@@ -896,5 +931,34 @@ mod relay_url_tests {
             strip_proto("https://nick@wireup.net").contains('@'),
             "strip_proto preserves userinfo by design; the userinfo guard upstream is what prevents the doubled echo"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_notes;
+
+    /// The Pi target writes `~/.pi/agent/mcp.json`, which Pi proper never reads.
+    /// If that note ever stops being attached to the Pi target, `wire setup
+    /// --apply` is silently misleading again, so both selection paths are locked.
+    #[test]
+    fn pi_target_carries_the_bridge_note() {
+        let dry_run = bridge_notes(|h| h == "Pi");
+        assert_eq!(dry_run.len(), 1, "Pi must carry exactly one note");
+        assert_eq!(dry_run[0].0, "Pi");
+        assert!(
+            dry_run[0].1.contains("pi-mcp-adapter"),
+            "note must name the bridge Pi needs: {}",
+            dry_run[0].1
+        );
+        assert!(
+            dry_run[0].1.contains("pi-plugin"),
+            "note must point at the native package: {}",
+            dry_run[0].1
+        );
+
+        // Hosts with a real MCP client must not be flagged.
+        assert!(bridge_notes(|h| h == "Cursor").is_empty());
+        assert!(bridge_notes(|_| false).is_empty());
     }
 }
