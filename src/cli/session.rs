@@ -1425,6 +1425,165 @@ pub(super) fn cmd_session_destroy(name_arg: &str, force: bool, as_json: bool) ->
     Ok(())
 }
 
+/// `wire session migrate [<name>] [--all] [--apply]` — move a pre-RFC-006
+/// `sessions/<name>` home into the 1.0 `sessions/by-key/<hash>` layout.
+///
+/// RFC-006 Part A made `by-key` the one layout and nothing reads the top-level
+/// location any more, so a home left there is unreachable by name even with its
+/// keypair intact: `wire --session <name> whoami` answers "not initialized"
+/// while the persona inside keeps signing. Worse, `init`/`up` for that name then
+/// mints a *second* identity, which is how one project ends up owning two agents.
+///
+/// Dry-run by default — `--apply` is what moves bytes. The move is a rename
+/// within one filesystem, so the rollback line printed afterwards is the way
+/// back; nothing here deletes a key.
+pub(crate) fn cmd_session_migrate(
+    name: Option<&str>,
+    all: bool,
+    apply: bool,
+    as_json: bool,
+) -> Result<()> {
+    let candidates: Vec<String> = match (name.map(str::trim), all) {
+        (Some(n), false) => vec![n.to_string()],
+        (None, true) => crate::session::legacy_named_homes(),
+        (None, false) => {
+            bail!("name a session to migrate, or pass --all to move every legacy home")
+        }
+        (Some(_), true) => bail!("pass a name or --all, not both"),
+    };
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        name: String,
+        from: Option<String>,
+        to: String,
+        action: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+
+    for raw in candidates {
+        let to = crate::session::session_dir(&crate::session::sanitize_name(&raw))?;
+        let Some(from) = crate::session::legacy_named_home_dir(&raw) else {
+            let action = if to.exists() {
+                "already in the by-key layout; nothing to move".to_string()
+            } else {
+                "no legacy home at sessions/<name>; a name that changes under \
+                 sanitizing is not migratable here"
+                    .to_string()
+            };
+            rows.push(Row {
+                name: raw,
+                from: None,
+                to: to.display().to_string(),
+                action,
+            });
+            continue;
+        };
+
+        // Two homes are two identities. Merging them would pick one keypair and
+        // silently orphan the other's pairings, so refuse and let the operator
+        // decide which one keeps the name.
+        if to.exists() {
+            rows.push(Row {
+                name: raw,
+                from: Some(from.display().to_string()),
+                to: to.display().to_string(),
+                action: "refused: the by-key home already exists; wire will not merge two homes"
+                    .to_string(),
+            });
+            continue;
+        }
+        // Renaming out from under a live daemon would leave it writing to a path
+        // that no longer resolves to its name.
+        if let Some(pid) = crate::session::session_daemon_pid(&from) {
+            if crate::platform::process_alive(pid) {
+                rows.push(Row {
+                    name: raw,
+                    from: Some(from.display().to_string()),
+                    to: to.display().to_string(),
+                    action: format!("refused: daemon pid {pid} is live on this home; stop it first"),
+                });
+                continue;
+            }
+        }
+
+        if !apply {
+            rows.push(Row {
+                name: raw,
+                from: Some(from.display().to_string()),
+                to: to.display().to_string(),
+                action: "would move (pass --apply)".to_string(),
+            });
+            continue;
+        }
+
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::rename(&from, &to).with_context(|| {
+            format!("moving {} to {}", from.display(), to.display())
+        })?;
+        // Confirm both ends before claiming the move: a rename that half-happened
+        // (different filesystem, permissions) must not be reported as success.
+        anyhow::ensure!(
+            crate::session::is_session_home(&to) && !from.exists(),
+            "move did not land cleanly: {} exists: {}, source still present: {}",
+            to.display(),
+            to.exists(),
+            from.exists()
+        );
+        moved.push((from.clone(), to.clone()));
+        rows.push(Row {
+            name: raw,
+            from: Some(from.display().to_string()),
+            to: to.display().to_string(),
+            action: "moved".to_string(),
+        });
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "dry_run": !apply,
+                "migrated": moved.len(),
+                "rows": rows,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        if apply {
+            "migrated:"
+        } else {
+            "wire session migrate (dry run — pass --apply to move):"
+        }
+    );
+    if rows.is_empty() {
+        println!("  no legacy session homes found");
+    }
+    for row in &rows {
+        match &row.from {
+            Some(from) => println!("  {}: {} -> {}\n    {}", row.name, from, row.to, row.action),
+            None => println!("  {}: {}", row.name, row.action),
+        }
+    }
+    if !moved.is_empty() {
+        println!();
+        println!("Rollback (move the home back):");
+        for (from, to) in &moved {
+            println!("  mv {} {}", to.display(), from.display());
+        }
+        println!();
+        println!("Check: eval \"$(wire session env <name>)\" && wire whoami");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod coerce_object_root_tests {
     use super::coerce_object_root;

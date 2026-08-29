@@ -172,6 +172,53 @@ pub fn find_session_home_by_name(name: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// True when `path` is a wire session home rather than a stray directory: a
+/// self-card is written by `init` and is what every reader needs.
+pub fn is_session_home(path: &std::path::Path) -> bool {
+    path.join("config").join("wire").join("agent-card.json").is_file()
+}
+
+/// The pre-RFC-006 layout: `sessions/<name>` used to be where a named session
+/// lived. Nothing reads that path any more — `list_sessions` scans `by-key`
+/// only, and `session_dir` hashes a name into `by-key` — so a home left here is
+/// unreachable: `wire --session <name> whoami` answers "not initialized", while
+/// the persona inside is intact. `init`/`up` on that same name then mints a
+/// second identity, which is how one name ends up owning two agents.
+///
+/// Returns Some only for a plain single-component name (nothing path-shaped,
+/// nothing that changes under `sanitize_name`, since the by-key home is derived
+/// from the sanitized form) whose legacy home exists on disk.
+pub fn legacy_named_home_dir(name: &str) -> Option<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != sanitize_name(trimmed) {
+        return None;
+    }
+    let candidate = sessions_root().ok()?.join(trimmed);
+    is_session_home(&candidate).then_some(candidate)
+}
+
+/// Every top-level legacy home under the sessions root, by directory name.
+/// `by-key` itself is the current layout, not a candidate.
+pub fn legacy_named_homes() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(root) = sessions_root() else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if name == "by-key" || !is_session_home(&entry.path()) {
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort();
+    out
+}
 /// Registry tracks `cwd → session_name` so repeated `wire session new`
 /// from the same project reuses the same identity instead of creating
 /// a fresh one each time. Lives at `<sessions_root>/registry.json`.
@@ -2482,6 +2529,21 @@ mod tests {
                     std::env::set_var(name, value);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn legacy_named_home_dir_refuses_names_that_are_not_plain_keys() {
+        // `legacy_named_home_dir` joins the typed name straight onto the sessions
+        // root. The by-key home is derived from the *sanitized* form, so a name
+        // that changes under sanitizing would move a directory to a home its own
+        // name does not hash to — and a path-shaped name would escape the root
+        // entirely. Both are refused before any filesystem access.
+        for bad in ["", "   ", "..", "../by-key", "a/b", "./x", "Legacy Name!"] {
+            assert!(
+                legacy_named_home_dir(bad).is_none(),
+                "legacy lookup must refuse {bad:?}"
+            );
         }
     }
 
