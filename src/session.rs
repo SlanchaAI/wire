@@ -835,17 +835,34 @@ pub fn detect_session_wire_home(cwd: &std::path::Path) -> Option<PathBuf> {
 ///   1. `WIRE_SESSION_ID` — explicit universal override (any harness).
 ///   2. `CLAUDE_CODE_SESSION_ID` — Claude Code adapter (stable per
 ///      conversation; the same id the auto-memory system keys off).
-///   3. `CODEX_SESSION_ID` — Codex compatibility adapter for hosts that
+///   3. `PI_SESSION_ID` — Pi Coding Agent (`@earendil-works/pi-coding-agent`)
+///      adapter. Pi injects this into the environment of commands its
+///      LLM-callable `bash` / `powershell` tools run with a session context
+///      (`core/tools/bash.js` `resolveSpawnContext`, gated on
+///      `exposeSessionEnvironment`, default true), so plain `wire <verb>` from
+///      inside a Pi session resolves per-session with zero operator setup.
+///      Stable per Pi conversation — it is the same id that names the session
+///      JSONL. Two Pi sessions in the SAME cwd therefore get two personas,
+///      which the legacy cwd registry would otherwise collapse into one.
+///      Two caveats, both verified against the installed Pi: the injector
+///      `delete`s the variable and re-sets it only when a session context
+///      exists, so context-less (e.g. sub-agent) bash tools inherit nothing; and
+///      because the variable is forwarded to child commands generally, a host
+///      that ships no session id of its own — Codex CLI does not forward
+///      `CODEX_SESSION_ID` — started inside a Pi shell inherits the parent Pi
+///      home and shares its inbox. Pi strips the variable for nested Pi, so
+///      Pi-in-Pi stays separate.
+///   4. `CODEX_SESSION_ID` — Codex compatibility adapter for hosts that
 ///      forward this older name.
-///   4. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
+///   5. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
 ///      per thread and inherited by tool subprocesses.
-///   5. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
-///   6. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
+///   6. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
+///   7. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
 ///      `copilot`) adapter. Set by the Copilot CLI host for every
 ///      session; stable per conversation; UUID-shaped.
-///   7. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
+///   8. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
 ///      identity (stable per workspace).
-///   8. `None` — caller falls back to legacy cwd-detect (bare CLI /
+///   9. `None` — caller falls back to legacy cwd-detect (bare CLI /
 ///      pre-v0.13 hosts). Future host adapters slot in before this.
 ///
 /// Returns `(key, source-label)`.
@@ -853,6 +870,7 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
     for (var, source) in [
         ("WIRE_SESSION_ID", "override"),
         ("CLAUDE_CODE_SESSION_ID", "claude-code"),
+        ("PI_SESSION_ID", "pi"),
         ("CODEX_SESSION_ID", "codex-cli"),
         ("CODEX_THREAD_ID", "codex-cli"),
     ] {
@@ -1566,7 +1584,7 @@ static SESSION_SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::
 /// The signal that won session/home resolution for this process. One of:
 /// `env:WIRE_HOME`, `env:WIRE_HOME_FORCE` (RFC-008 §C legacy-shape force),
 /// `override` (`WIRE_SESSION_ID`), `claude-code`, `claude-code-pidfile`,
-/// `codex-cli`, `goose`, `copilot-cli`, `vscode-workspace`, `minted`,
+/// `pi`, `codex-cli`, `goose`, `copilot-cli`, `vscode-workspace`, `minted`,
 /// `machine-default`, or `unknown` if adoption never ran.
 pub fn session_source() -> &'static str {
     SESSION_SOURCE.get().copied().unwrap_or("unknown")
@@ -1887,6 +1905,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -1897,6 +1916,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) Two distinct workspace paths -> two distinct, stable session homes.
@@ -1937,6 +1957,7 @@ mod tests {
         // Same guard for the other adapter slots.
         unsafe {
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             std::env::set_var("WIRE_SESSION_ID", "${workspaceFolder}");
         }
         let r_guard2 = resolve_session_key();
@@ -1956,6 +1977,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -1973,6 +1995,167 @@ mod tests {
             }
             if let Some(v) = prev_agent_session {
                 std::env::set_var("AGENT_SESSION_ID", v);
+            }
+            if let Some(v) = prev_copilot {
+                std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
+            }
+            if let Some(v) = prev_vscode {
+                std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_session_key_pi_adapter_priority_and_home_parity() {
+        // Per-adapter test for the Pi Coding Agent path. Pi injects
+        // PI_SESSION_ID into the env of every command its LLM-callable bash /
+        // powershell tools run (`core/tools/bash.js` `resolveSpawnContext`,
+        // gated on `exposeSessionEnvironment`, default true), so `wire <verb>`
+        // run from a Pi session resolves a per-session identity with no
+        // operator setup. Holds four invariants:
+        //
+        //   (a) Set to a real Pi session id -> that key wins resolution and two
+        //       distinct Pi sessions map to two distinct session homes. This is
+        //       the point of the adapter: two Pi sessions in the SAME cwd would
+        //       otherwise collapse onto one persona via the cwd registry.
+        //   (b) WIRE_SESSION_ID and CLAUDE_CODE_SESSION_ID outrank it; it
+        //       outranks CODEX_SESSION_ID / COPILOT_AGENT_SESSION_ID /
+        //       VSCODE_GIT_REPOSITORY_ROOT (pi sits at priority 3).
+        //   (c) HOME PARITY: the same id string arriving as PI_SESSION_ID or as
+        //       WIRE_SESSION_ID resolves to the SAME session home. The pi
+        //       package (pi/extensions/wire.ts) pins WIRE_SESSION_ID itself for
+        //       hosts that do not forward PI_SESSION_ID (SDK-embedded hosts);
+        //       parity is what makes those two paths one identity rather than
+        //       two personas for one conversation.
+        //   (d) Unexpanded ${...} literal is rejected by the guard, like every
+        //       other adapter.
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let prev_override = std::env::var_os("WIRE_SESSION_ID");
+        let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
+        let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
+        let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        // SAFETY: ENV_LOCK is held, serializing all env access.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("PI_SESSION_ID");
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+        }
+
+        // (a) PI_SESSION_ID wins resolution and is labeled `pi`; distinct Pi
+        //     sessions -> distinct homes; same id -> same home (resume).
+        let session_a = "0198c1f4-2b1e-7a3d-9c40-4f0d7c1b6a55";
+        let session_b = "0198c1f4-2b1e-7a3d-9c40-4f0d7c1b6a56";
+        unsafe { std::env::set_var("PI_SESSION_ID", session_a) };
+        let r1 = resolve_session_key();
+        assert!(
+            matches!(&r1, Some((k, src)) if k == session_a && *src == "pi"),
+            "PI_SESSION_ID must win resolution and be labeled pi; got {r1:?}"
+        );
+        let home_a = session_home_for_key(&r1.as_ref().unwrap().0).unwrap();
+
+        unsafe { std::env::set_var("PI_SESSION_ID", session_b) };
+        let home_b = session_home_for_key(&resolve_session_key().unwrap().0).unwrap();
+        assert_ne!(
+            home_a, home_b,
+            "two distinct Pi session ids must map to distinct session homes"
+        );
+
+        unsafe { std::env::set_var("PI_SESSION_ID", session_a) };
+        let home_a2 = session_home_for_key(&resolve_session_key().unwrap().0).unwrap();
+        assert_eq!(
+            home_a, home_a2,
+            "same Pi session id must yield the same home across calls"
+        );
+
+        // (b) Priority: override > claude-code > pi > codex > copilot > vscode.
+        unsafe { std::env::set_var("WIRE_SESSION_ID", "operator-override") };
+        let r_override = resolve_session_key();
+        assert!(
+            matches!(&r_override, Some((k, src)) if k == "operator-override" && *src == "override"),
+            "WIRE_SESSION_ID must beat PI_SESSION_ID; got {r_override:?}"
+        );
+        unsafe { std::env::remove_var("WIRE_SESSION_ID") };
+
+        unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "claude-wins-over-pi") };
+        let r_claude = resolve_session_key();
+        assert!(
+            matches!(&r_claude, Some((k, src)) if k == "claude-wins-over-pi" && *src == "claude-code"),
+            "CLAUDE_CODE_SESSION_ID must beat PI_SESSION_ID; got {r_claude:?}"
+        );
+        unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
+
+        // pi beats every later adapter, so a stray Codex/Copilot/VS Code id in
+        // the environment cannot steal a Pi session's identity.
+        unsafe {
+            std::env::set_var("CODEX_SESSION_ID", "codex-loses-to-pi");
+            std::env::set_var("COPILOT_AGENT_SESSION_ID", "copilot-loses-to-pi");
+            std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", "/repo/loses-to-pi");
+        };
+        let r_pi_wins = resolve_session_key();
+        assert!(
+            matches!(&r_pi_wins, Some((k, src)) if k == session_a && *src == "pi"),
+            "PI_SESSION_ID must beat CODEX/COPILOT/VSCODE adapters; got {r_pi_wins:?}"
+        );
+        unsafe {
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+        }
+
+        // (c) Home parity — the invariant pi/extensions/wire.ts depends on.
+        unsafe { std::env::remove_var("PI_SESSION_ID") };
+        unsafe { std::env::set_var("WIRE_SESSION_ID", session_a) };
+        let via_override = resolve_session_key().unwrap();
+        assert_eq!(
+            via_override.1, "override",
+            "WIRE_SESSION_ID keeps its own source label"
+        );
+        assert_eq!(
+            session_home_for_key(&via_override.0).unwrap(),
+            home_a,
+            "one Pi session id must reach one session home whether it arrives as \
+             PI_SESSION_ID or as WIRE_SESSION_ID — otherwise the pi package and a \
+             plain bash-tool `wire` call would run as two different personas"
+        );
+
+        // (d) Unexpanded ${...} guard.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::set_var("PI_SESSION_ID", "${PI_SESSION_ID}");
+        };
+        let r_guard = resolve_session_key();
+        assert!(
+            !matches!(&r_guard, Some((k, _)) if k.contains("${")),
+            "unexpanded ${{...}} in PI_SESSION_ID must be rejected by the ${{}} guard; got {r_guard:?}"
+        );
+
+        // Restore any env we displaced.
+        // SAFETY: ENV_LOCK still held.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("PI_SESSION_ID");
+            if let Some(v) = prev_override {
+                std::env::set_var("WIRE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_claude {
+                std::env::set_var("CLAUDE_CODE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex {
+                std::env::set_var("CODEX_SESSION_ID", v);
             }
             if let Some(v) = prev_copilot {
                 std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
@@ -2015,6 +2198,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -2025,6 +2209,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) COPILOT_AGENT_SESSION_ID set -> wins resolution; distinct ids
@@ -2088,6 +2273,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -2111,6 +2297,9 @@ mod tests {
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
             }
         }
     }
@@ -2143,6 +2332,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -2153,6 +2343,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) CODEX_THREAD_ID is the runtime value current Codex processes
@@ -2242,6 +2433,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -2265,6 +2457,9 @@ mod tests {
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
             }
         }
     }
@@ -3024,6 +3219,7 @@ mod tests {
             "override",
             "claude-code",
             "claude-code-pidfile",
+            "pi",
             "codex-cli",
             "goose",
             "copilot-cli",

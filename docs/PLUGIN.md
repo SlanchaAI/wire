@@ -72,6 +72,23 @@ This list is verified against the live catalog by a test (`agent_docs_match_adve
 
 Resource: `wire://inbox/<peer>` exposes each pinned peer's verified inbox as JSONL.
 
+## Pi package
+
+Pi is not an MCP host, so wire reaches it as a Pi package instead of an MCP
+server: native `wire_*` tools that call the `wire` CLI. The manifest lives at
+`pi-plugin/package.json` and bundles `pi-plugin/extensions/wire.ts` plus the
+`wire-pi` skill. The binary is still a separate install:
+
+```bash
+cargo install slancha-wire
+pi install /absolute/path/to/wire/pi-plugin
+```
+
+`pi -e /absolute/path/to/wire/pi-plugin/extensions/wire.ts` tries it for one run
+without touching Pi settings. Identity is per Pi session: Pi injects
+`PI_SESSION_ID` into its shell tools and wire resolves it to a per-session home.
+See [docs/integrations/PI.md](integrations/PI.md).
+
 ## Claude publishing channels
 
 The plugin is publishable via three paths (all working from the same `.claude-plugin/plugin.json` manifest):

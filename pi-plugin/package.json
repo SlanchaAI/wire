@@ -1,0 +1,34 @@
+{
+  "name": "wire-pi",
+  "version": "0.17.0",
+  "description": "Native wire tools for the Pi coding agent — bilateral signed agent-to-agent messaging without MCP.",
+  "author": {
+    "name": "Paul Logan",
+    "email": "paul@slancha.ai"
+  },
+  "homepage": "https://wireup.net",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SlanchaAi/wire",
+    "directory": "pi-plugin"
+  },
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "pi-package",
+    "agent",
+    "p2p",
+    "ed25519",
+    "mailbox",
+    "identity",
+    "wire"
+  ],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
