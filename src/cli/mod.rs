@@ -1577,9 +1577,10 @@ pub enum SessionCommand {
     /// Move a pre-RFC-006 `sessions/<name>` home into the 1.0
     /// `sessions/by-key/<hash>` layout. RFC-006 Part A made by-key the one
     /// layout, so nothing reads the top-level location any more: a home left
-    /// there is invisible to `wire session list`, `--session <name>`, and
-    /// `wire session destroy`, and creating the name again mints a second
-    /// identity for it. Dry-run by default — `--apply` moves the directory
+    /// there is invisible to every reader: `wire session list` skips it,
+    /// `wire session env <name>` errors "no session named <name> on this
+    /// machine", and `wire daemon --session <name>` cannot pin it. Creating
+    /// the name again mints a second identity for the same project. Dry-run by default — `--apply` moves the directory
     /// (a rename; the rollback command is printed). Refuses when the by-key
     /// home already exists or the legacy home's daemon is live.
     Migrate {
