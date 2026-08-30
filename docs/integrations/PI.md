@@ -106,6 +106,52 @@ Identity is keyed to the Pi session id, not the working directory.
   v0.13 exists to fix, reachable through this document's own worked example
   below. Fixed; the precedence is now as stated.
 
+### Typing `wire` in a Pi shell
+
+The 13 tools pin the session key themselves. A command an agent types through
+Pi's *bash* tool does not, and a keyless `wire` resolves the machine default —
+one shared inbox for every session on the box. Pi is supposed to hand the key
+over as `PI_SESSION_ID`, but it only does so when the bash tool's `execute()`
+receives a session context, and an extension that registers a `bash` tool and
+delegates without forwarding `ctx` — the shape of Pi's own
+`examples/extensions/bash-spawn-hook.ts` — drops it. Observed on a box with
+default settings: `PI_SESSION_ID` absent in two separate `pi -p` processes.
+
+Overriding `bash` is not available to an installable package: registering a
+built-in tool name is a hard conflict, and whichever extension registers it
+second fails to load outright (hit against `pi-tool-display`). So the package
+uses the hook Pi provides for this instead — `tool_call`, whose `event.input` is
+mutable and whose handlers compose. It prefixes `export WIRE_SESSION_ID='<id>'; `
+onto bash/powershell commands that invoke `wire`, taking the id from the live
+context per call, never from `process.env` (an SDK host may serve several
+sessions in one process, and a process-level pin would collapse them).
+
+- Visible, not sneaky: the prefix appears in the transcript.
+- Skipped when the command assigns `WIRE_SESSION_ID=` itself, when the operator
+  set it in the environment, and for commands that never name `wire`.
+- Opt out entirely: `WIRE_PI_NO_BASH_INJECT=1`. Set `WIRE_PI_HOOK_DEBUG=<file>`
+  to log each decision while diagnosing.
+- Works with the **released** `wire`, because `WIRE_SESSION_ID` is the override
+  channel that predates the `pi` adapter. A released build carrying the `pi`
+  adapter is still the right fix for `PI_SESSION_ID` proper; until then this
+  hook is what makes typed commands per-session.
+
+Verified with the installed 0.17.0 binary, two separate Pi sessions:
+
+```
+key 01a05362-… -> tinder-palm
+key 01a05363-… -> tidal-cedar
+```
+
+One root caveat found while verifying it, filed as a discrepancy rather than a
+claim: with `WIRE_HOME` pinned *and* `WIRE_SESSION_ID` set, the keyed home
+resolves under the machine default root, not `$WIRE_HOME/sessions`, so
+`sessions_root()`'s docstring ("sessions root becomes `$WIRE_HOME/sessions/`")
+does not hold for keyed homes. The key is honored
+(`by-key/<sha256(key)[..16]>`, checked against an independent hash); the root
+is not. Consequence: a `WIRE_HOME=$(mktemp -d)` prefix does **not** sandbox a
+keyed `wire up`.
+
 Check what wire actually resolved:
 
 ```bash

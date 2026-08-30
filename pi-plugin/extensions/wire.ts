@@ -26,6 +26,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -490,6 +491,59 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ── bash / powershell: wire commands carry this session's key ───────────────
+  //
+  // The 13 tools above pin WIRE_SESSION_ID themselves, but an agent that types
+  // `wire up` through Pi's *bash* tool gets no key, and a keyless `wire` falls
+  // through to the machine default: one shared inbox for every session on the
+  // box. Pi is meant to supply the key as PI_SESSION_ID
+  // (dist/core/tools/bash.js resolveSpawnContext), but it sets it only when the
+  // tool's execute() receives a session ctx — and an extension that registers a
+  // `bash` tool and delegates without forwarding ctx, the shape of pi's own
+  // examples/extensions/bash-spawn-hook.ts, drops it. Measured with default
+  // settings: PI_SESSION_ID absent in two separate `pi -p` processes.
+  //
+  // Overriding `bash` is not an option for an installable package: registering a
+  // built-in tool name is a hard conflict, and the second extension to do it
+  // fails to load outright (observed against pi-tool-display). So use the hook
+  // pi provides for exactly this — `tool_call`, whose `event.input` is mutable
+  // and whose handlers compose rather than replace. Only commands that name
+  // `wire` are touched, and the key comes from the live ctx per call, never from
+  // process.env, because an SDK host may serve several sessions in one process
+  // and a process-level pin would collapse them (defect class fixed in 65df231).
+  //
+  // The mutation is visible: the prefixed `export` appears in the transcript.
+  // Opt out with WIRE_PI_NO_BASH_INJECT=1.
+  if (!process.env.WIRE_PI_NO_BASH_INJECT) {
+    pi.on("tool_call", (event, ctx) => {
+      const dbg = (why: string) => {
+        if (!process.env.WIRE_PI_HOOK_DEBUG) return;
+        try {
+          appendFileSync(process.env.WIRE_PI_HOOK_DEBUG, `${event.toolName} ${JSON.stringify(event.input)} -> ${why}\n`);
+        } catch {
+          /* debug only */
+        }
+      };
+      dbg("enter");
+      const input = event.input as { command?: string } | undefined;
+      const command = input?.command;
+      if (!command) return dbg("no-command");
+      if (event.toolName !== "bash" && event.toolName !== "powershell") return dbg("tool-name");
+      if (process.env.WIRE_SESSION_ID) return dbg("operator-pin"); // operator-override channel wins
+      // A command that assigns the key has chosen its own identity (an operator
+      // override, or a deliberate share). Merely *reading* the variable is not a
+      // choice, so match assignment, not mention.
+      if (/(^|[;&|(\n]|\s)(export\s+)?WIRE_SESSION_ID=/.test(command)) return dbg("self-keyed");
+      if (!/(^|[\s;&|(])wire(\s|$)/.test(command)) return dbg("not-a-wire-cmd"); // wire only
+      const key = ctx?.sessionManager?.getSessionId?.();
+      if (!key) return dbg("no-session-id");
+      // `export`, not a `VAR=x cmd` prefix: a prefix binds only the first command
+      // of a chain, so `cd x && wire up` would still run keyless.
+      input!.command = `export WIRE_SESSION_ID='${key.replace(/'/g, "'\\''")}'; ${command}`;
+      dbg(`prefixed with ${key}`);
+    });
+  }
+
   // The watcher is session-lifetime infrastructure, not turn scaffolding
   // (wire AGENTS.md R7 — the 2026-05-12 agent-attention-layer incident root
   // caused exactly by tearing a listener down between iterations). It is torn
@@ -497,4 +551,5 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     stopWatcher(undefined);
   });
+
 }
