@@ -172,6 +172,56 @@ pub fn find_session_home_by_name(name: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// True when `path` is a wire session home rather than a stray directory: a
+/// self-card is written by `init` and is what every reader needs.
+pub fn is_session_home(path: &std::path::Path) -> bool {
+    path.join("config")
+        .join("wire")
+        .join("agent-card.json")
+        .is_file()
+}
+
+/// The pre-RFC-006 layout: `sessions/<name>` used to be where a named session
+/// lived. Nothing reads that path any more — `list_sessions` scans `by-key`
+/// only, and `session_dir` hashes a name into `by-key` — so a home left here is
+/// unreachable: `wire --session <name> whoami` answers "not initialized", while
+/// the persona inside is intact. `init`/`up` on that same name then mints a
+/// second identity, which is how one name ends up owning two agents.
+///
+/// Returns Some only for a plain single-component name (nothing path-shaped,
+/// nothing that changes under `sanitize_name`, since the by-key home is derived
+/// from the sanitized form) whose legacy home exists on disk.
+pub fn legacy_named_home_dir(name: &str) -> Option<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != sanitize_name(trimmed) {
+        return None;
+    }
+    let candidate = sessions_root().ok()?.join(trimmed);
+    is_session_home(&candidate).then_some(candidate)
+}
+
+/// Every top-level legacy home under the sessions root, by directory name.
+/// `by-key` itself is the current layout, not a candidate.
+pub fn legacy_named_homes() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(root) = sessions_root() else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if name == "by-key" || !is_session_home(&entry.path()) {
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort();
+    out
+}
 /// Registry tracks `cwd → session_name` so repeated `wire session new`
 /// from the same project reuses the same identity instead of creating
 /// a fresh one each time. Lives at `<sessions_root>/registry.json`.
@@ -450,28 +500,156 @@ fn url_is_loopback(url: &str) -> bool {
 /// Designed for `wire add <input>` ergonomics — the operator should
 /// be able to type whatever face wire put on the peer (statusline
 /// nickname, session list emoji+name) and have wire find it.
-pub fn resolve_local_sister(input: &str) -> Option<String> {
+/// One local session that answers to the name a caller typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SisterCandidate {
+    /// Display name — the persona handle for an initialized home, the by-key
+    /// hash otherwise. Two colliding identities share this value, so it is
+    /// never the dedupe key.
+    pub session: String,
+    /// The `by-key/<hash>` dir name. Distinct per identity even when `session`
+    /// is shared. This IS an actionable address: `resolve_local_session` matches
+    /// it, so `wire add <home> --local-sister` resolves the exact home.
+    pub home: String,
+    pub did: Option<String>,
+}
+
+/// What a bare name matched among this machine's session homes.
+///
+/// The `Ambiguous` arm is the whole point of this type. A persona nickname is
+/// `ADJECTIVES[243] × NOUNS[242]` = 58,806 names, seeded from the 8-hex
+/// fingerprint suffix (`Character::from_seed`), and v0.11 made that nickname the
+/// addressable handle — the handle is even baked into the DID. Collision odds
+/// reach 50% at ~285 identities, so on a box with thousands of session homes
+/// (one per agent session; see `ensure_session_bootstrapped`) two DIFFERENT DIDs
+/// routinely share one name. The previous implementation returned the first hit
+/// in `read_dir` order, which meant `wire dial <nick>` could silently pair with,
+/// and `wire send` could silently write to, whichever of the two the filesystem
+/// happened to enumerate first. Misrouting an Ed25519-signed message is not a
+/// cosmetic failure, so ambiguity is now a hard error that names the candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SisterMatch {
+    /// One identity matched. The payload is the `by-key` home dir name, which
+    /// is the only local token that is both unique and accepted downstream
+    /// (`resolve_local_session` matches it, and `resolve_name_to_target` looks
+    /// the session up by it).
+    Unique(String),
+    Ambiguous(Vec<SisterCandidate>),
+}
+
+impl SisterMatch {
+    /// The single session name, or an error listing every candidate by DID.
+    pub fn unique(self, input: &str) -> Result<String> {
+        match self {
+            SisterMatch::Unique(session) => Ok(session),
+            SisterMatch::Ambiguous(cands) => {
+                let count = cands.len();
+                let listing = cands
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "  wire dial {}   # or: wire add {} --local-sister",
+                            c.did.as_deref().unwrap_or("(no card)"),
+                            c.home
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(anyhow!(
+                    "`{input}` is not unique: {count} local sessions answer to that name. Persona \
+                     nicknames collide at this population (243x242 word pair, and the nickname is \
+                     the addressable handle), so wire refuses to guess which agent you meant — \
+                     guessing would pair with, or send signed events to, the wrong \
+                     identity.\n\nRepeat with the DID, or with the `by-key` home name plus \
+                     `--local-sister`:\n{listing}"
+                ))
+            }
+        }
+    }
+}
+
+/// Resolve a bare name against this machine's session homes. Accepts a session
+/// name, card handle, persona nickname, full DID, or `by-key` home dir name —
+/// the last two are the forms an ambiguous nickname must be narrowed to.
+/// Use [`resolve_local_sister_unique`] at call sites about to act on the result.
+pub fn resolve_local_sister(input: &str) -> Option<SisterMatch> {
     let needle = input.trim();
     if needle.is_empty() {
         return None;
     }
     let sessions = list_sessions().ok()?;
+    let mut matches: Vec<SisterCandidate> = Vec::new();
     for s in &sessions {
-        if s.name.eq_ignore_ascii_case(needle) {
-            return Some(s.name.clone());
-        }
-        if let Some(h) = &s.handle
-            && h.eq_ignore_ascii_case(needle)
-        {
-            return Some(s.name.clone());
-        }
-        if let Some(ch) = &s.character
-            && ch.nickname.eq_ignore_ascii_case(needle)
-        {
-            return Some(s.name.clone());
+        let home = s
+            .home_dir
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string();
+        let hit = s.name.eq_ignore_ascii_case(needle)
+            || s.handle
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(needle))
+            || s.character
+                .as_ref()
+                .is_some_and(|ch| ch.nickname.eq_ignore_ascii_case(needle))
+            // DID and by-key home are what the ambiguity error tells an operator
+            // to retype, so they have to resolve here too.
+            || s.did
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case(needle))
+            || home.eq_ignore_ascii_case(needle);
+        if hit {
+            matches.push(SisterCandidate {
+                session: s.name.clone(),
+                home,
+                did: s.did.clone(),
+            });
         }
     }
-    None
+    // Dedupe by HOME first: for an initialized home list_sessions overrides name
+    // to the persona handle, so the collision this guard exists to catch — two
+    // DIDs, one nickname — arrives as two entries with an identical `session`.
+    // A home-keyed dedupe keeps them distinct.
+    matches.sort_by(|a, b| a.home.cmp(&b.home));
+    matches.dedup_by(|a, b| a.home == b.home);
+    // Then collapse by DID: one identity living at two homes is one agent, not a
+    // choice between agents. Refusing there would be a false stop, and the error
+    // text would claim we might pick the wrong identity when both candidates are
+    // the same identity.
+    let distinct_dids: Vec<&Option<String>> = {
+        let mut v: Vec<&Option<String>> = matches.iter().map(|c| &c.did).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    if matches.len() > 1 && distinct_dids.len() == 1 && distinct_dids[0].is_some() {
+        matches.truncate(1);
+    }
+    match matches.len() {
+        0 => None,
+        1 => Some(SisterMatch::Unique(
+            matches.into_iter().next().unwrap().home,
+        )),
+        _ => Some(SisterMatch::Ambiguous(matches)),
+    }
+}
+
+/// `Ok(None)` — no local session answers to this name. `Ok(Some(home))` —
+/// exactly one does. `Err` — several distinct identities do, and picking one
+/// would misroute signed traffic. The returned `by-key` home name is accepted by
+/// `resolve_local_session`, so `wire add <home> --local-sister` works.
+pub fn resolve_local_sister_unique(input: &str) -> Result<Option<String>> {
+    resolve_local_sister(input)
+        .map(|m| m.unique(input))
+        .transpose()
+}
+
+/// `current_operational_handle`, exposed for CLI honesty checks (`wire session
+/// current` must report the identity that is actually signing, not only the name
+/// the cwd registry claims).
+pub fn operational_handle() -> Option<String> {
+    current_operational_handle()
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
@@ -835,17 +1013,34 @@ pub fn detect_session_wire_home(cwd: &std::path::Path) -> Option<PathBuf> {
 ///   1. `WIRE_SESSION_ID` — explicit universal override (any harness).
 ///   2. `CLAUDE_CODE_SESSION_ID` — Claude Code adapter (stable per
 ///      conversation; the same id the auto-memory system keys off).
-///   3. `CODEX_SESSION_ID` — Codex compatibility adapter for hosts that
+///   3. `PI_SESSION_ID` — Pi Coding Agent (`@earendil-works/pi-coding-agent`)
+///      adapter. Pi injects this into the environment of commands its
+///      LLM-callable `bash` / `powershell` tools run with a session context
+///      (`core/tools/bash.js` `resolveSpawnContext`, gated on
+///      `exposeSessionEnvironment`, default true), so plain `wire <verb>` from
+///      inside a Pi session resolves per-session with zero operator setup.
+///      Stable per Pi conversation — it is the same id that names the session
+///      JSONL. Two Pi sessions in the SAME cwd therefore get two personas,
+///      which the legacy cwd registry would otherwise collapse into one.
+///      Two caveats, both verified against the installed Pi: the injector
+///      `delete`s the variable and re-sets it only when a session context
+///      exists, so context-less (e.g. sub-agent) bash tools inherit nothing; and
+///      because the variable is forwarded to child commands generally, a host
+///      that ships no session id of its own — Codex CLI does not forward
+///      `CODEX_SESSION_ID` — started inside a Pi shell inherits the parent Pi
+///      home and shares its inbox. Pi strips the variable for nested Pi, so
+///      Pi-in-Pi stays separate.
+///   4. `CODEX_SESSION_ID` — Codex compatibility adapter for hosts that
 ///      forward this older name.
-///   4. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
+///   5. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
 ///      per thread and inherited by tool subprocesses.
-///   5. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
-///   6. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
+///   6. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
+///   7. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
 ///      `copilot`) adapter. Set by the Copilot CLI host for every
 ///      session; stable per conversation; UUID-shaped.
-///   7. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
+///   8. `VSCODE_GIT_REPOSITORY_ROOT` — VS Code/GitHub Copilot workspace-based
 ///      identity (stable per workspace).
-///   8. `None` — caller falls back to legacy cwd-detect (bare CLI /
+///   9. `None` — caller falls back to legacy cwd-detect (bare CLI /
 ///      pre-v0.13 hosts). Future host adapters slot in before this.
 ///
 /// Returns `(key, source-label)`.
@@ -853,6 +1048,7 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
     for (var, source) in [
         ("WIRE_SESSION_ID", "override"),
         ("CLAUDE_CODE_SESSION_ID", "claude-code"),
+        ("PI_SESSION_ID", "pi"),
         ("CODEX_SESSION_ID", "codex-cli"),
         ("CODEX_THREAD_ID", "codex-cli"),
     ] {
@@ -1566,7 +1762,7 @@ static SESSION_SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::
 /// The signal that won session/home resolution for this process. One of:
 /// `env:WIRE_HOME`, `env:WIRE_HOME_FORCE` (RFC-008 §C legacy-shape force),
 /// `override` (`WIRE_SESSION_ID`), `claude-code`, `claude-code-pidfile`,
-/// `codex-cli`, `goose`, `copilot-cli`, `vscode-workspace`, `minted`,
+/// `pi`, `codex-cli`, `goose`, `copilot-cli`, `vscode-workspace`, `minted`,
 /// `machine-default`, or `unknown` if adoption never ran.
 pub fn session_source() -> &'static str {
     SESSION_SOURCE.get().copied().unwrap_or("unknown")
@@ -1887,6 +2083,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -1897,6 +2094,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) Two distinct workspace paths -> two distinct, stable session homes.
@@ -1937,6 +2135,7 @@ mod tests {
         // Same guard for the other adapter slots.
         unsafe {
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             std::env::set_var("WIRE_SESSION_ID", "${workspaceFolder}");
         }
         let r_guard2 = resolve_session_key();
@@ -1956,6 +2155,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -1979,6 +2179,9 @@ mod tests {
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
             }
         }
     }
@@ -2015,6 +2218,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -2025,6 +2229,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) COPILOT_AGENT_SESSION_ID set -> wins resolution; distinct ids
@@ -2088,6 +2293,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -2111,6 +2317,9 @@ mod tests {
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
             }
         }
     }
@@ -2143,6 +2352,7 @@ mod tests {
         let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
         let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
         let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
         // SAFETY: ENV_LOCK is held, serializing all env access.
         unsafe {
             std::env::remove_var("WIRE_SESSION_ID");
@@ -2153,6 +2363,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
         }
 
         // (a) CODEX_THREAD_ID is the runtime value current Codex processes
@@ -2242,6 +2453,7 @@ mod tests {
             std::env::remove_var("AGENT_SESSION_ID");
             std::env::remove_var("COPILOT_AGENT_SESSION_ID");
             std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
             if let Some(v) = prev_override {
                 std::env::set_var("WIRE_SESSION_ID", v);
             }
@@ -2265,6 +2477,9 @@ mod tests {
             }
             if let Some(v) = prev_vscode {
                 std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
             }
         }
     }
@@ -2320,6 +2535,313 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn legacy_named_home_dir_refuses_names_that_are_not_plain_keys() {
+        // `legacy_named_home_dir` joins the typed name straight onto the sessions
+        // root. The by-key home is derived from the *sanitized* form, so a name
+        // that changes under sanitizing would move a directory to a home its own
+        // name does not hash to — and a path-shaped name would escape the root
+        // entirely. Both are refused before any filesystem access.
+        for bad in ["", "   ", "..", "../by-key", "a/b", "./x", "Legacy Name!"] {
+            assert!(
+                legacy_named_home_dir(bad).is_none(),
+                "legacy lookup must refuse {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_session_key_pi_adapter_priority_and_home_parity() {
+        // Per-adapter test for the Pi Coding Agent path. Pi injects
+        // PI_SESSION_ID into the env of every command its LLM-callable bash /
+        // powershell tools run (`core/tools/bash.js` `resolveSpawnContext`,
+        // gated on `exposeSessionEnvironment`, default true), so `wire <verb>`
+        // run from a Pi session resolves a per-session identity with no
+        // operator setup. Holds four invariants:
+        //
+        //   (a) Set to a real Pi session id -> that key wins resolution and two
+        //       distinct Pi sessions map to two distinct session homes. This is
+        //       the point of the adapter: two Pi sessions in the SAME cwd would
+        //       otherwise collapse onto one persona via the cwd registry.
+        //   (b) WIRE_SESSION_ID and CLAUDE_CODE_SESSION_ID outrank it; it
+        //       outranks CODEX_SESSION_ID / COPILOT_AGENT_SESSION_ID /
+        //       VSCODE_GIT_REPOSITORY_ROOT (pi sits at priority 3).
+        //   (c) HOME PARITY: the same id string arriving as PI_SESSION_ID or as
+        //       WIRE_SESSION_ID resolves to the SAME session home. The pi
+        //       package (pi/extensions/wire.ts) pins WIRE_SESSION_ID itself for
+        //       hosts that do not forward PI_SESSION_ID (SDK-embedded hosts);
+        //       parity is what makes those two paths one identity rather than
+        //       two personas for one conversation.
+        //   (d) Unexpanded ${...} literal is rejected by the guard, like every
+        //       other adapter.
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let prev_override = std::env::var_os("WIRE_SESSION_ID");
+        let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
+        let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
+        let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        // SAFETY: ENV_LOCK is held, serializing all env access.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("PI_SESSION_ID");
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+        }
+
+        // (a) PI_SESSION_ID wins resolution and is labeled `pi`; distinct Pi
+        //     sessions -> distinct homes; same id -> same home (resume).
+        let session_a = "0198c1f4-2b1e-7a3d-9c40-4f0d7c1b6a55";
+        let session_b = "0198c1f4-2b1e-7a3d-9c40-4f0d7c1b6a56";
+        unsafe { std::env::set_var("PI_SESSION_ID", session_a) };
+        let r1 = resolve_session_key();
+        assert!(
+            matches!(&r1, Some((k, src)) if k == session_a && *src == "pi"),
+            "PI_SESSION_ID must win resolution and be labeled pi; got {r1:?}"
+        );
+        let home_a = session_home_for_key(&r1.as_ref().unwrap().0).unwrap();
+
+        unsafe { std::env::set_var("PI_SESSION_ID", session_b) };
+        let home_b = session_home_for_key(&resolve_session_key().unwrap().0).unwrap();
+        assert_ne!(
+            home_a, home_b,
+            "two distinct Pi session ids must map to distinct session homes"
+        );
+
+        unsafe { std::env::set_var("PI_SESSION_ID", session_a) };
+        let home_a2 = session_home_for_key(&resolve_session_key().unwrap().0).unwrap();
+        assert_eq!(
+            home_a, home_a2,
+            "same Pi session id must yield the same home across calls"
+        );
+
+        // (b) Priority: override > claude-code > pi > codex > copilot > vscode.
+        unsafe { std::env::set_var("WIRE_SESSION_ID", "operator-override") };
+        let r_override = resolve_session_key();
+        assert!(
+            matches!(&r_override, Some((k, src)) if k == "operator-override" && *src == "override"),
+            "WIRE_SESSION_ID must beat PI_SESSION_ID; got {r_override:?}"
+        );
+        unsafe { std::env::remove_var("WIRE_SESSION_ID") };
+
+        unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", "claude-wins-over-pi") };
+        let r_claude = resolve_session_key();
+        assert!(
+            matches!(&r_claude, Some((k, src)) if k == "claude-wins-over-pi" && *src == "claude-code"),
+            "CLAUDE_CODE_SESSION_ID must beat PI_SESSION_ID; got {r_claude:?}"
+        );
+        unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") };
+
+        // pi beats every later adapter, so a stray Codex/Copilot/VS Code id in
+        // the environment cannot steal a Pi session's identity.
+        unsafe {
+            std::env::set_var("CODEX_SESSION_ID", "codex-loses-to-pi");
+            std::env::set_var("COPILOT_AGENT_SESSION_ID", "copilot-loses-to-pi");
+            std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", "/repo/loses-to-pi");
+        };
+        let r_pi_wins = resolve_session_key();
+        assert!(
+            matches!(&r_pi_wins, Some((k, src)) if k == session_a && *src == "pi"),
+            "PI_SESSION_ID must beat CODEX/COPILOT/VSCODE adapters; got {r_pi_wins:?}"
+        );
+        unsafe {
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+        }
+
+        // (c) Home parity — the invariant pi/extensions/wire.ts depends on.
+        unsafe { std::env::remove_var("PI_SESSION_ID") };
+        unsafe { std::env::set_var("WIRE_SESSION_ID", session_a) };
+        let via_override = resolve_session_key().unwrap();
+        assert_eq!(
+            via_override.1, "override",
+            "WIRE_SESSION_ID keeps its own source label"
+        );
+        assert_eq!(
+            session_home_for_key(&via_override.0).unwrap(),
+            home_a,
+            "one Pi session id must reach one session home whether it arrives as \
+             PI_SESSION_ID or as WIRE_SESSION_ID — otherwise the pi package and a \
+             plain bash-tool `wire` call would run as two different personas"
+        );
+
+        // (d) Unexpanded ${...} guard.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::set_var("PI_SESSION_ID", "${PI_SESSION_ID}");
+        };
+        let r_guard = resolve_session_key();
+        assert!(
+            !matches!(&r_guard, Some((k, _)) if k.contains("${")),
+            "unexpanded ${{...}} in PI_SESSION_ID must be rejected by the ${{}} guard; got {r_guard:?}"
+        );
+
+        // Restore any env we displaced.
+        // SAFETY: ENV_LOCK still held.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("PI_SESSION_ID");
+            if let Some(v) = prev_override {
+                std::env::set_var("WIRE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_claude {
+                std::env::set_var("CLAUDE_CODE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex {
+                std::env::set_var("CODEX_SESSION_ID", v);
+            }
+            if let Some(v) = prev_copilot {
+                std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
+            }
+            if let Some(v) = prev_vscode {
+                std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_local_sister_unique_refuses_ambiguous_persona() {
+        // A persona nickname is 243x242 word pairs seeded from the 8-hex
+        // fingerprint suffix, and v0.11 made that nickname the addressable
+        // handle. On a box with thousands of session homes the birthday bound
+        // is long past: the machine this was found on held 8,861 initialized
+        // homes and 566 handle groups shared by two different DIDs. Before this
+        // guard, `resolve_local_sister` returned the FIRST match in read_dir
+        // order, so `wire dial <nick>` / `wire send <nick>` could pair with or
+        // write signed events to whichever of the two the filesystem happened
+        // to enumerate. Locks the refusal, the actionable candidates, and the
+        // two paths that must keep working.
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = std::env::temp_dir().join(format!("wire-sisters-{}", rand::random::<u32>()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("sessions");
+
+        let mk_session = |key: &str, handle: &str, fingerprint: &str| -> PathBuf {
+            let home = root.join("by-key").join(key);
+            let cfg = home.join("config").join("wire");
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join("agent-card.json"),
+                format!(
+                    r#"{{"did":"did:wire:{handle}-{fingerprint}","handle":"{handle}","verify_keys":{{}}}}"#
+                ),
+            )
+            .unwrap();
+            home
+        };
+
+        // Two DISTINCT identities answering to ONE persona handle.
+        let h_a = mk_session("aaaa5c8806dde7b1", "amber-tarn", "11111111");
+        let h_b = mk_session("bbbb53029dbcde65", "amber-tarn", "22222222");
+        // One identity with a name nobody else answers to.
+        let _h_c = mk_session("cccc5fc3cbae0adf", "lone-larch", "33333333");
+
+        // sessions_root() resolves from inside a session home.
+        // SAFETY: ENV_LOCK is held.
+        unsafe { std::env::set_var("WIRE_HOME", &h_a) };
+
+        // (1) The collision must be refused, not resolved.
+        let amb = resolve_local_sister("amber-tarn");
+        assert!(
+            matches!(&amb, Some(SisterMatch::Ambiguous(c)) if c.len() == 2),
+            "two DIDs sharing a persona handle must surface as Ambiguous; got {amb:?}"
+        );
+        if let Some(SisterMatch::Ambiguous(c)) = &amb {
+            let homes: Vec<&str> = c.iter().map(|x| x.home.as_str()).collect();
+            assert!(
+                homes.contains(&"aaaa5c8806dde7b1") && homes.contains(&"bbbb53029dbcde65"),
+                "candidates must name both homes so the caller can disambiguate; got {homes:?}"
+            );
+        }
+
+        // (2) Acting on it errors, and the error names both DIDs and both
+        //     by-key homes (the disambiguator that find_session_home_by_name
+        //     actually accepts).
+        let err = resolve_local_sister_unique("amber-tarn")
+            .expect_err("ambiguous persona must not resolve");
+        let msg = err.to_string();
+        for needle in [
+            "not unique",
+            "did:wire:amber-tarn-11111111",
+            "did:wire:amber-tarn-22222222",
+            "aaaa5c8806dde7b1",
+            "bbbb53029dbcde65",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "ambiguity error must contain {needle:?}; got: {msg}"
+            );
+        }
+
+        // (3) A name owned by one identity still resolves normally, and the
+        //     token is the by-key home (the form resolve_local_session accepts).
+        let lone = resolve_local_sister_unique("lone-larch").unwrap();
+        assert_eq!(
+            lone.as_deref(),
+            Some("cccc5fc3cbae0adf"),
+            "a unique persona must resolve to its by-key home"
+        );
+
+        // (4) No match is Ok(None) — the caller falls through to federation.
+        let missing = resolve_local_sister_unique("no-such-peer").unwrap();
+        assert_eq!(missing, None, "unknown name must stay Ok(None)");
+
+        // (5) The remedy the ambiguity error prints must actually resolve, or
+        //     the guard strands the operator with a name they cannot use.
+        assert_eq!(
+            resolve_local_sister_unique("did:wire:amber-tarn-11111111")
+                .unwrap()
+                .as_deref(),
+            Some("aaaa5c8806dde7b1"),
+            "the full DID printed by the error must resolve to exactly one home"
+        );
+        assert_eq!(
+            resolve_local_sister_unique("bbbb53029dbcde65")
+                .unwrap()
+                .as_deref(),
+            Some("bbbb53029dbcde65"),
+            "the by-key home printed by the error must resolve to itself"
+        );
+
+        // (6) One identity at two homes is one agent, not a choice between
+        //     agents. Refusing there is a false stop, and the refusal text would
+        //     claim we might pick the wrong identity when both candidates are
+        //     the same identity.
+        let twin = root.join("by-key").join("dddd5c8806dde7b1");
+        std::fs::create_dir_all(twin.join("config").join("wire")).unwrap();
+        std::fs::write(
+            twin.join("config").join("wire").join("agent-card.json"),
+            r#"{"did":"did:wire:amber-tarn-11111111","handle":"amber-tarn","verify_keys":{}}"#,
+        )
+        .unwrap();
+        let same_did_two_homes = resolve_local_sister("did:wire:amber-tarn-11111111");
+        assert!(
+            matches!(&same_did_two_homes, Some(SisterMatch::Unique(_))),
+            "the same DID at two homes must not read as an ambiguity; got {same_did_two_homes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&twin);
+
+        // (7) Dedupe must key on home, not display name: both colliding entries
+        //     carry the same `session` (list_sessions overrides name to the
+        //     handle), so a name-keyed dedupe would have collapsed them and let
+        //     the ambiguity through.
+        assert_ne!(h_a, h_b, "fixture sanity: the two homes differ");
+
+        unsafe { std::env::remove_var("WIRE_HOME") };
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -3024,6 +3546,7 @@ mod tests {
             "override",
             "claude-code",
             "claude-code-pidfile",
+            "pi",
             "codex-cli",
             "goose",
             "copilot-cli",

@@ -292,20 +292,22 @@ pub(super) fn cmd_send(
         .and_then(|s| s.get("peers").and_then(Value::as_object).cloned())
         .map(|peers| peers.contains_key(&peer))
         .unwrap_or(false);
-    if !peer_is_pinned && let Some(sister_name) = crate::session::resolve_local_sister(&peer) {
+    if !peer_is_pinned
+        && let Some(sister_home) = crate::session::resolve_local_sister_unique(&peer)?
+    {
         if no_auto_pair {
             bail!(
-                "wire send: `{peer}` resolves to local sister `{sister_name}` but is not pinned, \
-                 and --no-auto-pair was passed. Run `wire dial {peer}` first, \
-                 then re-run send."
+                "wire send: `{peer}` resolves to local sister session home `{sister_home}` but is \n\
+                 not pinned, and --no-auto-pair was passed. Run `wire dial {peer}` first, then \n\
+                 re-run send."
             );
         }
         eprintln!(
-            "wire send: `{peer}` not pinned yet — auto-pairing via local-sister `{sister_name}` first. \
-             Pass --no-auto-pair to refuse implicit dialing."
+            "wire send: `{peer}` not pinned yet — auto-pairing via local-sister session home \n\
+             `{sister_home}` first. Pass --no-auto-pair to refuse implicit dialing."
         );
-        super::cmd_add_local_sister(&sister_name, true).map_err(|e| {
-            anyhow!("wire send: auto-pair to local sister `{sister_name}` failed: {e:#}")
+        super::cmd_add_local_sister(&sister_home, true).map_err(|e| {
+            anyhow!("wire send: auto-pair to local sister `{sister_home}` failed: {e:#}")
         })?;
     }
 

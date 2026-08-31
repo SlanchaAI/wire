@@ -1574,6 +1574,27 @@ pub enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Move a pre-RFC-006 `sessions/<name>` home into the 1.0
+    /// `sessions/by-key/<hash>` layout. RFC-006 Part A made by-key the one
+    /// layout, so nothing reads the top-level location any more: a home left
+    /// there is invisible to every reader: `wire session list` skips it,
+    /// `wire session env <name>` errors "no session named <name> on this
+    /// machine", and `wire daemon --session <name>` cannot pin it. Creating
+    /// the name again mints a second identity for the same project. Dry-run by default — `--apply` moves the directory
+    /// (a rename; the rollback command is printed). Refuses when the by-key
+    /// home already exists or the legacy home's daemon is live.
+    Migrate {
+        /// Session name whose legacy home should move. Omit with `--all`.
+        name: Option<String>,
+        /// Migrate every legacy home under the sessions root.
+        #[arg(long)]
+        all: bool,
+        /// Actually move the directory. Without this, print the plan only.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Tear down a session: kills its daemon (if running), deletes its
     /// state directory, and removes it from the registry. Requires
     /// `--force` because state loss is unrecoverable (keypair gone).
@@ -2434,6 +2455,12 @@ fn cmd_session(cmd: SessionCommand) -> Result<()> {
         SessionCommand::Env { name, json } => session::cmd_session_env(name.as_deref(), json),
         SessionCommand::Current { json } => session::cmd_session_current(json),
         SessionCommand::Bind { name, json } => cmd_session_bind(name.as_deref(), json),
+        SessionCommand::Migrate {
+            name,
+            all,
+            apply,
+            json,
+        } => session::cmd_session_migrate(name.as_deref(), all, apply, json),
         SessionCommand::Destroy { name, force, json } => {
             session::cmd_session_destroy(&name, force, json)
         }

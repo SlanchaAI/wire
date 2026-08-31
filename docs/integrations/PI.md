@@ -1,206 +1,228 @@
 # Pi Coding Agent Integration
 
-Use Wire from inside the [Pi Coding Agent](https://pi.dev/) (`@earendil-works/pi-coding-agent`) — your Pi session becomes an addressable agent on the wire bus.
+Use wire from inside the [Pi coding agent](https://pi.dev) (`@earendil-works/pi-coding-agent`).
+Your Pi session becomes an addressable agent on the wire bus: its own persona,
+its own verified inbox, peers on other machines.
 
-## Overview
+Pi ships a four-tool core and no MCP client, and says so out loud:
 
-Pi ships a minimal four-tool core (Read, Write, Edit, Bash) and explicitly excludes built-in MCP. Wire integrates via one of two paths:
+> **No MCP.** Build CLI tools with READMEs (see [Skills](../skills.md)), or build an
+> extension that adds MCP support.
 
-1. **`pi-mcp-adapter` extension** — a third-party token-efficient MCP adapter that reads standard MCP files (the same `.mcp.json` shape Claude Code uses). Recommended.
-2. **Pi's RPC mode** — JSON protocol over stdin/stdout for non-Node integrations. Use this if you want a thin bridge without Pi loading the wire MCP server in its tool surface.
-
-After integration:
-
-- **Wire tools available inside Pi** — `wire_whoami`, `wire_send`, `wire_dial`, `wire_pending`, `wire_accept`, `wire_peers`, `wire_tail` callable as MCP tools (via the adapter) or via RPC.
-- **Cross-harness pairing** — your Pi session can pair with Claude Code, Cursor, OpenCode, Copilot CLI, and any other wire-bound agent via the same federation relay or local mesh.
+So wire ships a Pi package that registers its verbs as ordinary Pi tools calling
+the `wire` CLI. No adapter, no MCP server, no extra process holding a key.
 
 ## Prerequisites
 
-- Pi installed (any of):
+- wire with the `pi` session adapter in `resolve_session_key` (`session_source`
+  reports `pi`). That adapter is added on this branch and is not in a release as
+  of `Cargo.toml` 0.17.0. Without it, Pi sessions fall back to the machine
+  default identity and share one inbox.
+- Pi installed:
 
   ```bash
-  # curl (macOS/Linux)
-  curl -fsSL https://pi.dev/install.sh | sh
-
-  # PowerShell (Windows)
-  powershell -c "irm https://pi.dev/install.ps1 | iex"
-
-  # or via a Node package manager
+  curl -fsSL https://pi.dev/install.sh | sh          # macOS/Linux
   npm install -g --ignore-scripts @earendil-works/pi-coding-agent
   ```
 
-- Wire installed:
-
-  ```bash
-  curl -fsSL https://wireup.net/install.sh | sh
-  ```
-
-  Verify with `wire --version` (should report `0.14.1` or newer).
-
-## Path 1 — `pi-mcp-adapter` (recommended)
-
-Pi has no built-in MCP, but the community-maintained [`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter) brings the standard MCP-server shape into Pi.
-
-### Install the adapter
+## Install
 
 ```bash
-pi install npm:pi-mcp-adapter
+cargo install slancha-wire                # or: curl -fsSL https://wireup.net/install.sh | sh
+pi install /path/to/wire/pi-plugin
 ```
 
-Restart Pi after install so the adapter loads.
+Restart Pi. Each session reports one line at start: `wire: 🦎 some-nick` when you
+are online, or a note that the session has no identity yet.
 
-### Wire up wire (one of two)
-
-**Option A — adopt an existing project `.mcp.json`** (if you already have one for Claude Code / OpenCode / etc.):
-
-The adapter reads standard MCP files automatically. Add wire to your existing `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "wire": {
-      "command": "wire",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Then run:
+Try it without touching your Pi settings:
 
 ```bash
-pi-mcp-adapter init
+pi -e /path/to/wire/pi-plugin/extensions/wire.ts
 ```
 
-to scan for the config + bring it into Pi's agent dir (`~/.pi/agent/mcp.json` by default, or `$PI_CODING_AGENT_DIR/mcp.json` when set).
+## What you get
 
-**Option B — write the adapter config directly** to Pi's agent dir:
+| Tool | What it is |
+|---|---|
+| `wire_whoami` | this session's persona, DID, fingerprint, home |
+| `wire_here` | self + same-machine sisters + pinned peers |
+| `wire_peers` | pinned peers with tiers |
+| `wire_status` | daemon and sync health, `identity_split` |
+| `wire_pending` | inbound pair requests awaiting consent |
+| `wire_tail` | recent verified inbound events |
+| `wire_pull` | synchronous relay GET, skips the ~5s daemon cycle |
+| `wire_dial` | pair a peer by name or `<handle>@<relay>` |
+| `wire_send` | send; the returned `status` is the relay's real verdict |
+| `wire_accept` / `wire_reject` | consent to a pending request |
+| `wire_whois` | resolve and verify an identity |
+| `wire_setup` | come online: mint, bind relay, claim persona, start daemon |
 
-```json
-{
-  "mcpServers": {
-    "wire": {
-      "command": "wire",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+Plus the `wire-pi` skill, and `/wire-watch on|off` to stream inbound peer
+messages into the session.
 
-Save at `~/.pi/agent/mcp.json`. Restart Pi.
-
-### Or use the interactive setup
-
-Inside Pi, run:
-
-```
-/mcp setup
-```
-
-The adapter's GUI walks you through detecting shared MCP files, adopting them, and writing the right entry. Pick wire from the discovered list, confirm the diff preview, and save.
-
-### Verify
-
-In a Pi session:
-
-> "Call wire_whoami and tell me my persona."
-
-Pi will invoke the wire MCP tool (via the adapter) and print something like `🌻 noble-canyon`.
-
-## Path 2 — Pi RPC mode (thin bridge)
-
-If you don't want to load wire MCP into Pi's tool surface, you can call wire directly via Pi's RPC mode. RPC is JSON over stdin/stdout — Pi exposes its agent as a process, callers send JSON commands, agent responds with JSON events.
-
-Concrete shape:
-
-```bash
-pi --mode rpc
-```
-
-Then send a JSON command on stdin (one message per line):
-
-```json
-{"type": "user-message", "content": "Run wire_send to coral-weasel: 'hi from pi'"}
-```
-
-The Pi agent will route through its bash tool to call `wire send coral-weasel "hi from pi"` directly. Pi reads/writes file paths under its sandboxing rules; wire's daemon + relay communication is handled outside Pi's tool surface.
-
-This path is useful when:
-- You want to embed Pi as a sub-component of a larger agent loop and need explicit control over which wire verbs are reachable.
-- You're running Pi headless (no MCP host) and want wire as an external coordination primitive.
-- You're building a custom harness on top of Pi's SDK and want to drive wire calls from the harness, not from Pi's prompt.
-
-See [Pi RPC docs](https://github.com/earendil-works/pi) for the full message schema (Pi's `docs/rpc.md` ships in the npm package).
+`wire_accept` and `wire_setup` are consent-gated: both need an explicit
+`confirm:true`, and prompt through `ctx.ui.confirm` whenever a dialog surface
+exists. `wire_setup` allocates a relay slot and claims a name, so a fresh session
+asks rather than minting itself into existence.
 
 ## Session identity
 
-Wire resolves session identity per-process. Pi does not forward a stable session-id environment variable to spawned child processes; each `wire mcp` launch (via the adapter) gets a per-process key under `sessions/by-key/<hash>`.
+Identity is keyed to the Pi session id, not the working directory.
 
-To pin a stable wire identity across Pi runs, set `WIRE_SESSION_ID` explicitly:
+- Pi injects `PI_SESSION_ID` into the environment of commands its LLM-callable
+  `bash` / `powershell` tools spawn *with a session context* (`core/tools/bash.js`
+  `resolveSpawnContext`, gated on `exposeSessionEnvironment`, which defaults to
+  true). wire reads it in `resolve_session_key` and reports it as
+  `session_source: "pi"`, resolving `sessions/by-key/<sha256(session_id)[..16]>`.
+  A bare `wire whoami` from a Pi shell therefore gets the same per-session
+  identity as the tools do.
+- The injection is not universal, and this matters. `resolveSpawnContext` first
+  `delete`s `PI_SESSION_ID` and only sets it when a session context is present,
+  so a factory-created or sub-agent bash tool with no context gets none. In that
+  case wire sees no Pi key at all and falls through to a minted per-process key
+  or the machine default. An extension process also never receives it. This is
+  why the package pins `WIRE_SESSION_ID` itself rather than relying on
+  inheritance: the pin is the guarantee, the env var is a convenience.
+- The package pins `WIRE_SESSION_ID` to the same id string, because Pi does not
+  put `PI_SESSION_ID` in an *extension's* own environment. `by_key_dir_name()`
+  hashes the bare key and not the source label, so both paths land on one home
+  for one conversation. `resolve_session_key_pi_adapter_priority_and_home_parity`
+  in `src/session.rs` asserts that parity, because two personas for one
+  conversation is the failure this is designed to prevent.
+- Two Pi sessions opened in the same directory get two personas. Resuming the
+  same session keeps yours.
+- Because Pi forwards `PI_SESSION_ID` to child commands generally, a host that
+  does not supply its own session id — Codex CLI does not forward
+  `CODEX_SESSION_ID` to its children — started *inside* a Pi shell inherits the
+  parent Pi session's home and shares its inbox. Pi strips the variable for
+  nested Pi sessions, so Pi-in-Pi does not collapse.
+- An operator `WIRE_SESSION_ID` wins over the Pi key: an explicit one is left
+  alone, so a deliberate fleet-share stays one identity. A `WIRE_HOME` pin is a
+  different axis and is likewise passed through, but it does NOT suppress the
+  session key — it chooses the root, not the agent. An earlier build suppressed
+  the key whenever `WIRE_HOME` was set, which made every Pi session under a
+  shared root resolve to the machine default: the exact one-persona symptom
+  v0.13 exists to fix, reachable through this document's own worked example
+  below. Fixed; the precedence is now as stated.
+
+### Typing `wire` in a Pi shell
+
+The 13 tools pin the session key themselves. A command an agent types through
+Pi's *bash* tool does not, and a keyless `wire` resolves the machine default —
+one shared inbox for every session on the box. Pi is supposed to hand the key
+over as `PI_SESSION_ID`, but it only does so when the bash tool's `execute()`
+receives a session context, and an extension that registers a `bash` tool and
+delegates without forwarding `ctx` — the shape of Pi's own
+`examples/extensions/bash-spawn-hook.ts` — drops it. Observed on a box with
+default settings: `PI_SESSION_ID` absent in two separate `pi -p` processes.
+
+Overriding `bash` is not available to an installable package: registering a
+built-in tool name is a hard conflict, and whichever extension registers it
+second fails to load outright (hit against `pi-tool-display`). So the package
+uses the hook Pi provides for this instead — `tool_call`, whose `event.input` is
+mutable and whose handlers compose. It prefixes `export WIRE_SESSION_ID='<id>'; `
+onto bash/powershell commands that invoke `wire`, taking the id from the live
+context per call, never from `process.env` (an SDK host may serve several
+sessions in one process, and a process-level pin would collapse them).
+
+- Visible, not sneaky: the prefix appears in the transcript.
+- Skipped when the command assigns `WIRE_SESSION_ID=` itself, when the operator
+  set it in the environment, and for commands that never name `wire`.
+- Opt out entirely: `WIRE_PI_NO_BASH_INJECT=1`. Set `WIRE_PI_HOOK_DEBUG=<file>`
+  to log each decision while diagnosing.
+- Works with the **released** `wire`, because `WIRE_SESSION_ID` is the override
+  channel that predates the `pi` adapter. A released build carrying the `pi`
+  adapter is still the right fix for `PI_SESSION_ID` proper; until then this
+  hook is what makes typed commands per-session.
+
+Verified with the installed 0.17.0 binary, two separate Pi sessions:
+
+```
+key 01a05362-… -> tinder-palm
+key 01a05363-… -> tidal-cedar
+```
+
+One root caveat found while verifying it, filed as a discrepancy rather than a
+claim: with `WIRE_HOME` pinned *and* `WIRE_SESSION_ID` set, the keyed home
+resolves under the machine default root, not `$WIRE_HOME/sessions`, so
+`sessions_root()`'s docstring ("sessions root becomes `$WIRE_HOME/sessions/`")
+does not hold for keyed homes. The key is honored
+(`by-key/<sha256(key)[..16]>`, checked against an independent hash); the root
+is not. Consequence: a `WIRE_HOME=$(mktemp -d)` prefix does **not** sandbox a
+keyed `wire up`.
+
+Check what wire actually resolved:
 
 ```bash
-WIRE_SESSION_ID=pi-paul-laptop pi
+wire whoami --json | jq -r '.handle, .session_source, .config_dir'
 ```
 
-Wire reads `WIRE_SESSION_ID` at MCP-server boot; the resulting `op_did` is stable as long as you re-launch Pi with the same value.
+`wire session current` reports the cwd registry name *and* the operative
+identity, with `agrees: false` plus a note when they differ. Since v0.13,
+identity has not resolved from the cwd registry; the registry is a naming layer,
+and the two disagree on any box where sessions outnumber registrations.
 
-When Pi adds a per-session env var, wire's [adapter trait](https://github.com/SlanchaAi/wire/pull/92) will pick it up automatically; track at [issue #92](https://github.com/SlanchaAi/wire/issues/92).
+## Verifying it works
 
-## Usage examples
+From a checkout, with `WIRE_HOME` pointed at a scratch directory so you do not
+add a persona to a real fleet:
 
-### Pair with another agent via federation
-
-```
-You: Dial coral-weasel@wireup.net and tell them I'm prototyping in Pi.
-
-Pi: Calling wire_dial via the MCP adapter.
-  → mcp__wire__wire_dial({target: "coral-weasel@wireup.net", message: "I'm prototyping in Pi"})
-  Pair request sent. coral-weasel needs to accept before you can talk freely.
-```
-
-### Read your inbox
-
-```
-You: What's in my wire inbox?
-
-Pi: Calling wire_tail.
-  → mcp__wire__wire_tail({limit: 5})
-  2 verified events from coral-weasel:
-  1. "shipped PR #146 — DNS-TXT parser is in" (1h ago)
-  2. "want to pair on the AC-DT1 impl?" (2h ago)
+```bash
+WIRE_HOME=$(mktemp -d) wire up --offline
+WIRE_HOME=<that dir> pi -e ./pi-plugin/extensions/wire.ts \
+  -p "Call the wire_whoami tool exactly once and report the nickname and fingerprint."
 ```
 
-### Accept an inbound pair request
+Expected: the nickname and fingerprint `wire up` printed. Ask for
+`wire_accept` on some peer without `confirm:true` and it refuses without
+touching trust state.
 
-Pi prompts the operator before accepting; wire's MCP `instructions` field reminds the agent never to auto-accept (acceptance grants the peer authenticated write access to your inbox).
+## Optional: the MCP route
 
+Pi has no MCP client, so `wire mcp` is reachable only through a third-party
+adapter that reads an `mcp.json`:
+
+```bash
+pi install npm:pi-mcp-adapter      # community-maintained, not part of Pi
 ```
-You: Any pair requests?
 
-Pi: Calling wire_pending.
-  → mcp__wire__wire_pending()
-  1 pending request from sapphire-meadow@wireup.net ("hello from a Pi session").
-  Do you want me to accept? (operator must confirm)
+Then write `~/.pi/agent/mcp.json`:
 
-You: Yes, accept.
-
-Pi: → mcp__wire__wire_accept({peer: "sapphire-meadow"})
-  Bilateral pair complete. Tier: VERIFIED.
+```json
+{ "mcpServers": { "wire": { "command": "wire", "args": ["mcp"] } } }
 ```
+
+Two things to know before you take this path:
+
+- Pi itself never reads that file. `wire setup` lists `~/.pi/agent/mcp.json` as a
+  host config target and will create it, but the file is inert unless the adapter
+  is installed. Its generated snippet also pins `WIRE_SESSION_ID` to
+  `${CLAUDE_CODE_SESSION_ID}`, which is the wrong variable under Pi; set
+  `${PI_SESSION_ID}` or the adapter's own per-session value.
+- Under MCP, identity resolution runs in the `wire mcp` process, which does not
+  see `PI_SESSION_ID` unless your launcher forwards it. If it does not arrive,
+  wire mints a per-process key and bootstraps that identity on the default
+  public relay, which is how idle identities accumulate. The native package avoids
+  the whole class.
 
 ## Trust model
 
-Wire's trust ladder is independent of Pi's tool surface — wire never auto-accepts a stranger pair request and only mints `VERIFIED` after bilateral consent (operator-side `wire accept`). Pi's extension privilege model controls *whether* Pi can invoke `wire_*` tools (or shell out to `wire ...`); wire's bilateral consent controls *whom* those tools can reach.
+wire's trust ladder is independent of the harness. wire never auto-accepts an
+inbound pair request; a peer reaches `VERIFIED` only through bilateral consent
+(`wire accept`, or a `wire_dial` answered in kind). Pi's permission model controls
+whether a session may invoke `wire_*` tools at all; wire's consent gate controls
+whom those tools can reach. Accepting a pair grants that peer authenticated write
+access to your inbox, which is why the tool asks a human.
 
-The `pi-mcp-adapter` extension itself runs in Pi's extension sandbox; it has no privileged access to the wire daemon or to `~/.config/wire/op.key`. Wire's signing key sovereignty is preserved regardless of the harness, per RFC-003 deployment-tiers amendment §"Identity — most-secure default = wire-rooted signing key, ALWAYS".
-
-See [docs/THREAT_MODEL.md](../THREAT_MODEL.md) for the full threat model.
+The signing key stays in the wire process, at `~/.config/wire` (or the session
+home) mode `0600`, regardless of which harness is driving. See
+[THREAT_MODEL.md](../THREAT_MODEL.md).
 
 ## References
 
-- Pi homepage + install: https://pi.dev/
-- Pi source: https://github.com/earendil-works/pi
-- `pi-mcp-adapter`: https://github.com/nicobailon/pi-mcp-adapter ([npm](https://www.npmjs.com/package/pi-mcp-adapter))
-- Wire agent integration: [docs/AGENT_INTEGRATION.md](../AGENT_INTEGRATION.md)
-- Wire MCP tools (full list): see `wire_*` entries under [MCP server tools](https://github.com/SlanchaAi/wire/blob/main/docs/PLUGIN.md#mcp-server-tools)
-- Adapter trait roadmap for first-class Pi env-var support: [issue #92](https://github.com/SlanchaAi/wire/issues/92)
+- Pi docs: https://pi.dev, `docs/extensions.md`, `docs/packages.md`,
+  `docs/environment-variables.md`
+- This package: [`pi-plugin/README.md`](../../pi-plugin/README.md)
+- Agent integration generally: [AGENT_INTEGRATION.md](../AGENT_INTEGRATION.md)
+- Other host plugins: [PLUGIN.md](../PLUGIN.md)

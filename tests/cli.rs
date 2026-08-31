@@ -1949,3 +1949,233 @@ fn tail_multi_peer_sorts_by_timestamp() {
         "expected 3 newest across peers (interleaved by timestamp)"
     );
 }
+
+#[test]
+fn session_current_reports_operative_identity_alongside_the_registry_name() {
+    // `wire session current` used to print only the cwd registry's name, which
+    // since v0.13 is not the identity that signs: resolution comes from a
+    // session-id key or the machine default and never from the registry. The
+    // two disagreeing silently is how an operator ends up sending as a persona
+    // they believe they are not. The registry answer is still reported (scripts
+    // parse it) and the operative identity is reported beside it.
+    let home = fresh_home();
+    let up = run(&home, &["up", "--offline"]);
+    assert!(
+        up.status.success(),
+        "offline up must succeed: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+
+    let out = Command::new(wire_bin())
+        .args(["session", "current", "--json"])
+        .current_dir(&home)
+        .env("WIRE_HOME", &home)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("spawn wire session current --json");
+    assert!(out.status.success());
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("session current --json must emit JSON");
+    for key in [
+        "cwd",
+        "session",
+        "operative_handle",
+        "session_source",
+        "config_dir",
+        "wire_home",
+        "agrees",
+        "note",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "`session current --json` must expose `{key}`; got {v}"
+        );
+    }
+    // Fresh home: nothing registered for this cwd, so there is no claim to
+    // compare against. `agrees` is null (not true) because agreement was never
+    // verified. The operative identity is still named.
+    assert!(
+        v["session"].is_null(),
+        "no registry entry expected; got {v}"
+    );
+    assert!(
+        v["agrees"].is_null(),
+        "agrees must be null when there is nothing to compare; got {v}"
+    );
+    assert!(
+        v["operative_handle"].is_string(),
+        "operative_handle must name the signing persona; got {v}"
+    );
+    // This harness forces the legacy home shape, so the source is the
+    // WIRE_HOME_FORCE label; a plain WIRE_HOME pin reports `env:WIRE_HOME`. Both
+    // are the deliberate-fleet-share pins, and neither is a cwd-derived source.
+    assert!(
+        ["env:WIRE_HOME", "env:WIRE_HOME_FORCE"]
+            .contains(&v["session_source"].as_str().unwrap_or("")),
+        "session_source must name the explicit home pin; got {v}"
+    );
+
+    // The historical stdout contract is untouched: first line is the registry
+    // name, or the same sentinel. The honesty went to stderr so nothing parsing
+    // stdout breaks.
+    let text = Command::new(wire_bin())
+        .args(["session", "current"])
+        .current_dir(&home)
+        .env("WIRE_HOME", &home)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("spawn wire session current");
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "(no session registered for this cwd)\n",
+        "stdout must keep its historical single-line answer"
+    );
+    let err = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        err.contains("does not select identity") && err.contains("session_source="),
+        "stderr must state that the registry does not drive identity: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// RFC-006 Part A made `sessions/by-key/<hash>` the only layout readers look
+/// at, so a home still sitting at `sessions/<name>` is unreachable: `session
+/// list` skips it and creating the name again mints a second identity for the
+/// same project. `wire session migrate` moves it back into reach. Dry-run by
+/// default, and the identity must survive the move.
+#[test]
+fn session_migrate_moves_a_legacy_named_home_into_the_by_key_layout() {
+    let home = fresh_home();
+    let legacy = home.join("sessions").join("legacy-api");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let init = Command::new(wire_bin())
+        .args(["init", "--offline"])
+        .env("WIRE_HOME", &legacy)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("init legacy home");
+    assert!(
+        init.status.success(),
+        "legacy home init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let before: serde_json::Value = serde_json::from_slice(
+        &Command::new(wire_bin())
+            .args(["whoami", "--json"])
+            .env("WIRE_HOME", &legacy)
+            .env("WIRE_HOME_FORCE", "1")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let handle = before["handle"].as_str().unwrap().to_string();
+
+    // Invisible to the reader before the move.
+    let list = run(&home, &["session", "list", "--json"]);
+    assert!(list.status.success());
+    let listed = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(
+        !listed.contains(&handle),
+        "a legacy top-level home must not be listed before migration; got {listed}"
+    );
+
+    // Dry run: names the move, touches nothing.
+    let dry = run(&home, &["session", "migrate", "legacy-api", "--json"]);
+    assert!(dry.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["migrated"], 0);
+    assert!(legacy.is_dir(), "dry run must not move the home");
+    let target = PathBuf::from(plan["rows"][0]["to"].as_str().unwrap());
+    assert!(target.starts_with(home.join("sessions").join("by-key")));
+    assert!(!target.exists(), "dry run must not create the target");
+
+    // Apply: the move lands and the identity is the same one.
+    let apply = run(
+        &home,
+        &["session", "migrate", "legacy-api", "--apply", "--json"],
+    );
+    assert!(apply.status.success());
+    let done: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(done["migrated"], 1, "apply must move one home: {done}");
+    assert!(!legacy.exists(), "source must be gone after the move");
+    let after: serde_json::Value = serde_json::from_slice(
+        &Command::new(wire_bin())
+            .args(["whoami", "--json"])
+            .env("WIRE_HOME", &target)
+            .env("WIRE_HOME_FORCE", "1")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        after["handle"].as_str().unwrap(),
+        handle,
+        "the move must carry the same keypair, not mint a new one"
+    );
+
+    // Reachable afterwards, and a second run changes nothing.
+    let list = run(&home, &["session", "list", "--json"]);
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains(&handle),
+        "the migrated home must appear in `session list`"
+    );
+    let again = run(&home, &["session", "migrate", "legacy-api"]);
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("already in the by-key layout"),
+        "re-running must be a no-op: {}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two homes for one name are two identities. Merging them would quietly keep
+/// one keypair and orphan the other's pairings, so the move is refused and both
+/// directories are left exactly where they were.
+#[test]
+fn session_migrate_refuses_to_merge_two_homes() {
+    let home = fresh_home();
+    let legacy = home.join("sessions").join("clash-api");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let init = Command::new(wire_bin())
+        .args(["init", "--offline"])
+        .env("WIRE_HOME", &legacy)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("init legacy home");
+    assert!(init.status.success());
+
+    let plan: serde_json::Value =
+        serde_json::from_slice(&run(&home, &["session", "migrate", "clash-api", "--json"]).stdout)
+            .unwrap();
+    let target = PathBuf::from(plan["rows"][0]["to"].as_str().unwrap());
+    std::fs::create_dir_all(&target).unwrap();
+    let rival = Command::new(wire_bin())
+        .args(["init", "--offline"])
+        .env("WIRE_HOME", &target)
+        .env("WIRE_HOME_FORCE", "1")
+        .output()
+        .expect("init rival by-key home");
+    assert!(rival.status.success());
+
+    let apply = run(
+        &home,
+        &["session", "migrate", "clash-api", "--apply", "--json"],
+    );
+    assert!(apply.status.success());
+    let done: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(done["migrated"], 0, "collision must not move: {done}");
+    assert!(
+        done["rows"][0]["action"]
+            .as_str()
+            .unwrap()
+            .contains("will not merge two homes"),
+        "refusal must explain itself: {done}"
+    );
+    assert!(legacy.is_dir(), "refusal must leave the source in place");
+    let _ = std::fs::remove_dir_all(&home);
+}

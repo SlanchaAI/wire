@@ -136,6 +136,7 @@ The project-local `.mcp.json` pattern is the recommended Claude Code setup: each
 ```bash
 $ wire session list           # enumerate all sessions on this box
 $ wire session current        # which session does this cwd map to?
+$ wire session migrate <name>  # move a pre-RFC-006 sessions/<name> home into by-key/ (dry run; --apply moves)
 $ wire session destroy <name> --force   # remove (irrecoverable)
 ```
 
