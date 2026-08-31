@@ -60,7 +60,7 @@ fn build_event(kind: u32, body: Value, handle: &str, fingerprint_hex: &str) -> V
     json!({
         "timestamp": "2026-05-31T00:00:00Z",
         "from": format!("did:wire:{handle}-{fingerprint_hex}"),
-        "to":   format!("did:wire:peer-deadbeef"),
+        "to":   "did:wire:peer-deadbeef",
         "type": "heartbeat",
         "kind": kind,
         "body": body,

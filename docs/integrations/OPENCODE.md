@@ -71,17 +71,39 @@ Re-edit the file at that path, restart OpenCode, and re-run `opencode mcp list`.
 
 ## Session identity
 
-Wire resolves session identity per-process. Today OpenCode does not forward a stable session-id environment variable to the spawned MCP server, so each `wire mcp` launch gets a per-process key under `sessions/by-key/<hash>`.
+OpenCode forwards **no session-id env var** to spawned MCP servers — the spawned process only gets `OPENCODE=1` and `OPENCODE_PID` (measured on 1.18.25 by dumping the MCP child's environment). Without help, `wire mcp` either reuses one static key across every session or mints a throwaway identity on every MCP boot.
 
-To pin a stable wire identity across OpenCode runs (recommended for any session you want peers to find again), set `WIRE_SESSION_ID` explicitly before launching OpenCode:
+The shipped plugin closes the gap without waiting on OpenCode:
+
+```bash
+cp opencode-plugin/wire-session.js ~/.config/opencode/plugin/
+# opencode auto-loads every *.js in that directory; restart your session after copying.
+```
+
+**How it works:** OpenCode fires `session.created` ~0.5s *before* it boots local MCP servers (measured: created 16:03:39.600Z → `wire mcp` exec 16:03:40.101Z). The plugin's event hook catches that event and stamps `WIRE_SESSION_ID=opencode-<sessionID>` into the wire MCP env before `wire mcp` ever starts — so every OpenCode session gets its own `sessions/by-key/<hash>` home, and resuming the same session (`opencode -c` or `-s <id>`) resolves the same key, hence the same persona, from birth through every resume.
+
+**Key resolution priority:**
+
+1. `WIRE_SESSION_ID` exported in the launching terminal (pinned persona — the plugin stands down)
+2. First top-level `session.created` / `session.updated` event → `opencode-<sessionID>`
+3. `-s <id>` argv, or `-c` resolved against `~/.local/share/opencode/opencode.db` (read-only, newest top-level session for the cwd; `--fork` skips this and gets a fresh key)
+4. Fresh UUID per process — a *new* persona, never a foreign session's identity
+
+**Verified on 1.18.25** (`opencode run` probing `wire_wire_whoami`): fresh run → `lunar-chinook`, `-s <that session>` resume → `lunar-chinook`; fresh → `placid-twilight`, `-c` twice → `placid-twilight` ×3; next fresh run → `ferny-kestrel`. Exported `WIRE_SESSION_ID=opencode-lauro-mac` → `kindly-kelp` on every launch.
+
+Caveats:
+
+- If the `session.created` event ever loses the boot race, the fallback key applies (new persona, not a wrong one).
+- A shared server (`opencode run --attach`) hosts many sessions in one process; the wire identity binds to its first top-level session.
+- `--fork` intentionally mints a fresh identity: a fork is a new conversation.
+
+To pin one stable persona across OpenCode runs instead (a long-lived addressable agent peers should keep finding), skip the priority chain by exporting the key:
 
 ```bash
 WIRE_SESSION_ID=opencode-paul-laptop opencode
 ```
 
-Wire reads `WIRE_SESSION_ID` at MCP-server boot; the resulting `op_did` is stable as long as you re-launch OpenCode with the same value. Pick a value unique per OpenCode session you want to keep reachable.
-
-When OpenCode adds a documented per-session env var (à la `CLAUDE_CODE_SESSION_ID` / `COPILOT_AGENT_SESSION_ID`), wire's [adapter trait](https://github.com/SlanchaAi/wire/pull/92) will pick it up automatically; track the discussion at [issue #92](https://github.com/SlanchaAi/wire/issues/92).
+If OpenCode ever ships a documented per-session env var (à la `CLAUDE_CODE_SESSION_ID` / `COPILOT_AGENT_SESSION_ID`), wire's [adapter trait](https://github.com/SlanchaAi/wire/pull/92) will pick it up automatically and this plugin becomes belt-and-braces; track [issue #92](https://github.com/SlanchaAi/wire/issues/92).
 
 ## Usage examples
 

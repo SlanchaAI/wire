@@ -695,7 +695,7 @@ mod tests {
         let existing_line = json!({
             "event_id": "different",
             "from": "did:wire:peer",
-            "body": format!("the user mentioned event_id deadbeefcafebabe in passing"),
+            "body": "the user mentioned event_id deadbeefcafebabe in passing",
         });
         let path = tmp.join("peer.jsonl");
         std::fs::write(&path, format!("{existing_line}\n")).unwrap();
