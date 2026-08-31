@@ -10,6 +10,10 @@ the PR description linked in each section.
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode gets per-session wire identities via a shipped plugin** (#92 follow-on): OpenCode forwards no session-id env var to spawned MCP servers — measured on 1.18.25, the MCP child sees only `OPENCODE`/`OPENCODE_PID` — so every `wire mcp` boot either reused one static key across all sessions or minted a throwaway identity per launch (one box measured 8,861 by-key homes). The gap cannot be closed from wire's side, because the key must exist before `wire mcp` execs. But OpenCode fires `session.created` ~0.5s *before* booting local MCP servers (measured 16:03:39.600Z → 16:03:40.101Z), and its plugin system runs in-process with a `config` hook that can still mutate the MCP env in that window. Ships **`opencode-plugin/wire-session.js`**: drop it in `~/.config/opencode/plugin/` and each OpenCode session resolves `WIRE_SESSION_ID=opencode-<sessionID>` — so birth identity and resume identity are the same key (`-c`/`-s` included), and no two sessions share one inbox. Resolution priority: exported `WIRE_SESSION_ID` (pinned persona wins) → first top-level `session.created`/`session.updated` event → `-s <id>` argv or `-c` resolved read-only against `opencode.db` (newest top-level session for the cwd; `--fork` gets a fresh key) → fresh UUID, which yields a new persona rather than ever a foreign one. Live-verified with `opencode run` + `wire_wire_whoami`: fresh→`-s` resume kept one persona; fresh→`-c`×2 kept one persona; consecutive fresh runs differed; exported `WIRE_SESSION_ID` overrode all of it. A lost event race falls back to the UUID path — a new persona, never a wrong one. `docs/integrations/OPENCODE.md` rewritten against what was measured.
+
 ## [v0.17.0] — 2026-07-10
 
 ### Fixed
