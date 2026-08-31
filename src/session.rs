@@ -1034,7 +1034,17 @@ pub fn detect_session_wire_home(cwd: &std::path::Path) -> Option<PathBuf> {
 ///      forward this older name.
 ///   5. `CODEX_THREAD_ID` — current OpenAI Codex runtime adapter. Stable
 ///      per thread and inherited by tool subprocesses.
-///   6. `AGENT_SESSION_ID` — Goose adapter, accepted only when `AGENT=goose`.
+///   6. `AGENT_SESSION_ID` — Goose adapter (the goose agent CLI /
+///      block-goose harness). Stable per Goose session (the
+///      `20260830_3`-shaped id in `~/.local/share/goose/sessions/
+///      sessions.db`); distinct Goose sessions in the SAME cwd
+///      therefore get distinct personas. Dual gate, live-probed goose
+///      1.45: the `AGENT=goose` marker honors the harness id as-is,
+///      but the marker only reaches shells via `goose term init` —
+///      MCP children get `AGENT_SESSION_ID` alone. So a goose-shaped
+///      id (`^\d{8}_\d+$`) is also accepted marker-less; any other
+///      shape without the marker is rejected so a foreign host's
+///      unrelated `AGENT_SESSION_ID` cannot launder a goose persona.
 ///   7. `COPILOT_AGENT_SESSION_ID` — GitHub Copilot CLI (`gh copilot` /
 ///      `copilot`) adapter. Set by the Copilot CLI host for every
 ///      session; stable per conversation; UUID-shaped.
@@ -1058,9 +1068,18 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
             return Some((v.trim().to_string(), source));
         }
     }
-    if std::env::var("AGENT").ok().as_deref() == Some("goose")
-        && let Ok(value) = std::env::var("AGENT_SESSION_ID")
+    // Goose adapter: `AGENT_SESSION_ID` is a GENERIC name other hosts could
+    // repurpose, so accept it only when it is goose's own marker or the id is
+    // goose-shaped. Live-probed goose 1.45: the harness forwards
+    // AGENT_SESSION_ID (= `260101_5`-style `sessions.db` id) to MCP children
+    // and bash tools, but sets the AGENT marker only via `goose term init`
+    // shell integration — requiring BOTH would leave the MCP per-process
+    // minted, orphaning the persona across resumes. The `^\d{8}_\d+$` shape
+    // check is the discriminator when the marker is absent (8-digit date +
+    // session counter; no other known host ships a matching var).
+    if let Ok(value) = std::env::var("AGENT_SESSION_ID")
         && valid_session_key(&value)
+        && (std::env::var("AGENT").ok().as_deref() == Some("goose") || is_goose_session_id(&value))
     {
         return Some((value.trim().to_string(), "goose"));
     }
@@ -1098,6 +1117,27 @@ pub fn resolve_session_key() -> Option<(String, &'static str)> {
 fn valid_session_key(v: &str) -> bool {
     let v = v.trim();
     !v.is_empty() && !v.contains("${")
+}
+
+/// Goose session-id shape: `YYYYMMDD_N` (e.g. `20260830_3`), the `sessions.db`
+/// id goose forwards as `AGENT_SESSION_ID` to MCP children and bash tools.
+/// When the harness's `AGENT=goose` marker is absent (MCP children never see
+/// it — live-probed goose 1.45), this shape is the discriminator that lets the
+/// goose adapter fire without letting a foreign host's unrelated
+/// `AGENT_SESSION_ID` claim a goose-labeled persona.
+fn is_goose_session_id(v: &str) -> bool {
+    let t = v.trim();
+    let b = t.as_bytes();
+    // 8-digit date component. The counter after `_` is 1+ digits of any
+    // width — goose reuses the id across the day, so we accept `_2` and
+    // `_100000` alike. A bare `^\d{8}_\d+$` is what the db guarantees.
+    if b.len() < 10 {
+        return false;
+    }
+    if !b[..8].iter().all(u8::is_ascii_digit) || b[8] != b'_' {
+        return false;
+    }
+    b[9..].iter().all(u8::is_ascii_digit)
 }
 
 /// A session-identity SPLIT: this process's OPERATIONAL identity (the home it is
@@ -2187,6 +2227,126 @@ mod tests {
     }
 
     #[test]
+    fn resolve_session_key_goose_adapter_marker_and_shape() {
+        // Goose adapter, dual gate (live-probed goose 1.45.0):
+        //
+        //   (a) AGENT=goose + AGENT_SESSION_ID → goose key wins; distinct ids
+        //       map to distinct homes (per-session persona contract).
+        //   (b) MCP children: goose forwards AGENT_SESSION_ID but NOT the
+        //       AGENT marker. A goose-shaped id (`YYYYMMDD_N`) is accepted
+        //       marker-less; a foreign-shaped id is rejected (no hostile
+        //       AGENT_SESSION_ID laundering into a goose persona).
+        //   (c) Shape-only acceptance still loses to WIRE_SESSION_ID.
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let prev_override = std::env::var_os("WIRE_SESSION_ID");
+        let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_codex = std::env::var_os("CODEX_SESSION_ID");
+        let prev_agent = std::env::var_os("AGENT");
+        let prev_agent_session = std::env::var_os("AGENT_SESSION_ID");
+        let prev_copilot = std::env::var_os("COPILOT_AGENT_SESSION_ID");
+        let prev_vscode = std::env::var_os("VSCODE_GIT_REPOSITORY_ROOT");
+        let prev_pi = std::env::var_os("PI_SESSION_ID");
+        // SAFETY: ENV_LOCK is held, serializing all env access.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
+        }
+
+        // (a) Marker path.
+        unsafe { std::env::set_var("AGENT", "goose") };
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "20260830_3") };
+        let r1 = resolve_session_key();
+        assert!(
+            matches!(&r1, Some((k, src)) if k == "20260830_3" && *src == "goose"),
+            "AGENT=goose + AGENT_SESSION_ID must resolve labeled goose; got {r1:?}"
+        );
+        let home_a = session_home_for_key("20260830_3").unwrap();
+
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "20260830_4") };
+        let home_b = session_home_for_key(resolve_session_key().unwrap().0.trim()).unwrap();
+        assert_ne!(
+            home_a, home_b,
+            "distinct goose session ids must map to distinct session homes"
+        );
+
+        // (b) Marker-less goose-shaped id (the MCP-child reality).
+        unsafe { std::env::remove_var("AGENT") };
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "20260901_12") };
+        let r2 = resolve_session_key();
+        assert!(
+            matches!(&r2, Some((k, src)) if k == "20260901_12" && *src == "goose"),
+            "goose-shaped AGENT_SESSION_ID without the AGENT marker must resolve goose; got {r2:?}"
+        );
+        // Foreign-shaped id WITHOUT the marker must NOT claim goose.
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "some-foreign-uuid-1234") };
+        assert!(
+            !matches!(&resolve_session_key(), Some((_, "goose"))),
+            "foreign-shaped AGENT_SESSION_ID without the AGENT marker must not resolve goose"
+        );
+        // ...but WITH the marker, any non-placeholder id is honored.
+        unsafe { std::env::set_var("AGENT", "goose") };
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "some-foreign-uuid-1234") };
+        assert!(
+            matches!(&resolve_session_key(), Some((k, "goose")) if k == "some-foreign-uuid-1234"),
+            "AGENT=goose marker must honor the harness's own id whatever its shape"
+        );
+
+        // (c) Operator override still beats the goose path.
+        unsafe { std::env::set_var("WIRE_SESSION_ID", "operator-override") };
+        let r3 = resolve_session_key();
+        assert!(
+            matches!(&r3, Some((k, src)) if k == "operator-override" && *src == "override"),
+            "WIRE_SESSION_ID must beat the goose adapter; got {r3:?}"
+        );
+
+        // Restore any env we displaced.
+        // SAFETY: ENV_LOCK still held.
+        unsafe {
+            std::env::remove_var("WIRE_SESSION_ID");
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("CODEX_SESSION_ID");
+            std::env::remove_var("AGENT");
+            std::env::remove_var("AGENT_SESSION_ID");
+            std::env::remove_var("COPILOT_AGENT_SESSION_ID");
+            std::env::remove_var("VSCODE_GIT_REPOSITORY_ROOT");
+            std::env::remove_var("PI_SESSION_ID");
+            if let Some(v) = prev_override {
+                std::env::set_var("WIRE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_claude {
+                std::env::set_var("CLAUDE_CODE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex {
+                std::env::set_var("CODEX_SESSION_ID", v);
+            }
+            if let Some(v) = prev_agent {
+                std::env::set_var("AGENT", v);
+            }
+            if let Some(v) = prev_agent_session {
+                std::env::set_var("AGENT_SESSION_ID", v);
+            }
+            if let Some(v) = prev_copilot {
+                std::env::set_var("COPILOT_AGENT_SESSION_ID", v);
+            }
+            if let Some(v) = prev_vscode {
+                std::env::set_var("VSCODE_GIT_REPOSITORY_ROOT", v);
+            }
+            if let Some(v) = prev_pi {
+                std::env::set_var("PI_SESSION_ID", v);
+            }
+        }
+    }
+
+    #[test]
     fn resolve_session_key_copilot_cli_adapter_and_priority() {
         // Per-adapter test for the GitHub Copilot CLI path (Phase 2 of #59):
         // resolve_session_key reads COPILOT_AGENT_SESSION_ID (set by the
@@ -2519,7 +2679,22 @@ mod tests {
         unsafe { std::env::remove_var("COPILOT_AGENT_SESSION_ID") };
 
         unsafe { std::env::set_var("AGENT", "another-host") };
-        assert!(!matches!(resolve_session_key(), Some((key, _)) if key == "20260810_7"));
+        // Dual gate (live-probed goose 1.45): a foreign AGENT value does NOT
+        // block a goose-shaped id — MCP children carry AGENT_SESSION_ID with
+        // no AGENT marker at all, which is the path this adapter exists for.
+        // The guard that survives is the SHAPE check: a foreign-shaped id
+        // under a foreign marker must not claim the goose persona.
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "foreign-host-uuid-99") };
+        assert!(
+            !matches!(resolve_session_key(), Some((key, "goose")) if key == "foreign-host-uuid-99"),
+            "foreign-shaped AGENT_SESSION_ID under a foreign AGENT marker must not resolve goose"
+        );
+        unsafe { std::env::set_var("AGENT_SESSION_ID", "20260810_7") };
+        assert_eq!(
+            resolve_session_key(),
+            Some(("20260810_7".into(), "goose")),
+            "goose-shaped id resolves goose even under a foreign AGENT marker (shape gate)"
+        );
 
         unsafe {
             std::env::set_var("AGENT", "goose");
