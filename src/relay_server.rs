@@ -2316,6 +2316,10 @@ async fn responder_health_set(
     (StatusCode::OK, Json(record)).into_response()
 }
 
+// `axum::response::Response` is a large type by design; boxing every error
+// return in the handler to satisfy `result_large_err` would cost more than it
+// protects.
+#[allow(clippy::result_large_err)]
 async fn check_token(
     relay: &Relay,
     headers: &HeaderMap,
