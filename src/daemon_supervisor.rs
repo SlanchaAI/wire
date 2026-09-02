@@ -120,7 +120,18 @@ fn classify_session_worker(
 /// Stop one supervisor-owned worker for a session that lifecycle planning did
 /// not select. A standalone daemon started by `wire up` may share the same
 /// pidfile and command line, so the pidfile's explicit owner is the boundary.
-fn retire_inactive_worker(session: &crate::session::SessionInfo) {
+///
+/// `owned_pids` names the workers this supervisor already holds a
+/// `Child` handle for (selected children plus orphans awaiting
+/// teardown). Those are skipped: killing one here would leave a zombie
+/// that only the orphan drain can reap, and `process_alive` reports a
+/// zombie as alive — so this function would burn its full SIGTERM +
+/// SIGKILL grace and then log a false "SURVIVED SIGKILL" on a worker
+/// that is already dead and queued for reaping.
+fn retire_inactive_worker(
+    session: &crate::session::SessionInfo,
+    owned_pids: &std::collections::HashSet<u32>,
+) {
     let pidfile = session
         .home_dir
         .join("state")
@@ -133,6 +144,10 @@ fn retire_inactive_worker(session: &crate::session::SessionInfo) {
         return;
     };
     if !record.supervisor_managed {
+        return;
+    }
+    if owned_pids.contains(&record.pid) {
+        // Ours already — the orphan drain owns its teardown.
         return;
     }
     let alive = crate::platform::process_alive(record.pid);
@@ -797,9 +812,16 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
                 orphans.push(state);
             }
         }
+        // Workers we hold a `Child` for. Their teardown belongs to the
+        // orphan drain in step 5, which can actually reap them.
+        let owned_pids: std::collections::HashSet<u32> = children
+            .values()
+            .chain(orphans.iter())
+            .map(|state| state.pid)
+            .collect();
         for session in &all_sessions {
             if !wanted_names.contains(&session.name) {
-                retire_inactive_worker(session);
+                retire_inactive_worker(session, &owned_pids);
             }
         }
 
@@ -1426,7 +1448,7 @@ mod tests {
         let mut session = initialized_session("operator-started", false);
         session.home_dir = tmp.path().to_path_buf();
 
-        retire_inactive_worker(&session);
+        retire_inactive_worker(&session, &std::collections::HashSet::new());
         std::thread::sleep(Duration::from_millis(100));
         let alive = crate::platform::process_alive(pid);
         let _ = crate::platform::kill_process(pid, false);
@@ -1438,6 +1460,60 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn supervisor_skips_workers_it_already_owns() {
+        // Regression: step 3 moves an evicted child onto the orphan
+        // list, then immediately calls `retire_inactive_worker` for the
+        // same (now unselected) session. Without the owned-pid guard
+        // that call kills our own child, which we have not reaped, so
+        // it becomes a zombie — and `process_alive` reports a zombie as
+        // alive. The function would burn its full SIGTERM + SIGKILL
+        // grace and log a false "SURVIVED SIGKILL" on every eviction.
+        let tmp = tempdir().unwrap();
+        let state = tmp.path().join("state/wire");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", "wire", "daemon"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let record = crate::ensure_up::DaemonPid {
+            schema: crate::ensure_up::DAEMON_PID_SCHEMA.to_string(),
+            pid,
+            bin_path: "/opt/wire".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: "2026-08-10T00:00:00Z".to_string(),
+            did: None,
+            relay_url: None,
+            supervisor_managed: true,
+        };
+        std::fs::write(
+            state.join("daemon.pid"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut session = initialized_session("supervisor-owned", false);
+        session.home_dir = tmp.path().to_path_buf();
+
+        let owned: std::collections::HashSet<u32> = [pid].into_iter().collect();
+        let started = Instant::now();
+        retire_inactive_worker(&session, &owned);
+        let elapsed = started.elapsed();
+
+        // Left alone for the orphan drain, and returned immediately
+        // rather than burning the kill grace.
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "owned worker was killed by retire_inactive_worker"
+        );
+        assert!(
+            elapsed < TERM_GRACE,
+            "retire_inactive_worker blocked on an owned pid: {elapsed:?}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn supervisor_retires_its_own_inactive_daemon() {
         let tmp = tempdir().unwrap();
@@ -1465,7 +1541,7 @@ mod tests {
         let mut session = initialized_session("supervisor-owned", false);
         session.home_dir = tmp.path().to_path_buf();
 
-        retire_inactive_worker(&session);
+        retire_inactive_worker(&session, &std::collections::HashSet::new());
         std::thread::sleep(Duration::from_millis(100));
         let status = child.try_wait().unwrap();
         if status.is_none() {
