@@ -1934,7 +1934,7 @@ mod tests {
             CUTOFF_14D,
             far_future_days(),
             &std::collections::HashSet::new(),
-            |h| fs_has_inbox_history(h),
+            fs_has_inbox_history,
             |_| false,
         );
         assert!(reaped.is_empty());
