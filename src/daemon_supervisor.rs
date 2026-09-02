@@ -144,12 +144,87 @@ fn retire_inactive_worker(session: &crate::session::SessionInfo) {
         "supervisor: retiring unselected session worker '{}' pid={} version={version:?}",
         session.name, record.pid
     );
-    if !crate::platform::kill_process(record.pid, false) {
-        eprintln!(
-            "supervisor: failed to signal unselected session worker '{}' pid={}",
-            session.name, record.pid
-        );
+    let label = format!("unselected session worker '{}'", session.name);
+    kill_worker_verified(record.pid, &label);
+}
+
+/// How long a worker gets to honour SIGTERM before the supervisor
+/// escalates to SIGKILL.
+const TERM_GRACE: Duration = Duration::from_millis(1500);
+const TERM_POLL: Duration = Duration::from_millis(100);
+
+/// Terminate one worker and *verify* it actually died: SIGTERM, wait up
+/// to [`TERM_GRACE`] for exit, then SIGKILL and re-check. Returns true
+/// iff the pid is gone when we return.
+///
+/// ## Why verification, not fire-and-forget
+///
+/// The original code sent a single un-escalated SIGTERM per poll and
+/// discarded the result. A worker parked in a relay reconnect backoff
+/// (1s–30s sleeps against an unreachable relay) does not act on SIGTERM
+/// promptly, so every poll re-signalled a process that never died while
+/// the supervisor had already dropped it from its bookkeeping. Workers
+/// then accumulated without bound: one dev box reached 2,770 live
+/// children under a `max_workers=16` cap, 6.2 GB RSS and a load average
+/// of 994. Escalating to SIGKILL and confirming death is what makes
+/// eviction an actual guarantee instead of a request.
+/// Terminate a child this supervisor owns and **reap it**, escalating
+/// SIGTERM -> SIGKILL. Returns true iff the child has been reaped.
+///
+/// Reaping is the half that `kill_worker_verified` cannot do: a killed
+/// direct child stays in the process table as a zombie until somebody
+/// `wait`s on it, and `process_alive` (a `kill(pid, 0)` probe) reports
+/// a zombie as *alive*. Evicted workers used to be dropped without a
+/// wait, so they lingered as unreapable entries and the supervisor
+/// could never tell a survivor from a corpse.
+fn terminate_and_reap(child: &mut Child, pid: u32, label: &str) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
     }
+    crate::platform::kill_process(pid, false);
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        std::thread::sleep(TERM_POLL);
+    }
+    eprintln!("supervisor: {label} pid={pid} ignored SIGTERM after {TERM_GRACE:?}; sending SIGKILL");
+    let _ = child.kill();
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        std::thread::sleep(TERM_POLL);
+    }
+    eprintln!("supervisor: {label} pid={pid} not reaped after SIGKILL; retrying next poll");
+    false
+}
+
+fn kill_worker_verified(pid: u32, label: &str) -> bool {
+    if !crate::platform::process_alive(pid) {
+        return true;
+    }
+    crate::platform::kill_process(pid, false);
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if !crate::platform::process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(TERM_POLL);
+    }
+    eprintln!("supervisor: {label} pid={pid} ignored SIGTERM after {TERM_GRACE:?}; sending SIGKILL");
+    crate::platform::kill_process(pid, true);
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if !crate::platform::process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(TERM_POLL);
+    }
+    eprintln!("supervisor: {label} pid={pid} SURVIVED SIGKILL; leaving it for the next poll");
+    false
 }
 
 /// Newest mtime among a session home's activity files — the
@@ -397,9 +472,126 @@ where
     reaped
 }
 
+/// Default idle window before an *identity-bearing* by-key home is
+/// reaped, in days.
+const DEFAULT_IDLE_REAP_MAX_AGE_DAYS: u64 = 14;
+
+/// Parse the idle reap cutoff. `None` raw -> default; `0` -> `None`
+/// (disabled); any other integer -> that many days; unparseable ->
+/// default.
+fn parse_idle_reap_max_age(raw: Option<&str>) -> Option<Duration> {
+    match raw {
+        Some(v) => {
+            let days: u64 = v.trim().parse().unwrap_or(DEFAULT_IDLE_REAP_MAX_AGE_DAYS);
+            (days != 0).then(|| Duration::from_secs(days * 86_400))
+        }
+        None => Some(Duration::from_secs(DEFAULT_IDLE_REAP_MAX_AGE_DAYS * 86_400)),
+    }
+}
+
+/// Read the idle reap cutoff from the environment.
+/// `WIRE_IDLE_REAP_MAX_AGE_DAYS=0` disables idle reaping entirely.
+fn idle_reap_max_age_from_env() -> Option<Duration> {
+    parse_idle_reap_max_age(
+        std::env::var("WIRE_IDLE_REAP_MAX_AGE_DAYS").ok().as_deref(),
+    )
+}
+
+/// Delete long-idle by-key session homes that DO hold an identity, and
+/// return what was removed.
+///
+/// ## Why this exists alongside [`reap_husks`]
+///
+/// `reap_husks` only removes homes with no `private.key` and no sync
+/// history. That made the by-key population **monotonic** in practice:
+/// session adoption mints a home, the home gains an identity within
+/// seconds, and from that moment no reaper could ever touch it. A real
+/// box accumulated 8,983 homes (461 MB) of which *zero* matched the
+/// husk predicate, while the supervisor stat-ed all of them on every
+/// 10s registry poll.
+///
+/// The husk predicate stays as-is — this is a strictly separate, much
+/// more conservative path keyed on *idleness* rather than emptiness. A
+/// dir is reaped only if ALL of these hold:
+/// - its name has the by-key shape (16 lowercase hex chars) — named,
+///   operator-created sessions are never touched;
+/// - it is not registry-bound;
+/// - it holds no live lease and no pending outbox (nothing would be
+///   lost by removing it);
+/// - no live daemon owns it;
+/// - its last activity (or, for a never-synced home, its own mtime) is
+///   older than `max_age`. Future timestamps count as young, so clock
+///   skew never deletes.
+///
+/// Failures are per-entry best-effort (warn + continue).
+fn reap_idle_homes<A, D>(
+    by_key_root: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    bound_names: &std::collections::HashSet<String>,
+    is_active: A,
+    daemon_live: D,
+) -> Vec<PathBuf>
+where
+    A: Fn(&Path) -> bool,
+    D: Fn(&Path) -> bool,
+{
+    let mut reaped = Vec::new();
+    let Ok(entries) = std::fs::read_dir(by_key_root) else {
+        return reaped;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let is_by_key_shape =
+            name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !is_by_key_shape {
+            continue;
+        }
+        if bound_names.contains(name) {
+            continue;
+        }
+        if is_active(&path) {
+            continue;
+        }
+        if daemon_live(&path) {
+            continue;
+        }
+        // Prefer real activity; fall back to the home's own mtime so a
+        // home that never synced still ages out on this path.
+        let last = fs_last_active(&path).or_else(|| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+        });
+        let idle_long_enough = last
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= max_age);
+        if !idle_long_enough {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => reaped.push(path),
+            Err(e) => eprintln!("supervisor: idle reap failed for {}: {e:#}", path.display()),
+        }
+    }
+    reaped
+}
+
 /// State the supervisor tracks per session it has spawned a child for.
 struct ChildState {
     child: Child,
+    /// Cached at spawn: `Child::id()` is not meaningful once the child
+    /// has been reaped, and the teardown pass needs a stable key.
+    pid: u32,
+    /// Session this child serves — carried so an orphaned child can
+    /// still name itself in teardown logs.
+    name: String,
     spawned_at: Instant,
 }
 
@@ -454,9 +646,25 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
             None => "disabled".to_string(),
         }
     );
+    let idle_max_age = idle_reap_max_age_from_env();
+    eprintln!(
+        "supervisor: idle reap cutoff = {}",
+        match idle_max_age {
+            Some(d) => format!("{} days", d.as_secs() / 86_400),
+            None => "disabled".to_string(),
+        }
+    );
     let mut last_husk_reap: Option<Instant> = None;
 
     let mut children: HashMap<String, ChildState> = HashMap::new();
+    // Children the supervisor has stopped selecting but has not yet
+    // confirmed dead. `children` is *intent*; this is the outstanding
+    // *fact*. Every process we fork-exec lives in exactly one of the
+    // two until it has been killed AND reaped, which is what bounds
+    // the population — dropping a `Child` neither kills nor reaps it,
+    // so an untracked eviction used to leak a live process (2,770 of
+    // them under a max_workers=16 cap on one box).
+    let mut orphans: Vec<ChildState> = Vec::new();
     // Per-session backoff that survives a child's reap → respawn → reap
     // cycle. Distinguishes "session crashes hard repeatedly" from
     // "child exited cleanly and we're spawning a fresh one".
@@ -552,6 +760,24 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
                             .join(", ")
                     );
                 }
+                if let Some(idle_age) = idle_max_age {
+                    let idle_reaped = reap_idle_homes(
+                        &root.join("by-key"),
+                        idle_age,
+                        SystemTime::now(),
+                        &bound,
+                        |home| fs_has_live_lease(home) || fs_has_pending_outbox(home),
+                        // On a liveness-probe error assume live — never
+                        // delete a home we couldn't safely inspect.
+                        |home| existing_daemon_for_session(home).unwrap_or(true),
+                    );
+                    if !idle_reaped.is_empty() {
+                        eprintln!(
+                            "supervisor: reaped {} idle session home(s)",
+                            idle_reaped.len()
+                        );
+                    }
+                }
             }
         }
 
@@ -566,10 +792,9 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
             .cloned()
             .collect();
         for name in to_kill {
-            if let Some(mut state) = children.remove(&name) {
+            if let Some(state) = children.remove(&name) {
                 eprintln!("supervisor: session '{name}' gone from registry; terminating its child");
-                let _ = state.child.kill();
-                let _ = state.child.wait();
+                orphans.push(state);
             }
         }
         for session in &all_sessions {
@@ -606,15 +831,17 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
             }
             match spawn_child_for_session(&info.name, &info.home_dir, interval_secs) {
                 Ok(child) => {
+                    let pid = child.id();
                     eprintln!(
-                        "supervisor: spawned child for session '{}' (pid {})",
-                        info.name,
-                        child.id()
+                        "supervisor: spawned child for session '{}' (pid {pid})",
+                        info.name
                     );
                     children.insert(
                         info.name.clone(),
                         ChildState {
                             child,
+                            pid,
+                            name: info.name.clone(),
                             spawned_at: Instant::now(),
                         },
                     );
@@ -632,6 +859,22 @@ pub fn run_supervisor(interval_secs: u64, max_workers: usize, as_json: bool) -> 
                 }
             }
         }
+
+        // 5. Drain the orphan list: kill (escalating) and reap every
+        //    child we no longer select. Anything still outstanding is
+        //    retried on the next poll, so the live population stays
+        //    bounded by `max_workers` plus whatever is mid-teardown.
+        if !orphans.is_empty() {
+            eprintln!(
+                "supervisor: {} orphan worker(s) pending teardown (cap {max_workers}, tracked {})",
+                orphans.len(),
+                children.len()
+            );
+        }
+        orphans.retain_mut(|state| {
+            let label = format!("orphan worker for session '{}'", state.name);
+            !terminate_and_reap(&mut state.child, state.pid, &label)
+        });
 
         std::thread::sleep(Duration::from_secs(REGISTRY_POLL_SECS));
     }
@@ -1420,6 +1663,167 @@ mod tests {
             |_| false,
         );
         assert!(reaped.is_empty());
+    }
+
+    const CUTOFF_14D: Duration = Duration::from_secs(14 * 86_400);
+
+    fn far_future_days() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(30 * 86_400)
+    }
+
+    /// Give a by-key home an identity + sync history, i.e. exactly the
+    /// shape `reap_husks` refuses to touch. This is the population that
+    /// grew without bound on the box that motivated the idle reaper.
+    fn mk_identity_home(root: &Path, name: &str) -> PathBuf {
+        let home = mk_husk(root, name);
+        std::fs::create_dir_all(home.join("config").join("wire")).unwrap();
+        std::fs::write(home.join("config").join("wire").join("private.key"), b"k").unwrap();
+        std::fs::write(home.join("state").join("wire").join("last_sync.json"), b"{}").unwrap();
+        home
+    }
+
+    #[test]
+    fn idle_reap_removes_long_idle_identity_home_that_husk_reap_cannot() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_identity_home(tmp.path(), "aaaaaaaaaaaaaaaa");
+        let bound = std::collections::HashSet::new();
+        // The husk reaper is blind to it — that is the bug.
+        let husks = reap_husks(tmp.path(), CUTOFF_48H, far_future_days(), &bound, |_| false);
+        assert!(husks.is_empty());
+        // The idle reaper drains it.
+        let reaped = reap_idle_homes(
+            tmp.path(),
+            CUTOFF_14D,
+            far_future_days(),
+            &bound,
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(reaped.len(), 1);
+        assert!(!tmp.path().join("aaaaaaaaaaaaaaaa").exists());
+    }
+
+    #[test]
+    fn idle_reap_keeps_recently_active_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_identity_home(tmp.path(), "bbbbbbbbbbbbbbbb");
+        let bound = std::collections::HashSet::new();
+        let reaped = reap_idle_homes(
+            tmp.path(),
+            CUTOFF_14D,
+            SystemTime::now(),
+            &bound,
+            |_| false,
+            |_| false,
+        );
+        assert!(reaped.is_empty());
+        assert!(tmp.path().join("bbbbbbbbbbbbbbbb").exists());
+    }
+
+    #[test]
+    fn idle_reap_keeps_home_with_live_lease_or_outbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_identity_home(tmp.path(), "cccccccccccccccc");
+        let bound = std::collections::HashSet::new();
+        let reaped = reap_idle_homes(
+            tmp.path(),
+            CUTOFF_14D,
+            far_future_days(),
+            &bound,
+            |_| true, // active: live lease or pending outbox
+            |_| false,
+        );
+        assert!(reaped.is_empty());
+    }
+
+    #[test]
+    fn idle_reap_keeps_home_with_live_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_identity_home(tmp.path(), "dddddddddddddddd");
+        let bound = std::collections::HashSet::new();
+        let reaped = reap_idle_homes(
+            tmp.path(),
+            CUTOFF_14D,
+            far_future_days(),
+            &bound,
+            |_| false,
+            |_| true,
+        );
+        assert!(reaped.is_empty());
+    }
+
+    #[test]
+    fn idle_reap_keeps_registry_bound_and_named_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_identity_home(tmp.path(), "eeeeeeeeeeeeeeee");
+        mk_identity_home(tmp.path(), "peat-eagle");
+        let mut bound = std::collections::HashSet::new();
+        bound.insert("eeeeeeeeeeeeeeee".to_string());
+        let reaped = reap_idle_homes(
+            tmp.path(),
+            CUTOFF_14D,
+            far_future_days(),
+            &bound,
+            |_| false,
+            |_| false,
+        );
+        assert!(reaped.is_empty());
+        assert!(tmp.path().join("peat-eagle").exists());
+    }
+
+    #[test]
+    fn idle_reap_max_age_parsing() {
+        assert_eq!(
+            parse_idle_reap_max_age(None),
+            Some(Duration::from_secs(DEFAULT_IDLE_REAP_MAX_AGE_DAYS * 86_400))
+        );
+        assert_eq!(parse_idle_reap_max_age(Some("0")), None);
+        assert_eq!(
+            parse_idle_reap_max_age(Some("3")),
+            Some(Duration::from_secs(3 * 86_400))
+        );
+        assert_eq!(
+            parse_idle_reap_max_age(Some("garbage")),
+            Some(Duration::from_secs(DEFAULT_IDLE_REAP_MAX_AGE_DAYS * 86_400))
+        );
+    }
+
+    #[test]
+    fn kill_worker_verified_reports_dead_pid_as_gone() {
+        // A pid that is definitively not running must short-circuit to
+        // "already dead" without signalling anything.
+        assert!(kill_worker_verified(u32::MAX - 1, "test worker"));
+    }
+
+    #[test]
+    fn terminate_and_reap_escalates_past_a_sigterm_ignoring_child() {
+        // The regression this guards: eviction used to send one
+        // un-escalated SIGTERM and discard both the result and the
+        // corpse, so a worker that did not act on SIGTERM survived
+        // while the supervisor dropped it from bookkeeping.
+        // `sh -c 'trap "" TERM; sleep 60'` ignores SIGTERM outright, so
+        // only SIGKILL escalation can end it — and only a `wait` can
+        // reap it afterwards.
+        let child = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 60"])
+            .spawn();
+        let Ok(mut child) = child else {
+            return; // no shell available — nothing to assert
+        };
+        let pid = child.id();
+        assert!(crate::platform::process_alive(pid));
+        assert!(terminate_and_reap(&mut child, pid, "sigterm-ignoring test worker"));
+    }
+
+    #[test]
+    fn terminate_and_reap_is_idempotent_on_an_already_dead_child() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn();
+        let Ok(mut child) = child else {
+            return;
+        };
+        let pid = child.id();
+        assert!(terminate_and_reap(&mut child, pid, "short-lived test worker"));
+        assert!(terminate_and_reap(&mut child, pid, "short-lived test worker"));
     }
 
     #[test]
