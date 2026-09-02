@@ -203,8 +203,7 @@ impl InboxWatcher {
         // unresponsive workers on a short grace, so a truncating write
         // here is a reachable path to that storm, not a theoretical one.
         let tmp = cursor_path.with_extension("cursor.tmp");
-        std::fs::write(&tmp, bytes)
-            .with_context(|| format!("writing cursor file {tmp:?}"))?;
+        std::fs::write(&tmp, bytes).with_context(|| format!("writing cursor file {tmp:?}"))?;
         std::fs::rename(&tmp, cursor_path)
             .with_context(|| format!("renaming {tmp:?} -> {cursor_path:?}"))?;
         Ok(())

@@ -214,7 +214,9 @@ fn terminate_and_reap(child: &mut Child, pid: u32, label: &str) -> bool {
         }
         std::thread::sleep(TERM_POLL);
     }
-    eprintln!("supervisor: {label} pid={pid} ignored SIGTERM after {TERM_GRACE:?}; sending SIGKILL");
+    eprintln!(
+        "supervisor: {label} pid={pid} ignored SIGTERM after {TERM_GRACE:?}; sending SIGKILL"
+    );
     let _ = child.kill();
     let deadline = Instant::now() + TERM_GRACE;
     while Instant::now() < deadline {
@@ -501,9 +503,7 @@ fn parse_idle_reap_max_age(raw: Option<&str>) -> Option<Duration> {
 /// Read the idle reap cutoff from the environment.
 /// `WIRE_IDLE_REAP_MAX_AGE_DAYS=0` disables idle reaping entirely.
 fn idle_reap_max_age_from_env() -> Option<Duration> {
-    parse_idle_reap_max_age(
-        std::env::var("WIRE_IDLE_REAP_MAX_AGE_DAYS").ok().as_deref(),
-    )
+    parse_idle_reap_max_age(std::env::var("WIRE_IDLE_REAP_MAX_AGE_DAYS").ok().as_deref())
 }
 
 /// Delete long-idle by-key session homes that DO hold an identity, and
@@ -588,11 +588,8 @@ where
         // body of every pending outbox file. Prefer real activity; fall
         // back to the home's own mtime so a home that never synced
         // still ages out on this path.
-        let last = fs_last_active(&path).or_else(|| {
-            std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-        });
+        let last = fs_last_active(&path)
+            .or_else(|| std::fs::metadata(&path).and_then(|m| m.modified()).ok());
         let idle_long_enough = last
             .and_then(|t| now.duration_since(t).ok())
             .is_some_and(|age| age >= max_age);
@@ -1804,7 +1801,11 @@ mod tests {
         let home = mk_husk(root, name);
         std::fs::create_dir_all(home.join("config").join("wire")).unwrap();
         std::fs::write(home.join("config").join("wire").join("private.key"), b"k").unwrap();
-        std::fs::write(home.join("state").join("wire").join("last_sync.json"), b"{}").unwrap();
+        std::fs::write(
+            home.join("state").join("wire").join("last_sync.json"),
+            b"{}",
+        )
+        .unwrap();
         home
     }
 
@@ -1920,7 +1921,10 @@ mod tests {
         let home = mk_identity_home(tmp.path(), "ffffffffffffffff");
         std::fs::create_dir_all(home.join("state").join("wire").join("inbox")).unwrap();
         std::fs::write(
-            home.join("state").join("wire").join("inbox").join("m.jsonl"),
+            home.join("state")
+                .join("wire")
+                .join("inbox")
+                .join("m.jsonl"),
             b"{}",
         )
         .unwrap();
@@ -1969,7 +1973,11 @@ mod tests {
         let pid = child.id();
         assert!(crate::platform::process_alive(pid));
         let started = Instant::now();
-        assert!(terminate_and_reap(&mut child, pid, "sigterm-ignoring test worker"));
+        assert!(terminate_and_reap(
+            &mut child,
+            pid,
+            "sigterm-ignoring test worker"
+        ));
         // Must have gone the long way round: SIGTERM, full grace, then
         // SIGKILL. An implementation that skipped the grace, or opened
         // with SIGKILL, would return well inside TERM_GRACE and pass a
@@ -1994,7 +2002,11 @@ mod tests {
         // longer tell which branch it exercised.
         child.wait().expect("waiting for the child");
         let started = Instant::now();
-        assert!(terminate_and_reap(&mut child, pid, "short-lived test worker"));
+        assert!(terminate_and_reap(
+            &mut child,
+            pid,
+            "short-lived test worker"
+        ));
         assert!(
             started.elapsed() < TERM_GRACE,
             "burned the kill grace on an already-dead child: {:?}",
@@ -2010,7 +2022,12 @@ mod tests {
         let state = tmp.path().join("state/wire");
         std::fs::create_dir_all(&state).unwrap();
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "trap '' TERM; while :; do sleep 1; done", "wire", "daemon"])
+            .args([
+                "-c",
+                "trap '' TERM; while :; do sleep 1; done",
+                "wire",
+                "daemon",
+            ])
             .spawn()
             .unwrap();
         let pid = child.id();
@@ -2044,7 +2061,10 @@ mod tests {
             started.elapsed()
         );
         assert!(pending.contains_key(&pid));
-        assert!(child.try_wait().unwrap().is_none(), "SIGTERM should not have killed it");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "SIGTERM should not have killed it"
+        );
 
         // Poll 2, before the grace elapses: still no escalation.
         retire_inactive_worker(&session, &owned, &mut pending);
