@@ -402,7 +402,14 @@ pub fn write_last_sync_record(push_n: usize, pull_n: usize, rejected_n: usize) {
             std::fs::create_dir_all(parent)?;
         }
         let body = serde_json::to_vec_pretty(&record)?;
-        std::fs::write(&path, body)?;
+        // tmp + rename: `fs::write` truncates in place, so a daemon
+        // killed mid-write leaves a 0-byte or half-JSON file and
+        // `read_last_sync_record` then reports a healthy session as
+        // "never synced". The supervisor SIGKILLs unresponsive workers
+        // on a short grace, so this window is reachable by design.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     })()
     .map_err(|e| eprintln!("daemon: last-sync persist error (non-fatal): {e:#}"));
