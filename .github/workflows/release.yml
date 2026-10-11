@@ -37,7 +37,7 @@ jobs:
           # Intel Mac users on this version fall back to: cargo install --git
           # https://github.com/SlanchaAi/wire wire. Re-add if v0.2 demand surfaces.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             artifact: wire
           - target: x86_64-pc-windows-msvc
             os: windows-latest
