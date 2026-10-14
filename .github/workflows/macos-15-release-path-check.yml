@@ -1,0 +1,59 @@
+name: macos-15 release path check
+
+# Temporary SLA-50 check. Exercises the aarch64-apple-darwin release
+# build, checksum, and artifact name on macos-15. Does not tag or publish.
+on:
+  push:
+    branches:
+      - cursor/sla-50-macos-15-arm64-runner-29ea
+    paths:
+      - .github/workflows/macos-15-release-path-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: aarch64-apple-darwin on macos-15
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+          save-if: false
+
+      - name: Build (cargo)
+        run: cargo build --release --target aarch64-apple-darwin --bin wire
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/wire dist/wire-aarch64-apple-darwin
+          cd dist
+          shasum -a 256 wire-aarch64-apple-darwin > wire-aarch64-apple-darwin.sha256
+          echo "---- staged ----"
+          ls -la
+          echo "---- checksum ----"
+          cat wire-aarch64-apple-darwin.sha256
+          shasum -a 256 -c wire-aarch64-apple-darwin.sha256
+          echo "---- file ----"
+          file wire-aarch64-apple-darwin
+          echo "---- minos ----"
+          otool -l wire-aarch64-apple-darwin | awk '/LC_BUILD_VERSION/{p=1} p{print} /LC_SOURCE_VERSION/{exit}'
+          sw_vers
+          uname -m
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wire-aarch64-apple-darwin
+          path: dist/*
+          retention-days: 1
