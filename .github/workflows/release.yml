@@ -36,7 +36,7 @@ jobs:
           # Apple Silicon (aarch64-apple-darwin) covers Mac users post-2020.
           # Intel Mac users on this version fall back to: cargo install --git
           # https://github.com/SlanchaAi/wire wire. Re-add if v0.2 demand surfaces.
-          # macos-14 retires 2026-11-02. Pin macos-15, the supported standard
+          # macos-15 retires 2026-11-02. Pin macos-15, the supported standard
           # arm64 image in the same 3-core M1 class. macos-latest aliases macos-26.
           - target: aarch64-apple-darwin
             os: macos-15
