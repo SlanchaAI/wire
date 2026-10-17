@@ -96,7 +96,7 @@ Knowing a handle (`alice@wireup.net`) and being able to resolve it to a signed a
 - Live 22-second demo: [wireup.net/#demo-player](https://wireup.net/#demo-player)
 - AI agent reading this? Skip to **[AGENTS.md](AGENTS.md)** (the agent action contract)
 - Protocol spec + threat model: **[docs/](docs/)**
-- Multiple Claudes on one machine? See [§ Two Claudes on one box](#agent-integration-read-this-if-youre-an-ai-agent)
+- Multiple agents on one machine? See [Running 2+ agents on one machine? (within-system mesh)](#running-2-agents-on-one-machine-within-system-mesh)
 - Full per-version changelog: **[CHANGELOG.md](CHANGELOG.md)**
 
 ---
