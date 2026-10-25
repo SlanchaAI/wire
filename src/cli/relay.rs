@@ -1203,7 +1203,25 @@ pub(super) fn cmd_daemon(
         }
     };
 
+    // A session-local daemon (spawned by `wire mcp` in a by-key home) exits
+    // once its session is gone and it has nothing left to sync. Not applied to
+    // machine-default homes; supervisor mode returns earlier.
+    let mut orphan = crate::ensure_up::OrphanTracker::default();
+    let orphan_exit = !once
+        && crate::ensure_up::is_session_keyed_home()
+        && std::env::var("WIRE_DAEMON_NO_ORPHAN_EXIT").is_err();
+
     loop {
+        if orphan_exit
+            && orphan.tick(
+                std::time::Instant::now(),
+                crate::ensure_up::session_orphaned(),
+            )
+        {
+            eprintln!("wire daemon: session gone (no mcp, no peers, empty outbox); exiting");
+            // `_pid_guard` removes daemon.pid on drop if it still names us.
+            return Ok(());
+        }
         let pushed = run_sync_push().unwrap_or_else(|e| {
             eprintln!("daemon: push error: {e:#}");
             json!({"pushed": [], "skipped": [{"error": e.to_string()}]})

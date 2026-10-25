@@ -657,9 +657,95 @@ fn process_alive(pid: u32) -> bool {
     crate::platform::process_alive(pid)
 }
 
+/// Ticks AND seconds a session-local daemon must look orphaned before it exits.
+const ORPHAN_EXIT_TICKS: u32 = 3;
+const ORPHAN_EXIT_SECS: u64 = 60;
+
+/// True when `WIRE_HOME` is a session-keyed home (`.../sessions/by-key/<hash>`),
+/// the only kind whose daemon `wire mcp` spawns and so the only kind tied to a
+/// session's life. Machine-default homes never qualify.
+pub fn is_session_keyed_home() -> bool {
+    std::env::var_os("WIRE_HOME")
+        .map(PathBuf::from)
+        .and_then(|h| h.parent().map(|p| p.file_name().map(|n| n == "by-key")))
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// True when this home's session is gone: `mcp.pid` missing or dead (or its pid
+/// was reused by a non-wire process), no pinned peers, nothing in the outbox.
+pub fn session_orphaned() -> bool {
+    let mcp_alive = match read_pid_record("mcp").pid() {
+        // Linux pid reuse: a live pid whose cmdline is not wire is not our mcp.
+        Some(pid) => {
+            process_alive(pid)
+                && (!cfg!(target_os = "linux")
+                    || std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .map(|c| String::from_utf8_lossy(&c).contains("wire"))
+                        .unwrap_or(true))
+        }
+        None => false,
+    };
+    if mcp_alive {
+        return false;
+    }
+    let has_peers = crate::config::read_relay_state()
+        .ok()
+        .and_then(|s| s["peers"].as_object().map(|p| !p.is_empty()))
+        .unwrap_or(true);
+    let outbox_pending = crate::config::outbox_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(true))
+        })
+        .unwrap_or(false);
+    !has_peers && !outbox_pending
+}
+
+/// Debounce for the orphan exit: fires only after `ORPHAN_EXIT_TICKS`
+/// consecutive orphaned ticks spanning at least `ORPHAN_EXIT_SECS`.
+#[derive(Default)]
+pub struct OrphanTracker {
+    ticks: u32,
+    since: Option<std::time::Instant>,
+}
+
+impl OrphanTracker {
+    pub fn tick(&mut self, now: std::time::Instant, orphaned: bool) -> bool {
+        if !orphaned {
+            *self = Self::default();
+            return false;
+        }
+        self.ticks += 1;
+        let since = *self.since.get_or_insert(now);
+        self.ticks >= ORPHAN_EXIT_TICKS
+            && now.duration_since(since) >= std::time::Duration::from_secs(ORPHAN_EXIT_SECS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_tracker_needs_ticks_and_time_and_resets() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut o = OrphanTracker::default();
+        // enough ticks but too little time
+        assert!(!o.tick(t0, true));
+        assert!(!o.tick(t0 + Duration::from_secs(5), true));
+        assert!(!o.tick(t0 + Duration::from_secs(10), true));
+        // session returns: counter resets
+        assert!(!o.tick(t0 + Duration::from_secs(70), false));
+        assert!(!o.tick(t0 + Duration::from_secs(75), true));
+        assert!(!o.tick(t0 + Duration::from_secs(80), true));
+        assert!(!o.tick(t0 + Duration::from_secs(85), true));
+        // 3+ ticks and >= 60s since first orphaned tick
+        assert!(o.tick(t0 + Duration::from_secs(135), true));
+    }
 
     #[test]
     fn process_alive_self() {
