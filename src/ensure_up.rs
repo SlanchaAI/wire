@@ -526,7 +526,7 @@ fn build_pid_record(pid: u32) -> DaemonPid {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
     let (did, relay_url) = identity_for_pid_record();
-    let supervisor_managed = std::env::var("WIRE_SUPERVISOR_MANAGED").is_ok_and(|raw| raw == "1");
+    let supervisor_managed = supervisor_managed();
     DaemonPid {
         schema: DAEMON_PID_SCHEMA.to_string(),
         pid,
@@ -670,6 +670,19 @@ pub fn is_session_keyed_home() -> bool {
         .and_then(|h| h.parent().map(|p| p.file_name().map(|n| n == "by-key")))
         .flatten()
         .unwrap_or(false)
+}
+
+/// True for workers spawned by the daemon supervisor, which respawns them if they exit.
+fn supervisor_managed() -> bool {
+    std::env::var("WIRE_SUPERVISOR_MANAGED").is_ok_and(|raw| raw == "1")
+}
+
+/// Whether this daemon should exit once its session is gone. Supervisor-managed
+/// workers never do: the supervisor would respawn them forever.
+pub fn orphan_exit_enabled() -> bool {
+    is_session_keyed_home()
+        && !supervisor_managed()
+        && std::env::var("WIRE_DAEMON_NO_ORPHAN_EXIT").is_err()
 }
 
 /// True when `dir` holds a non-empty `<peer>.jsonl` queue file. Lifecycle logs
@@ -887,6 +900,34 @@ mod tests {
         }
 
         assert_eq!(value["supervisor_managed"], true);
+    }
+
+    #[test]
+    fn orphan_exit_skips_supervisor_managed_workers() {
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("WIRE_HOME");
+        let prev_sup = std::env::var_os("WIRE_SUPERVISOR_MANAGED");
+        // SAFETY: ENV_LOCK serializes environment mutation in tests.
+        unsafe {
+            std::env::set_var("WIRE_HOME", "/tmp/sessions/by-key/abc");
+            std::env::remove_var("WIRE_SUPERVISOR_MANAGED");
+        }
+        let standalone = orphan_exit_enabled();
+        unsafe { std::env::set_var("WIRE_SUPERVISOR_MANAGED", "1") };
+        let managed = orphan_exit_enabled();
+        // SAFETY: ENV_LOCK remains held through restoration.
+        unsafe {
+            for (k, v) in [("WIRE_HOME", prev_home), ("WIRE_SUPERVISOR_MANAGED", prev_sup)] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert!(standalone);
+        assert!(!managed);
     }
 
     #[test]
