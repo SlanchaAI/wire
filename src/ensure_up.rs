@@ -672,6 +672,20 @@ pub fn is_session_keyed_home() -> bool {
         .unwrap_or(false)
 }
 
+/// True when `dir` holds a non-empty `<peer>.jsonl` queue file. Lifecycle logs
+/// (`<peer>.pushed.jsonl`) outlive delivery and are not pending outbound.
+fn outbox_has_pending(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".jsonl")
+                && !name.ends_with(".pushed.jsonl")
+                && e.metadata().map(|m| m.len() > 0).unwrap_or(true)
+        })
+    })
+}
+
 /// True when this home's session is gone: `mcp.pid` missing or dead (or its pid
 /// was reused by a non-wire process), no pinned peers, nothing in the outbox.
 pub fn session_orphaned() -> bool {
@@ -694,12 +708,7 @@ pub fn session_orphaned() -> bool {
         .and_then(|s| s["peers"].as_object().map(|p| !p.is_empty()))
         .unwrap_or(true);
     let outbox_pending = crate::config::outbox_dir()
-        .ok()
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(true))
-        })
+        .map(|d| outbox_has_pending(&d))
         .unwrap_or(false);
     !has_peers && !outbox_pending
 }
@@ -745,6 +754,20 @@ mod tests {
         assert!(!o.tick(t0 + Duration::from_secs(85), true));
         // 3+ ticks and >= 60s since first orphaned tick
         assert!(o.tick(t0 + Duration::from_secs(135), true));
+    }
+
+    #[test]
+    fn outbox_pending_ignores_pushed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("alice.pushed.jsonl"),
+            b"{\"event_id\":\"x\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("alice.jsonl"), b"").unwrap();
+        assert!(!outbox_has_pending(dir.path()));
+        std::fs::write(dir.path().join("alice.jsonl"), b"{}\n").unwrap();
+        assert!(outbox_has_pending(dir.path()));
     }
 
     #[test]
