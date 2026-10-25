@@ -526,7 +526,7 @@ fn build_pid_record(pid: u32) -> DaemonPid {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
     let (did, relay_url) = identity_for_pid_record();
-    let supervisor_managed = std::env::var("WIRE_SUPERVISOR_MANAGED").is_ok_and(|raw| raw == "1");
+    let supervisor_managed = supervisor_managed();
     DaemonPid {
         schema: DAEMON_PID_SCHEMA.to_string(),
         pid,
@@ -657,9 +657,131 @@ fn process_alive(pid: u32) -> bool {
     crate::platform::process_alive(pid)
 }
 
+/// Ticks AND seconds a session-local daemon must look orphaned before it exits.
+const ORPHAN_EXIT_TICKS: u32 = 3;
+const ORPHAN_EXIT_SECS: u64 = 60;
+
+/// True when `WIRE_HOME` is a session-keyed home (`.../sessions/by-key/<hash>`),
+/// the only kind whose daemon `wire mcp` spawns and so the only kind tied to a
+/// session's life. Machine-default homes never qualify.
+pub fn is_session_keyed_home() -> bool {
+    std::env::var_os("WIRE_HOME")
+        .map(PathBuf::from)
+        .and_then(|h| h.parent().map(|p| p.file_name().map(|n| n == "by-key")))
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// True for workers spawned by the daemon supervisor, which respawns them if they exit.
+fn supervisor_managed() -> bool {
+    std::env::var("WIRE_SUPERVISOR_MANAGED").is_ok_and(|raw| raw == "1")
+}
+
+/// Whether this daemon should exit once its session is gone. Supervisor-managed
+/// workers never do: the supervisor would respawn them forever.
+pub fn orphan_exit_enabled() -> bool {
+    is_session_keyed_home()
+        && !supervisor_managed()
+        && std::env::var("WIRE_DAEMON_NO_ORPHAN_EXIT").is_err()
+}
+
+/// True when `dir` holds a non-empty `<peer>.jsonl` queue file. Lifecycle logs
+/// (`<peer>.pushed.jsonl`) outlive delivery and are not pending outbound.
+fn outbox_has_pending(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".jsonl")
+                && !name.ends_with(".pushed.jsonl")
+                && e.metadata().map(|m| m.len() > 0).unwrap_or(true)
+        })
+    })
+}
+
+/// True when this home's session is gone: `mcp.pid` missing or dead (or its pid
+/// was reused by a non-wire process), no pinned peers, nothing in the outbox.
+pub fn session_orphaned() -> bool {
+    let mcp_alive = match read_pid_record("mcp").pid() {
+        // Linux pid reuse: a live pid whose cmdline is not wire is not our mcp.
+        Some(pid) => {
+            process_alive(pid)
+                && (!cfg!(target_os = "linux")
+                    || std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .map(|c| String::from_utf8_lossy(&c).contains("wire"))
+                        .unwrap_or(true))
+        }
+        None => false,
+    };
+    if mcp_alive {
+        return false;
+    }
+    let has_peers = crate::config::read_relay_state()
+        .ok()
+        .and_then(|s| s["peers"].as_object().map(|p| !p.is_empty()))
+        .unwrap_or(true);
+    let outbox_pending = crate::config::outbox_dir()
+        .map(|d| outbox_has_pending(&d))
+        .unwrap_or(false);
+    !has_peers && !outbox_pending
+}
+
+/// Debounce for the orphan exit: fires only after `ORPHAN_EXIT_TICKS`
+/// consecutive orphaned ticks spanning at least `ORPHAN_EXIT_SECS`.
+#[derive(Default)]
+pub struct OrphanTracker {
+    ticks: u32,
+    since: Option<std::time::Instant>,
+}
+
+impl OrphanTracker {
+    pub fn tick(&mut self, now: std::time::Instant, orphaned: bool) -> bool {
+        if !orphaned {
+            *self = Self::default();
+            return false;
+        }
+        self.ticks += 1;
+        let since = *self.since.get_or_insert(now);
+        self.ticks >= ORPHAN_EXIT_TICKS
+            && now.duration_since(since) >= std::time::Duration::from_secs(ORPHAN_EXIT_SECS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_tracker_needs_ticks_and_time_and_resets() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut o = OrphanTracker::default();
+        // enough ticks but too little time
+        assert!(!o.tick(t0, true));
+        assert!(!o.tick(t0 + Duration::from_secs(5), true));
+        assert!(!o.tick(t0 + Duration::from_secs(10), true));
+        // session returns: counter resets
+        assert!(!o.tick(t0 + Duration::from_secs(70), false));
+        assert!(!o.tick(t0 + Duration::from_secs(75), true));
+        assert!(!o.tick(t0 + Duration::from_secs(80), true));
+        assert!(!o.tick(t0 + Duration::from_secs(85), true));
+        // 3+ ticks and >= 60s since first orphaned tick
+        assert!(o.tick(t0 + Duration::from_secs(135), true));
+    }
+
+    #[test]
+    fn outbox_pending_ignores_pushed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("alice.pushed.jsonl"),
+            b"{\"event_id\":\"x\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("alice.jsonl"), b"").unwrap();
+        assert!(!outbox_has_pending(dir.path()));
+        std::fs::write(dir.path().join("alice.jsonl"), b"{}\n").unwrap();
+        assert!(outbox_has_pending(dir.path()));
+    }
 
     #[test]
     fn process_alive_self() {
@@ -778,6 +900,34 @@ mod tests {
         }
 
         assert_eq!(value["supervisor_managed"], true);
+    }
+
+    #[test]
+    fn orphan_exit_skips_supervisor_managed_workers() {
+        let _guard = crate::config::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("WIRE_HOME");
+        let prev_sup = std::env::var_os("WIRE_SUPERVISOR_MANAGED");
+        // SAFETY: ENV_LOCK serializes environment mutation in tests.
+        unsafe {
+            std::env::set_var("WIRE_HOME", "/tmp/sessions/by-key/abc");
+            std::env::remove_var("WIRE_SUPERVISOR_MANAGED");
+        }
+        let standalone = orphan_exit_enabled();
+        unsafe { std::env::set_var("WIRE_SUPERVISOR_MANAGED", "1") };
+        let managed = orphan_exit_enabled();
+        // SAFETY: ENV_LOCK remains held through restoration.
+        unsafe {
+            for (k, v) in [("WIRE_HOME", prev_home), ("WIRE_SUPERVISOR_MANAGED", prev_sup)] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert!(standalone);
+        assert!(!managed);
     }
 
     #[test]
