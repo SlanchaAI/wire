@@ -77,9 +77,8 @@ const MAX_INVITES: usize = 50_000;
 /// connections, each a channel that every `post_event` fans out to (O(n)
 /// broadcast) — memory + latency DoS. Over the cap → 503.
 const MAX_STREAMS_PER_SLOT: usize = 256;
-/// Soft cap on nicks tracked in `intro_times`; once exceeded, fully-aged entries
-/// are swept so the map can't accumulate one stale entry per ever-touched nick
-/// (#247.3 hygiene; growth is already bounded by `MAX_HANDLES`).
+/// Hard cap on nicks tracked in `intro_times`. At capacity, reclaim expired
+/// buckets; reject new nicks if all buckets remain active.
 const MAX_INTRO_TRACKING_NICKS: usize = 10_000;
 
 /// True iff a map at `len` entries is at/over the `max` ceiling — i.e. a new
@@ -1878,13 +1877,8 @@ async fn handles_directory(
 ///
 /// SECURITY (audit / #247 finding 3): this route is UNAUTHENTICATED by design
 /// (a stranger must be able to drop a pair-intro) and is NOT under the governor
-/// layer — it sits on the main router, not in `hot_writes`. The only backpressure
-/// is the per-slot 64MB quota, which is shared with the owner's own inbound, so a
-/// flood of intros to a known nick can fill the victim's slot and 413 their
-/// legitimate traffic. A per-nick / per-source intro rate-limit (and a separate
-/// intro-byte budget so a flood can't evict the owner) is tracked in #247.3 —
-/// it is NOT in place today. (Earlier comment here wrongly claimed governor
-/// coverage.)
+/// layer — it sits on the main router, not in `hot_writes`. Per-nick buckets
+/// allow five attempts per five minutes, with a hard cap on tracked nicks.
 async fn handle_intro(
     State(relay): State<Relay>,
     Path(nick): Path<String>,
@@ -1910,11 +1904,20 @@ async fn handle_intro(
         // and 10/s × 256KiB still fills 64MB in ~25s). Cap intros per nick per
         // window; over the limit → 429.
         let now = unix_now();
-        // Audit hygiene: before tracking this nick, opportunistically sweep
-        // fully-aged nicks once the map grows past a soft cap, so it can't
-        // retain one stale entry per ever-touched nick.
-        if at_capacity(inner.intro_times.len(), MAX_INTRO_TRACKING_NICKS) {
+        // Never evict an active bucket: that would let nick churn reset limits.
+        if !inner.intro_times.contains_key(&nick)
+            && at_capacity(inner.intro_times.len(), MAX_INTRO_TRACKING_NICKS)
+        {
             evict_stale_intro_nicks(&mut inner.intro_times, now, INTRO_WINDOW_SECS);
+            if at_capacity(inner.intro_times.len(), MAX_INTRO_TRACKING_NICKS) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(
+                        json!({"error": "intro rate tracking capacity reached; try again shortly"}),
+                    ),
+                )
+                    .into_response();
+            }
         }
         let times = inner.intro_times.entry(nick.clone()).or_default();
         if !record_intro_within_rate(times, now, INTRO_WINDOW_SECS, INTRO_MAX_PER_WINDOW) {
@@ -2633,6 +2636,141 @@ mod tests {
             1,
             "stale entries pruned, only the new one remains"
         );
+    }
+
+    async fn intro_rate_limit_fixture() -> (tempfile::TempDir, Relay, Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Relay::new(dir.path().to_path_buf()).await.unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let card = crate::agent_card::build_agent_card(
+            "sender",
+            key.verifying_key().as_bytes(),
+            None,
+            None,
+            None,
+        );
+        let card = crate::agent_card::sign_agent_card(&card, &key.to_bytes());
+        for nick in ["alice", "bob"] {
+            relay.inner.lock().await.handles.insert(
+                nick.into(),
+                HandleRecord {
+                    nick: nick.into(),
+                    did: "fixture".into(),
+                    card: card.clone(),
+                    slot_id: if nick == "alice" {
+                        "a".repeat(32)
+                    } else {
+                        "b".repeat(32)
+                    },
+                    relay_url: None,
+                    claimed_at: "fixture".into(),
+                    discoverable: None,
+                },
+            );
+        }
+        (
+            dir,
+            relay,
+            json!({"kind": 1100, "type": "pair_drop", "body": {"card": card}}),
+        )
+    }
+
+    async fn intro_rate_limit_request(relay: &Relay, nick: &str, event: &Value) -> StatusCode {
+        handle_intro(
+            State(relay.clone()),
+            Path(nick.into()),
+            Json(PostEventRequest {
+                event: event.clone(),
+            }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn intro_rate_limit_sixth_rejected_other_nick_unaffected_and_window_resets() {
+        let (_dir, relay, event) = intro_rate_limit_fixture().await;
+        for _ in 0..5 {
+            assert_eq!(
+                intro_rate_limit_request(&relay, "alice", &event).await,
+                StatusCode::CREATED
+            );
+        }
+        assert_eq!(
+            intro_rate_limit_request(&relay, "alice", &event).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            intro_rate_limit_request(&relay, "bob", &event).await,
+            StatusCode::CREATED
+        );
+        // Age the real bucket exactly to the window boundary without sleeping.
+        relay
+            .inner
+            .lock()
+            .await
+            .intro_times
+            .get_mut("alice")
+            .unwrap()
+            .fill(unix_now() - 300);
+        assert_eq!(
+            intro_rate_limit_request(&relay, "alice", &event).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(relay.inner.lock().await.slots[&"a".repeat(32)].len(), 6);
+    }
+
+    #[tokio::test]
+    async fn intro_rate_limit_tracking_is_bounded_and_reclaims_expired_nicks() {
+        let (_dir, relay, event) = intro_rate_limit_fixture().await;
+        {
+            let mut inner = relay.inner.lock().await;
+            let now = unix_now();
+            for i in 0..MAX_INTRO_TRACKING_NICKS - 1 {
+                inner.intro_times.insert(format!("tracked-{i}"), vec![now]);
+            }
+            inner.intro_times.insert("alice".into(), vec![now; 5]);
+        }
+        assert_eq!(
+            intro_rate_limit_request(&relay, "bob", &event).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            relay.inner.lock().await.intro_times.len(),
+            MAX_INTRO_TRACKING_NICKS
+        );
+        assert_eq!(
+            intro_rate_limit_request(&relay, "alice", &event).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        relay
+            .inner
+            .lock()
+            .await
+            .intro_times
+            .get_mut("alice")
+            .unwrap()
+            .pop();
+        assert_eq!(
+            intro_rate_limit_request(&relay, "alice", &event).await,
+            StatusCode::CREATED
+        );
+        relay
+            .inner
+            .lock()
+            .await
+            .intro_times
+            .get_mut("tracked-0")
+            .unwrap()
+            .fill(unix_now() - 300);
+        assert_eq!(
+            intro_rate_limit_request(&relay, "bob", &event).await,
+            StatusCode::CREATED
+        );
+        let inner = relay.inner.lock().await;
+        assert_eq!(inner.intro_times.len(), MAX_INTRO_TRACKING_NICKS);
+        assert!(!inner.intro_times.contains_key("tracked-0"));
     }
 
     #[test]
