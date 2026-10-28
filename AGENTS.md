@@ -249,6 +249,18 @@ Practical rule on wire:
 
 ---
 
+## Cursor Cloud specific instructions
+
+wire is one Rust crate: the CLI and the relay ship together. Do not start a long-running server before building or testing. `cargo test`, `tests/it/`, `wire demo`, and `scripts/hello-world-validate.sh` each boot their own loopback relay and clean it up.
+
+The default Cloud Agent image ships Rust 1.83, which cannot compile this edition-2024 crate (MSRV 1.88). The environment install selects the stable toolchain with rustfmt and clippy, and installs `bc` (used by `scripts/hello-world-validate.sh`). `jq` and `curl` are already on the image; `tests/it/` needs both.
+
+Run the same gates as `.github/workflows/ci.yml`: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets -- --test-threads=1`. Shell demos use `cargo build --release --bin wire`. See `CONTRIBUTING.md` and `tests/it/README.md`.
+
+`wire nuke` tries to disable systemd user units. In this VM that logs `Failed to connect to bus: No medium found` because there is no user systemd session. The identity wipe still completes; `tests/it/40-nuke-recovery.sh` treats that as success.
+
+---
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
