@@ -16,7 +16,6 @@ exclude = [
     "CLAUDE.md",
     "AGENTS.md",
     ".claude/",
-    ".gitnexus/",
     ".planning/",
     "SESSION_LOG_*.md",
 ]
